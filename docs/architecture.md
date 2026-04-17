@@ -163,7 +163,7 @@ ib-cgt/
 │       ├── py.typed
 │       ├── cli.py               (planned)
 │       ├── config.py            (planned)
-│       ├── domain/              (planned)
+│       ├── domain/
 │       ├── db/
 │       │   └── migrations/      (planned)
 │       ├── ingest/              (planned)
@@ -177,7 +177,8 @@ ib-cgt/
     ├── conftest.py
     ├── test_smoke.py
     ├── fixtures/                (planned)
-    ├── unit/                    (planned)
+    ├── unit/
+    │   └── domain/
     └── integration/             (planned)
 ```
 
@@ -189,7 +190,7 @@ items marked ⬜ are pending.
 
 1. ✅ **Project skeleton** — `pyproject.toml`, src layout, conda deps,
    ruff / mypy / pytest configured, smoke test green.
-2. ⬜ **Domain model** — dataclasses / enums; no I/O.
+2. ✅ **Domain model** — dataclasses / enums; no I/O.
 3. ⬜ **DB schema + migrations + repos** — tables, indexes, repositories
    with unit tests.
 4. ⬜ **FX service** — Frankfurter client, cache, business-day fallback.
@@ -212,7 +213,7 @@ items marked ⬜ are pending.
 | # | Component | Package | Status |
 |---|-----------|---------|--------|
 | 1 | Project skeleton | — (build / tooling) | ✅ Done |
-| 2 | Domain model | `ib_cgt.domain` | ⬜ Pending |
+| 2 | Domain model | `ib_cgt.domain` | ✅ Done |
 | 3 | Persistence | `ib_cgt.db` | ⬜ Pending |
 | 4 | Ingestion | `ib_cgt.ingest` | ⬜ Pending |
 | 5 | FX service | `ib_cgt.fx` | ⬜ Pending |
@@ -221,7 +222,7 @@ items marked ⬜ are pending.
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
 | 9 | CLI | `ib_cgt.cli` | ⬜ Pending |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
-| 11 | Tests & fixtures | `tests/` | 🟡 Smoke test only |
+| 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md` + this page |
 
 ## How to keep this in sync
