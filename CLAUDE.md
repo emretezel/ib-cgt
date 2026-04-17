@@ -73,6 +73,7 @@ When proposing database changes, include:
 
 - Use **pytest** for the test suite.
 - Think carefully about the best location for the test suite and place it where it belongs for this project's structure.
+- Always add unit tests whenever a new feature is implemented or existing behaviour is changed. No feature or change lands without tests covering it.
 
 ## 8. Static Analysis and Quality Tools
 
