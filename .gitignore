@@ -1,0 +1,178 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checkers / linters / formatters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Translations
+*.mo
+*.pot
+
+# Django / Flask / Scrapy / Sphinx (unlikely here, but cheap to include)
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+
+# mkdocs documentation
+/site
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Icon must end with two \r
+Icon
+
+
+# Files that might appear in the root of a volume
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# ---------------------------------------------------------------------------
+# VS Code
+# ---------------------------------------------------------------------------
+# Ignore the folder by default, but allow a curated set of shared project
+# settings to be committed. This keeps per-user state (history, workspace
+# caches) out of git while letting the team share launch configs, tasks,
+# recommended extensions, and workspace settings.
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# Local History extension
+.history/
+
+# Built VS Code extensions
+*.vsix
+
+# ---------------------------------------------------------------------------
+# Project-specific
+# ---------------------------------------------------------------------------
+
+# Interactive Brokers statement exports may contain personal financial data.
+# Keep a dedicated folder out of version control by default; add specific
+# fixture files back explicitly if you need them checked in.
+data/
+statements/
+*.csv
+*.xlsx
+*.xls
+
+# SQLite databases produced by local runs
+*.sqlite
+*.sqlite3
+*.db
+
+# Secrets / credentials
+secrets/
+*.pem
+*.key
