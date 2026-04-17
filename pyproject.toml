@@ -1,0 +1,141 @@
+# ---------------------------------------------------------------------------
+# ib-cgt — UK Capital Gains Tax calculator for Interactive Brokers statements
+# ---------------------------------------------------------------------------
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ib-cgt"
+version = "0.1.0"
+description = "Compute UK Capital Gains Tax from Interactive Brokers HTML statements."
+readme = "docs/index.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Emre Tezel", email = "emre.tezel@gmail.com" }]
+keywords = ["uk", "cgt", "capital-gains-tax", "interactive-brokers", "tax", "hmrc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Accounting",
+    "Typing :: Typed",
+]
+
+# No runtime dependencies yet. Each future component plan (ingest, fx, cli, ...)
+# will add its own deps here and document WHY.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/emretezel/ib-cgt"
+Issues = "https://github.com/emretezel/ib-cgt/issues"
+
+# ---------------------------------------------------------------------------
+# Hatchling build config — declare src layout and ship py.typed
+# ---------------------------------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ib_cgt"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "docs/", "AGENTS.md", "CLAUDE.md", "LICENSE"]
+
+# ---------------------------------------------------------------------------
+# Ruff — format + lint
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Enabled rule groups — keep the set tight and opinionated rather than
+# turning on everything. Rationale in brackets.
+select = [
+    "E", "W",     # pycodestyle     — basic style
+    "F",          # pyflakes        — unused imports, undefined names
+    "I",          # isort           — import ordering
+    "N",          # pep8-naming     — class/function/constant casing
+    "UP",         # pyupgrade       — modern syntax
+    "B",          # bugbear         — common correctness bugs
+    "SIM",        # simplify        — obvious simplifications
+    "C4",         # comprehensions  — idiomatic comprehensions
+    "RUF",        # ruff-specific   — good-practice catches
+    "D",          # pydocstyle      — docstring presence/style (rule 17)
+]
+ignore = [
+    "D203",       # conflicts with D211 (prefer no blank line before class docstring)
+    "D213",       # conflicts with D212 (multi-line summary on first line)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests don't need every function to have a docstring, and fixtures/test
+# names often trip naming rules intentionally.
+"tests/**/*.py" = ["D", "N802"]
+
+[tool.ruff.format]
+# Defaults are fine — double quotes, LF line endings, trailing commas respected.
+
+# ---------------------------------------------------------------------------
+# Mypy — strict type checking
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["ib_cgt"]
+explicit_package_bases = true
+warn_unreachable = true
+warn_return_any = true
+pretty = true
+
+# Per rule 14, errors must be fixed elegantly — no blanket suppressions.
+# We deliberately do NOT set ignore_missing_imports; each untyped third-party
+# lib must be pinned against a stubs package in pyproject.toml dev deps.
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",                    # show short summary of all non-pass outcomes
+    "--strict-markers",       # unknown @pytest.mark.* raises, not warns
+    "--strict-config",
+]
+
+# ---------------------------------------------------------------------------
+# Coverage — enabled via pytest-cov; keep config co-located
+# ---------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = ["src/ib_cgt"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

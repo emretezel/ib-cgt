@@ -1,0 +1,15 @@
+# Reproducible setup for the ib-cgt conda env.
+# Usage:
+#   conda env create -f environment.yml      (first time, if env doesn't exist)
+#   conda env update -f environment.yml      (refresh)
+# The env's Python version is pinned; actual Python deps come from
+# `pip install -e ".[dev]"` driven by pyproject.toml (rule 10).
+
+name: ib-cgt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .[dev]
