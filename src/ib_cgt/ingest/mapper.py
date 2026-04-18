@@ -123,15 +123,27 @@ def map_rows(
         (info.asset_class, info.symbol): info for info in parsed.instruments
     }
 
+    # Running per-symbol position for futures — consulted when a row
+    # carries a mixed `C;O` code to decide whether it's a pure close
+    # (O flag spurious) or a genuine reversal that needs splitting into
+    # a close leg + an open leg. The state is statement-local; contracts
+    # that were opened in an earlier year start this walk at 0, which
+    # is correct for the front-month futures that produce these rows in
+    # practice. Keyed on symbol alone because a parsed statement belongs
+    # to a single primary account.
+    futures_pos: dict[str, Decimal] = {}
+
     trades: list[Trade] = []
     for raw in parsed.trades:
-        trade = _map_one(
-            raw,
-            account_id=parsed.account_id,
-            info_by_symbol=info_by_symbol,
-            assume_timezone=assume_timezone,
+        trades.extend(
+            _map_one(
+                raw,
+                account_id=parsed.account_id,
+                info_by_symbol=info_by_symbol,
+                futures_pos=futures_pos,
+                assume_timezone=assume_timezone,
+            )
         )
-        trades.append(trade)
     return trades
 
 
@@ -145,9 +157,16 @@ def _map_one(
     *,
     account_id: str,
     info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    futures_pos: dict[str, Decimal],
     assume_timezone: ZoneInfo,
-) -> Trade:
-    """Dispatch a single raw row to the right asset-class mapper."""
+) -> list[Trade]:
+    """Dispatch a single raw row into one or more `Trade` objects.
+
+    Almost every row produces exactly one `Trade`. The one exception is a
+    futures row with a mixed `C;O` code that reverses the position through
+    zero — that becomes two trades (a close leg + an open leg of opposite
+    direction). See `_derive_futures_events` for the disambiguation.
+    """
     # Parse the timestamp and the signed quantity once — every asset
     # class needs both, and doing it here keeps the per-class code tidy.
     trade_datetime = _parse_datetime(raw.datetime_text, assume_timezone)
@@ -156,14 +175,21 @@ def _map_one(
     fees = _parse_decimal(raw.fees_text, field="fees", raw=raw) if raw.fees_text else Decimal(0)
 
     instrument: AnyInstrument
+    events: list[tuple[TradeAction, Decimal]]
     if raw.asset_class in _STOCK_LABELS:
         instrument, action = _build_stock(raw, signed_qty)
+        events = [(action, abs(signed_qty))]
     elif raw.asset_class in _BOND_LABELS:
         instrument, action = _build_bond(raw, signed_qty)
+        events = [(action, abs(signed_qty))]
     elif raw.asset_class in _FUTURE_LABELS:
-        instrument, action = _build_future(raw, signed_qty, info_by_symbol)
+        instrument = _build_future_instrument(raw, info_by_symbol)
+        prior_pos = futures_pos.get(raw.symbol, Decimal(0))
+        events = _derive_futures_events(signed_qty, raw.code, prior_pos, raw)
+        futures_pos[raw.symbol] = prior_pos + signed_qty
     elif raw.asset_class in _FX_LABELS:
         instrument, action = _build_fx(raw, signed_qty)
+        events = [(action, abs(signed_qty))]
     else:
         raise MappingError(f"Unsupported asset class section: {raw.asset_class!r} ({raw=})")
 
@@ -182,18 +208,33 @@ def _map_one(
     # reduces proceeds, not the other way round).
     fees_magnitude = abs(fees)
 
-    return Trade(
-        account_id=account_id,
-        instrument=instrument,
-        action=action,
-        trade_datetime=trade_datetime,
-        trade_date=trade_date,
-        settlement_date=settlement_date,
-        quantity=abs(signed_qty),
-        price=Money.of(price, instrument.currency),
-        fees=Money.of(fees_magnitude, instrument.currency),
-        accrued_interest=None,
-    )
+    # On a single-event row fees attach in full to that event. On a split
+    # reversal row we allocate pro-rata by quantity, assigning any rounding
+    # residual to the last leg so the sum equals `fees_magnitude` exactly.
+    total_qty = sum((qty for _, qty in events), Decimal(0))
+    trades: list[Trade] = []
+    allocated_fees = Decimal(0)
+    for idx, (action, qty) in enumerate(events):
+        if idx == len(events) - 1:
+            leg_fees = fees_magnitude - allocated_fees
+        else:
+            leg_fees = fees_magnitude * qty / total_qty
+            allocated_fees += leg_fees
+        trades.append(
+            Trade(
+                account_id=account_id,
+                instrument=instrument,
+                action=action,
+                trade_datetime=trade_datetime,
+                trade_date=trade_date,
+                settlement_date=settlement_date,
+                quantity=qty,
+                price=Money.of(price, instrument.currency),
+                fees=Money.of(leg_fees, instrument.currency),
+                accrued_interest=None,
+            )
+        )
+    return trades
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +262,11 @@ def _build_bond(raw: RawTradeRow, signed_qty: Decimal) -> tuple[BondInstrument, 
     return instrument, action
 
 
-def _build_future(
+def _build_future_instrument(
     raw: RawTradeRow,
-    signed_qty: Decimal,
     info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
-) -> tuple[FutureInstrument, TradeAction]:
-    """Map a Futures row to (FutureInstrument, OPEN/CLOSE_LONG/SHORT)."""
+) -> FutureInstrument:
+    """Resolve multiplier + expiry from the instruments side-table."""
     info = info_by_symbol.get(("Futures", raw.symbol))
     if info is None or info.multiplier_text is None or info.expiry_text is None:
         raise MappingError(
@@ -250,15 +290,12 @@ def _build_future(
             f"Unparseable futures expiry {info.expiry_text!r} for {raw.symbol!r}"
         ) from exc
 
-    instrument = FutureInstrument(
+    return FutureInstrument(
         symbol=raw.symbol,
         currency=raw.currency,
         contract_multiplier=multiplier,
         expiry_date=expiry_date,
     )
-
-    action = _futures_action(signed_qty, raw.code, raw)
-    return instrument, action
 
 
 def _build_fx(raw: RawTradeRow, signed_qty: Decimal) -> tuple[FXInstrument, TradeAction]:
@@ -311,46 +348,80 @@ def _parse_decimal(text: str, *, field: str, raw: RawTradeRow) -> Decimal:
         raise MappingError(f"Unparseable {field} {text!r} on row {raw=}") from exc
 
 
-def _futures_action(signed_qty: Decimal, code: str, raw: RawTradeRow) -> TradeAction:
-    """Derive the four-valued futures action from (sign, code).
+def _derive_futures_events(
+    signed_qty: Decimal,
+    code: str,
+    prior_pos: Decimal,
+    raw: RawTradeRow,
+) -> list[tuple[TradeAction, Decimal]]:
+    """Return `(action, positive_qty)` events this futures row represents.
 
-    Per the statement format: `O` marks opening fills and `C` marks
-    closing fills. Combined with the sign of quantity (positive = long
-    direction, negative = short direction), this uniquely identifies
-    the `TradeAction`:
+    Normally one event. A `C;O` code — which IB prints when an aggregated
+    fill has both a closing and an opening character — produces either
+    one event (when the numeric columns describe a pure close and the `O`
+    flag is spurious accounting noise) or two events (when the row
+    reverses the position through zero).
 
-    | qty sign | code | action        |
+    The disambiguation uses the running position `prior_pos`:
+
+    * `prior_pos == 0`  — no position to close, row is a pure open.
+    * `prior_pos * new_pos >= 0` — same sign or touches zero, row is a
+      pure close (O flag spurious).
+    * `prior_pos * new_pos < 0`  — genuine reversal: emit CLOSE for
+      `|prior_pos|` first, then OPEN for `|new_pos|` in the opposite
+      direction.
+
+    Single-letter codes (`O`, `C`, `O;P`, `C;P`) skip the reversal logic
+    and use the sign x flag table directly:
+
+    | qty sign | flag | action        |
     |----------|------|---------------|
     |   +      |  O   | OPEN_LONG     |
     |   -      |  C   | CLOSE_LONG    |
     |   -      |  O   | OPEN_SHORT    |
     |   +      |  C   | CLOSE_SHORT   |
-
-    IB also occasionally stuffs secondary flags into `Code`
-    (`O;A` for "opening, assignment"). We treat the code as matching
-    if it *contains* a single O or C — that absorbs drift without
-    over-matching an unrelated flag.
     """
     has_open = "O" in code
     has_close = "C" in code
-    if has_open == has_close:
-        # Either both present (malformed) or neither (not a trade we can
-        # classify). Fail loudly — the calculator cannot route the row.
-        raise MappingError(
-            f"Futures code {code!r} does not contain exactly one of 'O' or 'C' (row: {raw})"
-        )
+    if not (has_open or has_close):
+        raise MappingError(f"Futures code {code!r} contains neither 'O' nor 'C' (row: {raw})")
+    if signed_qty == 0:
+        raise MappingError(f"Futures row has zero quantity, cannot derive action (row: {raw})")
 
-    if signed_qty > 0 and has_open:
-        return TradeAction.OPEN_LONG
-    if signed_qty < 0 and has_close:
-        return TradeAction.CLOSE_LONG
-    if signed_qty < 0 and has_open:
-        return TradeAction.OPEN_SHORT
-    if signed_qty > 0 and has_close:
-        return TradeAction.CLOSE_SHORT
+    if has_open and has_close:
+        new_pos = prior_pos + signed_qty
+        if prior_pos == 0:
+            # No prior position to close — the C flag is spurious noise.
+            action = TradeAction.OPEN_LONG if signed_qty > 0 else TradeAction.OPEN_SHORT
+            return [(action, abs(signed_qty))]
+        if prior_pos * new_pos >= 0:
+            # Same sign or position hit zero — pure close, O flag spurious.
+            # IB's numeric columns (Basis, P/L) match this interpretation.
+            action = TradeAction.CLOSE_LONG if prior_pos > 0 else TradeAction.CLOSE_SHORT
+            return [(action, abs(signed_qty))]
+        # Genuine reversal through zero. Split into close leg (|prior|)
+        # followed by open leg (|new|) in the opposite direction. Both
+        # legs share the row's trade price; fees are allocated pro-rata
+        # by quantity in the caller.
+        close_qty = abs(prior_pos)
+        open_qty = abs(new_pos)
+        if prior_pos > 0:
+            return [
+                (TradeAction.CLOSE_LONG, close_qty),
+                (TradeAction.OPEN_SHORT, open_qty),
+            ]
+        return [
+            (TradeAction.CLOSE_SHORT, close_qty),
+            (TradeAction.OPEN_LONG, open_qty),
+        ]
 
-    # signed_qty == 0 slips through the above checks.
-    raise MappingError(f"Futures row has zero quantity, cannot derive action (row: {raw})")
+    if has_open:
+        # +qty opens longs, -qty opens shorts.
+        action = TradeAction.OPEN_LONG if signed_qty > 0 else TradeAction.OPEN_SHORT
+        return [(action, abs(signed_qty))]
+    # has_close: +qty buys to close a short, -qty sells to close a long.
+    action = TradeAction.CLOSE_SHORT if signed_qty > 0 else TradeAction.CLOSE_LONG
+    return [(action, abs(signed_qty))]
 
 
 __all__ = [

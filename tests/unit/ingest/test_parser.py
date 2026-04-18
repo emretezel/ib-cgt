@@ -100,3 +100,38 @@ def test_parse_title_fallback() -> None:
     assert parsed.account_id == "U1234567"
     assert parsed.trades == ()
     assert parsed.instruments == ()
+
+
+def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
+    """Older (2017-2018) statements prefix the asset class with a custodian
+    suffix. The parser should collapse that to the canonical label so the
+    mapper's label sets still match.
+    """
+    legacy_label = (
+        "Stocks - Held with Interactive Brokers (U.K.) Limited carried by Interactive Brokers LLC"
+    )
+    html = f"""<html>
+    <head><title>U5555555 Activity Statement 2018</title></head>
+    <body>
+    <div id="tblAccountInfo_U5555555Body">
+    <table><tr><td>Account</td><td>U5555555</td></tr></table>
+    </div>
+    <div id="tblTransactions_U5555555Body">
+    <table id="summaryDetailTable">
+    <thead><tr>
+    <th>Symbol</th><th>Date/Time</th><th>Quantity</th><th>T. Price</th>
+    <th>C. Price</th><th>Proceeds</th><th>Comm/Fee</th><th>Basis</th>
+    <th>Realized P/L</th><th>Realized P/L %</th><th>MTM P/L</th><th>Code</th>
+    </tr></thead>
+    <tbody><tr><td class="header-asset" colspan="12">{legacy_label}</td></tr></tbody>
+    <tbody><tr><td class="header-currency" colspan="12">SEK</td></tr></tbody>
+    <tbody><tr>
+    <td>EOLU B</td><td>2018-01-03, 06:28:02</td><td>-2,500</td>
+    <td>29.7000</td><td>0</td><td>74250.00</td><td>-49.00</td>
+    <td>0</td><td>0</td><td>0</td><td>0</td><td>C;P</td>
+    </tr></tbody>
+    </table></div></body></html>""".encode()
+    parsed = parse_statement(html)
+    assert len(parsed.trades) == 1
+    assert parsed.trades[0].asset_class == "Stocks"
+    assert parsed.trades[0].symbol == "EOLU B"

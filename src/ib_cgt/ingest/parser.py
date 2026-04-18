@@ -257,7 +257,7 @@ def _parse_one_trades_table(table: Tag) -> list[RawTradeRow]:
         # Asset-class header rows flip the active asset class. We stringify
         # the label so downstream code can compare against a known set.
         if _row_has_cell_class(tr, "header-asset"):
-            current_asset_class = _row_first_cell_text(tr)
+            current_asset_class = _normalize_asset_class(_row_first_cell_text(tr))
             continue
         if _row_has_cell_class(tr, "header-currency"):
             current_currency = _row_first_cell_text(tr)
@@ -314,10 +314,11 @@ def _find_trades_tables(soup: BeautifulSoup) -> list[Tag]:
     """Return every `<table>` element holding a Trades section.
 
     The enclosing `<div>` ids look like `tblTransactions_U…Body`. IB emits
-    one per included account on consolidated statements (and sometimes one
-    per asset class group), so we collect them all rather than stopping at
-    the first match. The scan is `<div>`-based so the match is independent
-    of which account-suffix variant IB used.
+    one per included account on consolidated statements, and legacy
+    (2017-2018) layouts additionally split the section into one table per
+    asset class *within* the same div. We collect every table we find so
+    both layouts are covered. The scan is `<div>`-based so the match is
+    independent of which account-suffix variant IB used.
     """
     tables: list[Tag] = []
     for div in soup.find_all("div", id=True):
@@ -325,9 +326,9 @@ def _find_trades_tables(soup: BeautifulSoup) -> list[Tag]:
             continue
         div_id = str(div.get("id", ""))
         if div_id.startswith("tblTransactions_") and div_id.endswith("Body"):
-            table = div.find("table")
-            if isinstance(table, Tag):
-                tables.append(table)
+            for table in div.find_all("table"):
+                if isinstance(table, Tag):
+                    tables.append(table)
     return tables
 
 
@@ -394,7 +395,7 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
             continue
 
         if _row_has_cell_class(tr, "header-asset"):
-            current_asset_class = _row_first_cell_text(tr)
+            current_asset_class = _normalize_asset_class(_row_first_cell_text(tr))
             continue
 
         if tr.find("th") is not None:
@@ -432,16 +433,22 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
 
 
 def _find_instruments_tables(soup: BeautifulSoup) -> list[Tag]:
-    """Return every Financial Instrument Information `<table>`."""
+    """Return every Financial Instrument Information `<table>`.
+
+    Legacy (2017-2018) layouts emit one table per asset class inside a
+    single `tblContractInfo<acct>Body` div (Stocks table + Futures table
+    + …), while newer layouts use a single table with a `header-asset`
+    row separator. Collecting every table covers both shapes.
+    """
     tables: list[Tag] = []
     for div in soup.find_all("div", id=True):
         if not isinstance(div, Tag):
             continue
         div_id = str(div.get("id", ""))
         if div_id.startswith("tblContractInfo") and div_id.endswith("Body"):
-            table = div.find("table")
-            if isinstance(table, Tag):
-                tables.append(table)
+            for table in div.find_all("table"):
+                if isinstance(table, Tag):
+                    tables.append(table)
     return tables
 
 
@@ -487,6 +494,22 @@ def _row_first_cell_text(tr: Tag) -> str:
     if isinstance(cell, Tag):
         return cell.get_text(strip=True)
     return ""
+
+
+def _normalize_asset_class(label: str) -> str:
+    """Collapse IB's verbose custodian suffixes to the canonical label.
+
+    Older statements (2017-2018 vintage) print the asset-class header as
+    e.g. `"Stocks - Held with Interactive Brokers (U.K.) Limited carried
+    by Interactive Brokers LLC"`. The prefix before `" - "` is the
+    canonical label (`"Stocks"`, `"Futures"`, …) — the suffix is
+    custodian plumbing that doesn't affect CGT classification. We strip
+    it here so the mapper can compare against fixed label sets and the
+    futures instrument-info join (keyed on asset class) stays consistent
+    across statement vintages.
+    """
+    head, sep, _tail = label.partition(" - ")
+    return head.strip() if sep else label.strip()
 
 
 def _optional_cell(cells: list[Tag], column_map: dict[str, int], logical: str) -> str | None:

@@ -164,9 +164,85 @@ def test_futures_missing_instrument_info_raises() -> None:
         map_rows(parsed)
 
 
-def test_futures_ambiguous_code_raises() -> None:
-    parsed = _make([_futures_row("1", "OC")], [_6lf5_info()])
-    with pytest.raises(MappingError, match="exactly one of"):
+def test_futures_mixed_code_pure_open_when_no_prior_position() -> None:
+    """A `C;O` code with no prior position is treated as a pure open.
+
+    IB occasionally emits the `C` flag as accounting noise on aggregated
+    rows. With `prior_pos=0` there's no position to close, so only the
+    open interpretation is physically possible.
+    """
+    parsed = _make([_futures_row("1", "C;O")], [_6lf5_info()])
+    trades = map_rows(parsed)
+    assert len(trades) == 1
+    assert trades[0].action is TradeAction.OPEN_LONG
+    assert trades[0].quantity == Decimal("1")
+
+
+def test_futures_mixed_code_pure_close_when_no_sign_flip() -> None:
+    """A `C;O` row whose net qty reduces the position toward zero is a close.
+
+    Simulates the real pattern we see in 20_21.htm (XC DEC 21): prior
+    position +24, row qty -9, net +15 - still long after, so the `O`
+    flag is spurious and the row is one CLOSE_LONG x 9.
+    """
+    rows = [
+        _futures_row("24", "O"),  # build +24 longs
+        _futures_row("-9", "C;O;P"),  # close 9 of them
+    ]
+    trades = map_rows(_make(rows, [_6lf5_info()]))
+    assert len(trades) == 2
+    assert trades[1].action is TradeAction.CLOSE_LONG
+    assert trades[1].quantity == Decimal("9")
+
+
+def test_futures_mixed_code_reversal_splits_into_two_trades() -> None:
+    """A `C;O` row that flips the sign of the position splits into two trades.
+
+    Simulates the 21_22.htm QGV1 pattern: prior +1, row qty -4, net -3.
+    Expected split: CLOSE_LONG x 1 + OPEN_SHORT x 3. Fees allocate
+    pro-rata by quantity (25% / 75% of the row's total).
+    """
+    rows = [
+        _futures_row("1", "O"),  # prior position +1 long
+        _futures_row("-4", "C;O"),  # reversal
+    ]
+    trades = map_rows(_make(rows, [_6lf5_info()]))
+    assert len(trades) == 3
+    # The first trade is the prior open.
+    assert trades[0].action is TradeAction.OPEN_LONG
+    # Trades 1 and 2 are the split reversal.
+    close_leg, open_leg = trades[1], trades[2]
+    assert close_leg.action is TradeAction.CLOSE_LONG
+    assert close_leg.quantity == Decimal("1")
+    assert open_leg.action is TradeAction.OPEN_SHORT
+    assert open_leg.quantity == Decimal("3")
+    # Price is identical on both legs (IB's T.Price applies to both).
+    assert close_leg.price == open_leg.price
+    # Fees split pro-rata: 2.47 total → 0.25 * 2.47 = 0.6175 (close)
+    # + 0.75 * 2.47 = 1.8525 (open). Sum must equal 2.47 exactly.
+    assert close_leg.fees.amount + open_leg.fees.amount == Decimal("2.47")
+    assert close_leg.fees.amount == Decimal("2.47") * Decimal(1) / Decimal(4)
+
+
+def test_futures_mixed_code_reversal_short_to_long() -> None:
+    """Mirror of the reversal test — prior short, row flips to long."""
+    rows = [
+        _futures_row("-1", "O"),  # prior position -1 short
+        _futures_row("2", "C;O"),  # reversal: close 1 short, open 1 long
+    ]
+    trades = map_rows(_make(rows, [_6lf5_info()]))
+    assert len(trades) == 3
+    close_leg, open_leg = trades[1], trades[2]
+    assert close_leg.action is TradeAction.CLOSE_SHORT
+    assert close_leg.quantity == Decimal("1")
+    assert open_leg.action is TradeAction.OPEN_LONG
+    assert open_leg.quantity == Decimal("1")
+
+
+def test_futures_zero_qty_raises() -> None:
+    """A zero-qty futures row is unclassifiable regardless of code."""
+    parsed = _make([_futures_row("0", "O")], [_6lf5_info()])
+    with pytest.raises(MappingError, match="zero quantity"):
         map_rows(parsed)
 
 
