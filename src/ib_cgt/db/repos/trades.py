@@ -141,6 +141,74 @@ class TradeRepo:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()
         return int(row["n"])
 
+    def list_filtered(
+        self,
+        *,
+        account_id: str | None = None,
+        symbol: str | None = None,
+        since: date | None = None,
+        limit: int | None = None,
+    ) -> list[Trade]:
+        """Return trades matching optional filters, ordered newest first.
+
+        Designed for the `ib-cgt trades …` CLI. Any combination of the
+        four parameters may be `None`; the WHERE clause is assembled to
+        skip the corresponding predicate so the query planner can still
+        pick the cheapest index for whatever fields *are* present.
+
+        Index coverage:
+        * `account_id` → `ix_trades_account_date` (and carries the
+          trade_date order for free).
+        * `symbol` requires a join on `instruments`, served by the
+          `ix_instruments_symbol` index.
+        * `trade_date >= since` alone is served by `ix_trades_trade_date`.
+
+        Args:
+            account_id: Exact account filter (e.g. ``"U1234567"``).
+            symbol: Exact instrument symbol filter (e.g. ``"AAPL"``).
+            since: Lower-bound on `trade_date` (inclusive).
+            limit: Cap on the result-set size; `None` means no cap. The
+                intent is interactive CLI use — the caller almost always
+                wants a sane ceiling.
+
+        Returns:
+            A list of `Trade` objects ordered by `trade_datetime` DESC
+            (newest first), with at most `limit` entries if supplied.
+        """
+        # Build the query incrementally so optional filters are simply
+        # absent from the SQL rather than expressed as `col = col`. This
+        # keeps the query planner's job obvious and the EXPLAIN output
+        # readable during perf reviews.
+        clauses: list[str] = []
+        params: list[object] = []
+        joins = ""
+
+        if account_id is not None:
+            clauses.append("t.account_id = ?")
+            params.append(account_id)
+        if symbol is not None:
+            # We need the instrument to reconstruct the domain object
+            # anyway (via `_row_to_trade` → InstrumentRepo.get), so this
+            # join does not add net I/O — just lets us filter in SQL.
+            joins = " JOIN instruments i ON i.instrument_id = t.instrument_id"
+            clauses.append("i.symbol = ?")
+            params.append(symbol)
+        if since is not None:
+            clauses.append("t.trade_date >= ?")
+            params.append(date_to_text(since))
+
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(int(limit))
+
+        sql = (
+            f"SELECT t.* FROM trades t{joins}{where_sql} ORDER BY t.trade_datetime DESC{limit_sql}"
+        )
+
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_trade(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

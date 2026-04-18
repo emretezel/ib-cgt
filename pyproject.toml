@@ -26,9 +26,17 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-# No runtime dependencies yet. Each future component plan (ingest, fx, cli, ...)
-# will add its own deps here and document WHY.
-dependencies = []
+# Runtime deps tracked per-component. Additions must explain WHY in the
+# comment next to them so future maintainers don't have to guess.
+dependencies = [
+    # Ingestion (component 3) — parse IB HTML activity statements.
+    "beautifulsoup4>=4.12",   # convenient DOM navigation; our only practical choice
+    "lxml>=5.0",              # fast C parser backend used by BeautifulSoup
+    # CLI (component 8) — minimal subset (`db init`, `ingest`, `trades`) shipped
+    # alongside ingestion so the pipeline is runnable end-to-end today.
+    "typer>=0.15",            # Typer builds on Click; good type-hint ergonomics
+    "rich>=13.9",             # table rendering for `ib-cgt trades`
+]
 
 [project.optional-dependencies]
 dev = [
@@ -36,7 +44,14 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.3",
     "pytest-cov>=5.0",
+    # Type stubs for ingestion deps (rule 14: no blanket ignores).
+    "types-beautifulsoup4>=4.12",
+    "lxml-stubs>=0.5",
 ]
+
+[project.scripts]
+# Entry point installed by `pip install -e .`. Users run `ib-cgt …`.
+ib-cgt = "ib_cgt.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/emretezel/ib-cgt"
