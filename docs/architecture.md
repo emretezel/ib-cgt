@@ -191,7 +191,7 @@ items marked ⬜ are pending.
 1. ✅ **Project skeleton** — `pyproject.toml`, src layout, conda deps,
    ruff / mypy / pytest configured, smoke test green.
 2. ✅ **Domain model** — dataclasses / enums; no I/O.
-3. ⬜ **DB schema + migrations + repos** — tables, indexes, repositories
+3. ✅ **DB schema + migrations + repos** — tables, indexes, repositories
    with unit tests.
 4. ⬜ **FX service** — Frankfurter client, cache, business-day fallback.
 5. ⬜ **Statement ingestion** — HTML parser, canonical mapping, dedup,
@@ -214,7 +214,7 @@ items marked ⬜ are pending.
 |---|-----------|---------|--------|
 | 1 | Project skeleton | — (build / tooling) | ✅ Done |
 | 2 | Domain model | `ib_cgt.domain` | ✅ Done |
-| 3 | Persistence | `ib_cgt.db` | ⬜ Pending |
+| 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ⬜ Pending |
 | 5 | FX service | `ib_cgt.fx` | ⬜ Pending |
 | 6 | Rule engines | `ib_cgt.rules` | ⬜ Pending |
