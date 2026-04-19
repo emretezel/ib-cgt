@@ -109,6 +109,29 @@ class FXRateRepo:
         ).fetchall()
         return {date.fromisoformat(r["rate_date"]) for r in rows}
 
+    def max_rate_date(self, base: str, quote: str) -> date | None:
+        """Return the newest cached `rate_date` for `(base, quote)`, or `None` if empty.
+
+        Used by the incremental FX sync to decide where to resume: on
+        first run the result is `None` (fetch full history); on
+        subsequent runs we fetch only `max_rate_date + 1 day .. today`.
+
+        Query plan: the primary key `(base, quote, rate_date)` orders
+        rows naturally by date within a `(base, quote)` prefix, so
+        `MAX(rate_date)` with `WHERE base=? AND quote=?` is a
+        single-row reverse probe on the PK — O(log n), no sort.
+        `EXPLAIN QUERY PLAN` reports `SEARCH fx_rates USING PRIMARY KEY`.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(rate_date) AS max_date FROM fx_rates WHERE base = ? AND quote = ?",
+            (base, quote),
+        ).fetchone()
+        # `MAX` always returns a row; the value is NULL when the filter
+        # matches nothing, which in sqlite3 surfaces as `None`.
+        if row is None or row["max_date"] is None:
+            return None
+        return date.fromisoformat(row["max_date"])
+
     def get_latest_on_or_before(
         self,
         base: str,

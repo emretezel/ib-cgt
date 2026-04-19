@@ -1,6 +1,6 @@
 """FX service — the business-logic layer over the repo and HTTP client.
 
-Three responsibilities, kept separate on the public surface:
+Two responsibilities, kept separate on the public surface:
 
 * `convert(amount, target, on)` — the read path. Never talks to the
   network. Uses the cache's `get_latest_on_or_before` with a bounded
@@ -9,14 +9,11 @@ Three responsibilities, kept separate on the public surface:
   native→GBP, GBP→native, and cross-currency (neither leg is GBP)
   via a GBP-pivot computation.
 
-* `preload(currencies, start, end)` — the write path. Finds the dates
-  the cache is missing for each currency, issues one Frankfurter
-  range request per contiguous gap, and upserts the responses. Never
-  re-fetches dates that are already cached.
-
-* `sync_for_tax_year(year, currencies)` — convenience wrapper. Pads
-  the front of the tax-year window by `fallback_days` so a
-  6-April-Monday fallback-to-Good-Friday lookup still has a rate.
+* `sync_currencies(currencies)` — the write path. For each currency,
+  looks up the newest cached `rate_date` and fetches only what's
+  newer from Frankfurter (from ECB's earliest publication on the
+  very first run). Idempotent: a second run against an up-to-date
+  cache issues zero HTTP calls.
 
 Rate storage convention: `base='GBP'`. A row `(GBP, USD, D, r)` means
 `1 GBP = r USD` on date `D` — matches Frankfurter's convention when we
@@ -33,7 +30,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from ib_cgt.db import FXRateRepo
-from ib_cgt.domain import Money, TaxYear
+from ib_cgt.domain import Money
 from ib_cgt.domain.money import validate_currency_code
 from ib_cgt.fx.client import FrankfurterClient
 from ib_cgt.fx.errors import RateNotFoundError
@@ -52,6 +49,11 @@ _DEFAULT_FALLBACK_DAYS = 10
 # CGT figure must be expressed in GBP; the constant still makes the
 # math below read better than a bare string literal.
 _GBP = "GBP"
+
+# ECB's first published reference-rate date (EUR base). Frankfurter's
+# free dataset begins here; a first-run sync for a previously-unseen
+# currency pulls the full history from this date forward.
+_ECB_EARLIEST = date(1999, 1, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -139,95 +141,77 @@ class FXService:
         return Money.of(result, target)
 
     # ------------------------------------------------------------------
-    # Write path — preload() and sync_for_tax_year()
+    # Write path — sync_currencies()
     # ------------------------------------------------------------------
 
-    def preload(
+    def sync_currencies(
         self,
-        *,
         currencies: Iterable[str],
-        start: date,
-        end: date,
-    ) -> int:
-        """Fetch any missing (date, currency) rates in `[start, end]` and upsert them.
+        *,
+        earliest: date = _ECB_EARLIEST,
+        today: date | None = None,
+    ) -> dict[str, int]:
+        """Incrementally refresh the cache for every supplied currency.
 
-        Per-currency strategy: check the cache first via
-        `dates_present`, and skip the HTTP call entirely if the window
-        is already fully populated. If anything is missing, we still
-        fetch the full `[start, end]` window in one range request
-        rather than itemising gaps — Frankfurter's response is tiny
-        (<= 300 dates x N symbols) and a single HTTP round-trip is
-        cheaper than multiple.
+        Per (GBP, quote) pair:
+
+        * If nothing is cached yet → fetch `[earliest .. today]`
+          (full ECB history on first run).
+        * If the cache's newest date is strictly before today → fetch
+          `[max_rate_date + 1 .. today]` (incremental top-up).
+        * If the cache is already at or ahead of today → skip the
+          HTTP call entirely (0 new rows reported).
+
+        One Frankfurter `fetch_range` per currency keeps the code
+        simple and lets each pair's window be sized independently.
+        Weekends / TARGET holidays are returned as gaps by Frankfurter;
+        we store only real publication dates, and the business-day
+        fallback in `convert()` handles lookups on non-publication
+        days.
 
         Args:
-            currencies: The quote currencies to fetch (against GBP).
-                `GBP` itself is silently filtered out so callers can
-                pass an unfiltered list from a `DISTINCT currency`
-                query without special-casing.
-            start: Inclusive lower bound for the window.
-            end: Inclusive upper bound for the window.
+            currencies: Quote currencies to sync (against GBP). `GBP`
+                is filtered out so callers can pass an unfiltered
+                `DISTINCT currency` list.
+            earliest: First date to use on a pair's very first run.
+                Defaults to 1999-01-04 (ECB's first EUR publication).
+                Exposed so tests can pin a shorter window.
+            today: Injectable "now" for deterministic tests. Defaults
+                to `date.today()`.
 
         Returns:
-            The total number of rate rows written (cache misses that
-            turned into Frankfurter hits). Zero if everything was
-            already cached.
+            A mapping `{currency: rows_written}`, preserving the input
+            order (minus duplicates and GBP). A currency whose cache
+            was already up-to-date maps to 0.
         """
-        if end < start:
-            raise ValueError(f"preload: end ({end}) is before start ({start})")
+        reference_today = today if today is not None else date.today()
 
-        # Stable, unique, upper-case; drop GBP because "base=GBP &
-        # symbols=GBP" is a degenerate query.
         quote_list = self._normalise_currencies(currencies)
         if not quote_list:
+            return {}
+
+        summary: dict[str, int] = {}
+        for quote in quote_list:
+            summary[quote] = self._sync_one(quote=quote, earliest=earliest, today=reference_today)
+        return summary
+
+    def _sync_one(self, *, quote: str, earliest: date, today: date) -> int:
+        """Fetch + upsert the missing window for a single (GBP, quote) pair."""
+        latest = self._repo.max_rate_date(_GBP, quote)
+        # Determine the window to request. First-run uses `earliest`;
+        # otherwise we resume strictly after the last cached date so we
+        # never re-download what we already have.
+        start = earliest if latest is None else latest + timedelta(days=1)
+
+        if start > today:
+            # Either we synced today already, or the cache is somehow
+            # ahead of today (clock skew, manual seeding). Nothing to do.
             return 0
 
-        total_written = 0
-        for quote in quote_list:
-            # We treat each quote independently so the set of missing
-            # dates is per-currency. That matters because a newly-added
-            # currency needs a full-window fetch even when other
-            # currencies are already cached.
-            present = self._repo.dates_present(_GBP, quote, start, end)
-            # Window size in calendar days (inclusive). ECB publishes on
-            # working days, so `present` will always have fewer entries
-            # than this; we use the inclusive span purely as an "is
-            # there any gap?" heuristic.
-            expected_span = (end - start).days + 1
-            if len(present) >= expected_span:
-                # Nothing more to do — cache already spans every
-                # calendar day in the window. (This branch is unlikely
-                # in practice because weekends are never cached, but
-                # cheap to check and keeps the "fully cached" path
-                # zero-cost.)
-                continue
-            fetched = self._client.fetch_range(base=_GBP, symbols=[quote], start=start, end=end)
-            if not fetched:
-                continue
-            # Filter out rates we already have — `upsert_many` would
-            # overwrite them with the same value, but a strict skip
-            # keeps the reported row count meaningful ("how many new
-            # rates did this sync add?").
-            missing = [r for r in fetched if r.rate_date not in present]
-            total_written += self._repo.upsert_many(missing)
-        return total_written
-
-    def sync_for_tax_year(
-        self,
-        year: TaxYear,
-        *,
-        currencies: Iterable[str],
-    ) -> int:
-        """Preload rates for the given tax year (6 Apr → 5 Apr).
-
-        The window is padded on the front by `fallback_days` so a
-        trade on the first weekend of the year can still fall back to
-        the previous Friday's rate. We do not pad the end: the last
-        day of the UK tax year (5 April) is itself fixed, so the
-        next-day boundary belongs to the following tax year's sync.
-        """
-        start = year.start_date - timedelta(days=self._fallback_days)
-        end = year.end_date
-        return self.preload(currencies=currencies, start=start, end=end)
+        fetched = self._client.fetch_range(base=_GBP, symbols=[quote], start=start, end=today)
+        if not fetched:
+            return 0
+        return self._repo.upsert_many(fetched)
 
     # ------------------------------------------------------------------
     # Internal helpers

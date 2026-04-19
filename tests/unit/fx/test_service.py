@@ -1,24 +1,22 @@
-"""Unit tests for `FXService` — convert / preload / sync_for_tax_year.
+"""Unit tests for `FXService.convert` — the read path only.
 
-Tests against a real (empty) SQLite DB per test via the `db` fixture;
-the Frankfurter client is either a respx-mocked real client (for
-preload / sync tests) or a stub that raises if called (for convert
-tests, which must never hit the network).
+Sync behaviour (write path) is covered in `test_sync_currencies.py`.
+These tests use a real (empty) SQLite DB per test via the `db`
+fixture and a stub Frankfurter client that raises if touched — the
+convert path must never hit the network.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
-import httpx
 import pytest
-import respx
 
 from ib_cgt.db import FXRate, FXRateRepo
-from ib_cgt.domain import Money, TaxYear
+from ib_cgt.domain import Money
 from ib_cgt.fx import FrankfurterClient, FXService, RateNotFoundError
 
 from .conftest import TEST_BASE_URL
@@ -154,104 +152,4 @@ def test_convert_cross_currency_pivots_through_gbp(db: sqlite3.Connection) -> No
 # ---------------------------------------------------------------------------
 
 
-@respx.mock
-def test_preload_fetches_only_when_cache_has_gaps(db: sqlite3.Connection) -> None:
-    """If every publication date is already cached, skip the HTTP call."""
-    # Seed every publication date in the window (business days only, but
-    # the repo doesn't care about weekends — we make `present` equal the
-    # *calendar-day span* to short-circuit the "check cache first" path).
-    rates = [
-        FXRate(
-            base="GBP",
-            quote="USD",
-            rate_date=date(2025, 1, 2) + timedelta(days=d),
-            rate=Decimal("1.25"),
-        )
-        for d in range(3)
-    ]
-    _seed(db, *rates)
-
-    # Cover the remaining two calendar days too so len(present) >= span.
-    # (The preload only fires when a gap exists.)
-    _seed(
-        db,
-        FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 5), rate=Decimal("1.25")),
-        FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 6), rate=Decimal("1.25")),
-    )
-
-    client = FrankfurterClient(base_url=TEST_BASE_URL)
-    # No route mounted — any call would 404 through respx. That's the
-    # assertion: preload must not hit the network.
-    service = FXService(FXRateRepo(db), client)
-    assert service.preload(currencies=["USD"], start=date(2025, 1, 2), end=date(2025, 1, 6)) == 0
-
-
-@respx.mock
-def test_preload_upserts_only_missing_dates(db: sqlite3.Connection) -> None:
-    """Already-cached dates are filtered out of the upsert."""
-    _seed(
-        db,
-        FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25")),
-    )
-    respx.get(f"{TEST_BASE_URL}/v1/2025-01-02..2025-01-03").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "base": "GBP",
-                "start_date": "2025-01-02",
-                "end_date": "2025-01-03",
-                "rates": {
-                    "2025-01-02": {"USD": 1.25},  # already cached
-                    "2025-01-03": {"USD": 1.26},  # new
-                },
-            },
-        )
-    )
-    service = FXService(FXRateRepo(db), FrankfurterClient(base_url=TEST_BASE_URL))
-    written = service.preload(currencies=["USD"], start=date(2025, 1, 2), end=date(2025, 1, 3))
-    assert written == 1
-
-
-def test_preload_drops_gbp_and_dedupes(db: sqlite3.Connection) -> None:
-    """GBP is filtered out; duplicates collapse without an HTTP call."""
-    service = _service(db)  # network-banned stub; passing through is fine
-    # Both GBP filtering and dedupe should prevent any fetch; network-banned
-    # client would raise otherwise.
-    assert (
-        service.preload(currencies=["GBP", "gbp"], start=date(2025, 1, 2), end=date(2025, 1, 6))
-        == 0
-    )
-
-
-def test_preload_rejects_reversed_window(db: sqlite3.Connection) -> None:
-    with pytest.raises(ValueError, match="before"):
-        _service(db).preload(currencies=["USD"], start=date(2025, 1, 5), end=date(2025, 1, 2))
-
-
-# ---------------------------------------------------------------------------
-# sync_for_tax_year — pads front of window by fallback_days
-# ---------------------------------------------------------------------------
-
-
-@respx.mock
-def test_sync_for_tax_year_pads_window_by_fallback_days(db: sqlite3.Connection) -> None:
-    """The range requested should start `fallback_days` before 6 Apr."""
-    # Watch the URL — that's what we assert on.
-    route = respx.get(f"{TEST_BASE_URL}/v1/2024-03-27..2025-04-05").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "base": "GBP",
-                "start_date": "2024-03-27",
-                "end_date": "2025-04-05",
-                "rates": {"2024-04-05": {"USD": 1.25}},
-            },
-        )
-    )
-    service = FXService(
-        FXRateRepo(db),
-        FrankfurterClient(base_url=TEST_BASE_URL),
-        fallback_days=10,
-    )
-    service.sync_for_tax_year(TaxYear(2024), currencies=["USD"])
-    assert route.called
+# Sync behaviour is covered end-to-end in `test_sync_currencies.py`.

@@ -6,9 +6,10 @@ ingestion and FX layers are runnable end-to-end. Commands:
 * ``ib-cgt db init`` — open the configured DB and apply migrations.
 * ``ib-cgt ingest PATH`` — parse and persist an IB HTML statement.
 * ``ib-cgt trades [filters]`` — print a rich table of stored trades.
-* ``ib-cgt fx sync --year YYYY`` — pull ECB rates for every currency
-  observed in that tax year's trades (or a user-supplied list) and
-  cache them locally.
+* ``ib-cgt fx sync [--currency CODE]...`` — for every currency seen
+  in imported statements, pull newer ECB rates from Frankfurter into
+  the local cache. First run for a pair pulls the full ECB history;
+  subsequent runs only fetch what is newer than what is cached.
 
 The command surface and help text are deliberately terse; we'll flesh
 them out when the calculator and reporting commands land in their own
@@ -35,9 +36,7 @@ from ib_cgt.db import (
     apply_migrations,
     open_connection,
 )
-from ib_cgt.db.codecs import date_to_text
-from ib_cgt.domain import TaxYear, Trade
-from ib_cgt.domain.tax_year import InvalidTaxYearError
+from ib_cgt.domain import Trade
 from ib_cgt.fx import FrankfurterClient, FXService
 from ib_cgt.ingest import IngestResult, ingest_statement
 
@@ -241,14 +240,6 @@ def _render_trades(rows: list[Trade], db_path: Path) -> None:
 
 @fx_app.command("sync")
 def fx_sync(
-    year: Annotated[
-        int,
-        typer.Option(
-            "--year",
-            "-y",
-            help="UK tax year start calendar year (e.g. 2024 for the 2024/25 year).",
-        ),
-    ],
     currency: Annotated[
         list[str] | None,
         typer.Option(
@@ -256,32 +247,35 @@ def fx_sync(
             "-c",
             help=(
                 "Quote currency to fetch. Repeat the flag for multiple. "
-                "Defaults to every non-GBP currency observed in that year's trades."
+                "When omitted, every non-GBP currency present in the "
+                "instruments table is synced."
             ),
         ),
     ] = None,
 ) -> None:
-    """Fetch ECB rates for the given tax year and cache them locally."""
-    try:
-        tax_year = TaxYear(year)
-    except InvalidTaxYearError as exc:
-        raise typer.BadParameter(f"invalid --year {year!r}: {exc}") from exc
+    """Incrementally sync ECB rates for every observed currency.
 
+    Per-pair behaviour:
+
+    * First run (no cached rates) → pull full ECB history from
+      1999-01-04.
+    * Subsequent runs → pull only rates newer than the latest cached
+      date.
+    """
     db_path = resolve_db_path()
     conn = open_connection(db_path)
     try:
         apply_migrations(conn)
-        # Auto-detect the currency set when the caller didn't supply one.
-        # Single DISTINCT query rather than N per-instrument lookups so
-        # this stays O(#traded instruments) at the DB layer.
+        # Explicit `--currency` overrides the DB-derived set — handy for
+        # one-off fetches or tests without needing any ingested trades.
         if currency:
             currencies = sorted({c.upper() for c in currency if c.strip() != ""})
         else:
-            currencies = _detect_currencies_for_year(conn, tax_year)
+            currencies = _detect_all_currencies(conn)
 
         if not currencies:
             _console.print(
-                f"[yellow]No non-GBP trades recorded for {tax_year.label}[/] — nothing to sync."
+                "[yellow]No non-GBP currencies observed in instruments[/] — nothing to sync."
             )
             return
 
@@ -289,45 +283,52 @@ def fx_sync(
             FXRateRepo(conn),
             FrankfurterClient(base_url=resolve_fx_base_url()),
         )
-        written = service.sync_for_tax_year(tax_year, currencies=currencies)
+        summary = service.sync_currencies(currencies)
+        # Re-read `max_rate_date` after the sync so the summary can show
+        # the new watermark per pair.
+        latest_by_ccy = {ccy: FXRateRepo(conn).max_rate_date("GBP", ccy) for ccy in summary}
     finally:
         conn.close()
 
-    _render_fx_sync_result(tax_year, currencies, written, db_path)
+    _render_fx_sync_result(summary, latest_by_ccy, db_path)
 
 
-def _detect_currencies_for_year(conn: sqlite3.Connection, tax_year: TaxYear) -> list[str]:
-    """Return every non-GBP instrument currency traded in `tax_year`.
+def _detect_all_currencies(conn: sqlite3.Connection) -> list[str]:
+    """Return every non-GBP currency referenced by any instrument.
 
-    Uses the `ix_trades_trade_date` index so the scan is O(#trades in
-    window). The join to `instruments` is by the narrow surrogate id,
-    so the plan is an index range scan followed by a PK lookup per
-    distinct instrument — fine for the result cardinality here (at
-    most a handful of currencies in practice).
+    Uses the `ix_instruments_currency` index so this is an index scan
+    that skips duplicates rather than a full table scan. The result
+    cardinality is small (a handful of currencies for a typical UK
+    taxpayer's IB portfolio), so the ordering is a stable sort that
+    makes the subsequent Rich table output deterministic.
     """
     rows = conn.execute(
-        "SELECT DISTINCT i.currency "
-        "FROM trades t JOIN instruments i ON i.instrument_id = t.instrument_id "
-        "WHERE t.trade_date BETWEEN ? AND ? AND i.currency != 'GBP' "
-        "ORDER BY i.currency",
-        (date_to_text(tax_year.start_date), date_to_text(tax_year.end_date)),
+        "SELECT DISTINCT currency FROM instruments WHERE currency != 'GBP' ORDER BY currency"
     ).fetchall()
     return [r["currency"] for r in rows]
 
 
 def _render_fx_sync_result(
-    tax_year: TaxYear,
-    currencies: list[str],
-    written: int,
+    summary: dict[str, int],
+    latest_by_ccy: dict[str, date | None],
     db_path: Path,
 ) -> None:
-    """Print a short summary of the FX sync run."""
-    _console.print(
-        f"[green]Synced[/] [bold]{written}[/] new rate(s) for "
-        f"[bold]{tax_year.label}[/] "
-        f"across {', '.join(currencies)} "
-        f"[dim]→ {db_path}[/]"
-    )
+    """Print a per-currency Rich table with the new rows and watermark."""
+    table = Table(title=f"FX sync → {db_path}")
+    table.add_column("Currency", style="bold")
+    table.add_column("New rows", justify="right")
+    table.add_column("Latest cached", justify="right")
+    total = 0
+    for ccy, rows_written in summary.items():
+        total += rows_written
+        latest = latest_by_ccy.get(ccy)
+        table.add_row(
+            ccy,
+            str(rows_written),
+            latest.isoformat() if latest is not None else "—",
+        )
+    _console.print(table)
+    _console.print(f"[green]Synced[/] [bold]{total}[/] new rate(s) total.")
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

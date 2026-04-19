@@ -12,7 +12,7 @@ from ib_cgt.db import apply_migrations, open_memory_connection
 def test_fresh_db_applies_initial_migration() -> None:
     conn = open_memory_connection()
     applied = apply_migrations(conn)
-    assert applied == [1]
+    assert applied == [1, 2]
     # `accounts` is the first table in 001_initial.sql, so its presence
     # confirms the script ran to completion (not just partially).
     row = conn.execute(
@@ -31,7 +31,7 @@ def test_schema_migrations_table_records_version() -> None:
     conn = open_memory_connection()
     apply_migrations(conn)
     rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    assert [int(r[0]) for r in rows] == [1]
+    assert [int(r[0]) for r in rows] == [1, 2]
 
 
 def test_foreign_keys_are_enforced_after_migration() -> None:

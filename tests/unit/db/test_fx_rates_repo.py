@@ -140,6 +140,64 @@ def test_latest_on_or_before_rejects_negative_lookback(db: sqlite3.Connection) -
         repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 2), max_lookback_days=-1)
 
 
+# ---------------------------------------------------------------------------
+# max_rate_date
+# ---------------------------------------------------------------------------
+
+
+def test_max_rate_date_returns_none_on_empty_pair(db: sqlite3.Connection) -> None:
+    """A pair with zero cached rows should return None, not raise."""
+    assert FXRateRepo(db).max_rate_date("GBP", "USD") is None
+
+
+def test_max_rate_date_returns_newest_cached(db: sqlite3.Connection) -> None:
+    """MAX(rate_date) must pick the latest date regardless of insert order."""
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [
+            FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 6), rate=Decimal("1.27")),
+            FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25")),
+            FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 3), rate=Decimal("1.26")),
+        ]
+    )
+    assert repo.max_rate_date("GBP", "USD") == date(2025, 1, 6)
+
+
+def test_max_rate_date_respects_pair_boundary(db: sqlite3.Connection) -> None:
+    """A EUR rate must not satisfy a USD lookup."""
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="EUR", rate_date=date(2025, 1, 6), rate=Decimal("1.20"))]
+    )
+    assert repo.max_rate_date("GBP", "USD") is None
+
+
+def test_max_rate_date_uses_primary_key(db: sqlite3.Connection) -> None:
+    """EXPLAIN QUERY PLAN must show an index search, not a full table scan.
+
+    SQLite names the PK's backing index `sqlite_autoindex_fx_rates_1`.
+    Any phrasing containing `USING` plus the PK prefix (`base=?`) is
+    acceptable — the key assertion is that no bare `SCAN fx_rates`
+    (without `USING ...`) occurs.
+    """
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25"))]
+    )
+    plan_rows = db.execute(
+        "EXPLAIN QUERY PLAN SELECT MAX(rate_date) FROM fx_rates WHERE base = ? AND quote = ?",
+        ("GBP", "USD"),
+    ).fetchall()
+    plan_text = " | ".join(r["detail"] for r in plan_rows)
+    assert "USING" in plan_text
+    assert "base=?" in plan_text  # PK prefix actually used
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN QUERY PLAN — get_latest_on_or_before
+# ---------------------------------------------------------------------------
+
+
 def test_latest_on_or_before_uses_primary_key_index(db: sqlite3.Connection) -> None:
     """EXPLAIN QUERY PLAN confirms the PK is used, not a table scan."""
     repo = FXRateRepo(db)

@@ -86,3 +86,23 @@ def test_find_id_returns_none_when_absent(db: sqlite3.Connection) -> None:
     assert repo.find_id(aapl) is None
     repo.upsert(aapl)
     assert repo.find_id(aapl) is not None
+
+
+def test_distinct_currency_uses_ix_instruments_currency(db: sqlite3.Connection) -> None:
+    """The DISTINCT-currency query the FX CLI issues must use the new index.
+
+    Without an index on `instruments.currency`, the query has to scan
+    the whole table. With `ix_instruments_currency` present (added by
+    migration 002), SQLite walks the index and skips duplicates.
+    EXPLAIN QUERY PLAN must mention the index by name.
+    """
+    repo = InstrumentRepo(db)
+    repo.upsert(StockInstrument(symbol="AAPL", currency="USD"))
+    repo.upsert(StockInstrument(symbol="SAP", currency="EUR"))
+    plan_rows = db.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT DISTINCT currency FROM instruments WHERE currency != 'GBP' "
+        "ORDER BY currency"
+    ).fetchall()
+    plan_text = " | ".join(r["detail"] for r in plan_rows)
+    assert "ix_instruments_currency" in plan_text

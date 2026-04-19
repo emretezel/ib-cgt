@@ -81,17 +81,23 @@ All arithmetic stays in `Decimal`; the result's precision is whatever
 falls out of Python's default decimal context (28 digits). Rounding to
 pennies is a reporting concern, not a conversion concern.
 
-## `ib-cgt fx sync --year YYYY`
+## `ib-cgt fx sync`
 
-Bulk-fills the cache for a UK tax year (6 Apr `YYYY` → 5 Apr `YYYY+1`),
-padded on the front by `fallback_days` so a 6 April Monday lookup can
-still fall back to Good Friday.
+Incrementally refreshes the FX cache for every currency the portfolio
+has ever traded against GBP. Run it once after ingesting statements;
+re-running is cheap and safe.
 
 ```text
-ib-cgt fx sync --year 2024
-# → fetches every ECB publication inside [2024-03-27, 2025-04-05]
-#   for every non-GBP currency that appears on a 2024/25 trade.
+ib-cgt fx sync
+# → for each distinct non-GBP currency in `instruments`, fetch only
+#   what is newer than the cache's most recent rate_date for that pair.
 ```
+
+On a brand-new cache for a pair, the window spans
+`[1999-01-04 .. today]` (ECB's first EUR publication). On subsequent
+runs it narrows to `[max_rate_date + 1 .. today]`. When the cache is
+already at or beyond `today`, the command skips the HTTP call and
+reports 0 new rows for that currency.
 
 Currency set, in order:
 
@@ -99,17 +105,19 @@ Currency set, in order:
    set (upper-cased, deduplicated).
 2. Otherwise, auto-detect:
    ```sql
-   SELECT DISTINCT i.currency
-     FROM trades t
-     JOIN instruments i ON i.instrument_id = t.instrument_id
-    WHERE t.trade_date BETWEEN <start> AND <end>
-      AND i.currency != 'GBP'
-    ORDER BY i.currency;
+   SELECT DISTINCT currency
+     FROM instruments
+    WHERE currency != 'GBP'
+    ORDER BY currency;
    ```
-   This uses the `ix_trades_trade_date` index.
+   This uses the `ix_instruments_currency` index — a covering index
+   that lets SQLite serve the DISTINCT via an index scan instead of a
+   full table scan.
 
-The command is idempotent: dates already cached are not re-fetched, and
-the "rows written" figure in the summary reflects genuinely new rows.
+The command is idempotent: cached dates are never re-fetched, and the
+"new rows" figure in the summary reflects genuinely new rows only. A
+fresh DB (or a GBP-only portfolio) prints `nothing to sync` and exits 0
+without making any HTTP calls.
 
 ### Environment variables
 
