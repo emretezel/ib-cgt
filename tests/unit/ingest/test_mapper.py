@@ -145,6 +145,10 @@ def _6lf5_info() -> RawInstrumentInfo:
         ("-1", "C", TradeAction.CLOSE_LONG),
         ("-1", "O", TradeAction.OPEN_SHORT),
         ("1", "C", TradeAction.CLOSE_SHORT),
+        # `Ep` rides on a close when IB physically/cash-settles a contract
+        # at expiry. It must route identically to a plain `C`.
+        ("1", "C;Ep", TradeAction.CLOSE_SHORT),
+        ("-4", "C;Ep", TradeAction.CLOSE_LONG),
     ],
 )
 def test_futures_actions(qty: str, code: str, expected: TradeAction) -> None:
@@ -155,7 +159,7 @@ def test_futures_actions(qty: str, code: str, expected: TradeAction) -> None:
     assert trade.instrument.contract_multiplier == Decimal("100000")
     assert trade.instrument.expiry_date == date(2024, 12, 31)
     # Quantity is always positive; sign lives in the action.
-    assert trade.quantity == Decimal("1")
+    assert trade.quantity == abs(Decimal(qty))
 
 
 def test_futures_missing_instrument_info_raises() -> None:
@@ -271,6 +275,56 @@ def test_forex_trade_mapping() -> None:
     # Price currency follows the instrument (base). See mapper docstring.
     assert trade.price.currency == "EUR"
     assert trade.price.amount == Decimal("0.85742")
+
+
+def test_forex_ep_ca_triad_collapses_to_single_delivery() -> None:
+    """A `Ep`/`Ca`/`Ep` triad on the same (symbol, datetime, price, abs-qty)
+    is IB's amendment pattern for a single physical-delivery FX leg.
+    We keep the net delivery (one `Ep` row) and drop the cancelled pair.
+
+    Mirrors the 2024-06-17 J7M4 JPY-futures settlement in 24_25.htm.
+    """
+    common = {
+        "asset_class": "Forex",
+        "currency": "USD",
+        "symbol": "USD.JPY",
+        "datetime_text": "2024-06-17, 17:15:00",
+        "price_text": "157.965405576",
+        "fees_text": "0",
+    }
+    rows = [
+        RawTradeRow(quantity_text="158262.49999998", code="Ep", **common),
+        RawTradeRow(quantity_text="-158262.49999998", code="Ca", **common),
+        RawTradeRow(quantity_text="158262.49999998", code="Ep", **common),
+    ]
+    trades = map_rows(_make(rows))
+    assert len(trades) == 1
+    trade = trades[0]
+    assert isinstance(trade.instrument, FXInstrument)
+    assert trade.action is TradeAction.BUY
+    assert trade.quantity == Decimal("158262.49999998")
+
+
+def test_forex_ep_standalone_passes_through() -> None:
+    """A lone `Ep` row without a matching `Ca` must not be dropped.
+
+    Mirrors the 2024-12-16 J7Z4 settlement, which emitted only one
+    Forex row instead of the three-row amendment triad.
+    """
+    row = RawTradeRow(
+        asset_class="Forex",
+        currency="USD",
+        symbol="USD.JPY",
+        datetime_text="2024-12-16, 17:15:00",
+        quantity_text="40484.37500001",
+        price_text="154.380548051",
+        fees_text="0",
+        code="Ep",
+    )
+    trades = map_rows(_make([row]))
+    assert len(trades) == 1
+    assert trades[0].action is TradeAction.BUY
+    assert trades[0].quantity == Decimal("40484.37500001")
 
 
 def test_forex_malformed_symbol_raises() -> None:

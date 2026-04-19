@@ -133,8 +133,16 @@ def map_rows(
     # to a single primary account.
     futures_pos: dict[str, Decimal] = {}
 
+    # Drop matched `Ep`/`Ca` amendment pairs among Forex rows before
+    # mapping. IB posts these triads on physically-settled futures
+    # deliveries (one `Ca` cancels one `Ep` at identical price); the net
+    # delivery would be correct either way, but collapsing them here
+    # keeps the audit trail readable and the S.104 pool diagnostics
+    # honest.
+    effective_rows = _collapse_ep_ca_pairs(parsed.trades)
+
     trades: list[Trade] = []
-    for raw in parsed.trades:
+    for raw in effective_rows:
         trades.extend(
             _map_one(
                 raw,
@@ -348,6 +356,53 @@ def _parse_decimal(text: str, *, field: str, raw: RawTradeRow) -> Decimal:
         raise MappingError(f"Unparseable {field} {text!r} on row {raw=}") from exc
 
 
+def _collapse_ep_ca_pairs(rows: tuple[RawTradeRow, ...]) -> list[RawTradeRow]:
+    """Drop matched `Ep`/`Ca` amendment pairs from the Forex row stream.
+
+    On a physical-settlement FX-futures expiry IB can post three Forex
+    rows for a single delivery: an `Ep` row, a `Ca` cancel row with the
+    opposite signed quantity, and a second `Ep` row (observed on the
+    2024-06-17 J7M4 settlement). The net quantity equals one delivery
+    and the raw rows cancel mathematically, but leaving the triad in
+    the S.104 pool makes audit trails confusing and is fragile if a
+    future price column ever differs between rows.
+
+    This helper groups Forex rows by
+    `(symbol, datetime_text, price_text, abs(quantity_text))` and
+    cancels each `Ca` row against one `Ep` row in the same group,
+    keeping any residual `Ep` rows. Non-Forex rows and Forex rows that
+    carry neither code pass through untouched, preserving input order.
+    """
+    if not rows:
+        return []
+
+    # Index every Forex row that is a candidate for cancellation by a
+    # tuple of its identifying columns, so we can pair Ep with Ca purely
+    # from string equality (no Decimal parsing needed here).
+    keep = [True] * len(rows)
+    groups: dict[tuple[str, str, str, str], list[int]] = {}
+    for idx, row in enumerate(rows):
+        if row.asset_class != "Forex":
+            continue
+        if "Ep" not in row.code and "Ca" not in row.code:
+            continue
+        abs_qty = row.quantity_text.lstrip("-")
+        key = (row.symbol, row.datetime_text, row.price_text, abs_qty)
+        groups.setdefault(key, []).append(idx)
+
+    # Within each group, pair the first N `Ca` rows with the first N
+    # `Ep` rows and mark both for removal; any extra `Ep` rows survive
+    # (these are the real deliveries).
+    for idx_list in groups.values():
+        ep_idxs = [i for i in idx_list if "Ep" in rows[i].code]
+        ca_idxs = [i for i in idx_list if "Ca" in rows[i].code]
+        n_pairs = min(len(ep_idxs), len(ca_idxs))
+        for i in ep_idxs[:n_pairs] + ca_idxs[:n_pairs]:
+            keep[i] = False
+
+    return [row for row, keep_it in zip(rows, keep, strict=True) if keep_it]
+
+
 def _derive_futures_events(
     signed_qty: Decimal,
     code: str,
@@ -371,8 +426,8 @@ def _derive_futures_events(
       `|prior_pos|` first, then OPEN for `|new_pos|` in the opposite
       direction.
 
-    Single-letter codes (`O`, `C`, `O;P`, `C;P`) skip the reversal logic
-    and use the sign x flag table directly:
+    Single-letter codes (`O`, `C`, `O;P`, `C;P`, `C;Ep`) skip the
+    reversal logic and use the sign x flag table directly:
 
     | qty sign | flag | action        |
     |----------|------|---------------|
@@ -380,6 +435,15 @@ def _derive_futures_events(
     |   -      |  C   | CLOSE_LONG    |
     |   -      |  O   | OPEN_SHORT    |
     |   +      |  C   | CLOSE_SHORT   |
+
+    `Ep` ("Resulted from an Expired Position" per IB's code legend) is
+    the physical-settlement / cash-expiry marker. It rides on a `C`
+    close — e.g. `C;Ep` — and is treated as an ordinary close; the
+    membership check `"O" in code` is False for `Ep`, so these rows
+    route correctly through the `has_close`-only branch below. The
+    currency-leg deliveries that accompany physically-settled FX
+    futures arrive as separate `Ep`-coded rows in the Forex section
+    and feed the FX pools via the normal BUY/SELL mapping.
     """
     has_open = "O" in code
     has_close = "C" in code
