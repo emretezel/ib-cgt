@@ -36,6 +36,11 @@ dependencies = [
     # alongside ingestion so the pipeline is runnable end-to-end today.
     "typer>=0.15",            # Typer builds on Click; good type-hint ergonomics
     "rich>=13.9",             # table rendering for `ib-cgt trades`
+    # FX service (component 4) — Frankfurter HTTP client backing the SQLite
+    # rate cache. httpx is the modern choice: typed, sync+async, and its
+    # request/response model is clean enough that we can keep the client
+    # surface tiny. No retries/backoff in v1 — fail fast and surface errors.
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +52,9 @@ dev = [
     # Type stubs for ingestion deps (rule 14: no blanket ignores).
     "types-beautifulsoup4>=4.12",
     "lxml-stubs>=0.5",
+    # FX client tests — respx intercepts httpx at the transport layer so
+    # tests assert against real URL/query shapes without real network.
+    "respx>=0.22",
 ]
 
 [project.scripts]

@@ -18,7 +18,7 @@ implementation status.
 - `cgt-rules.md` — UK CGT rules this tool implements (TCGA 1992 references).
   *(planned)*
 - `ingestion.md` — IB HTML format notes and known quirks. *(planned)*
-- `fx.md` — Frankfurter caching and business-day fallback. *(planned)*
+- [`fx.md`](./fx.md) — Frankfurter caching and business-day fallback.
 - `cli.md` — command reference. *(planned)*
 
 ## Setup

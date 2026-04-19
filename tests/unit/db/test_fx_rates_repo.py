@@ -71,3 +71,91 @@ def test_dates_present_rejects_reversed_range(db: sqlite3.Connection) -> None:
     repo = FXRateRepo(db)
     with pytest.raises(ValueError):
         repo.dates_present("GBP", "USD", date(2025, 1, 3), date(2025, 1, 1))
+
+
+# ---------------------------------------------------------------------------
+# get_latest_on_or_before
+# ---------------------------------------------------------------------------
+
+
+def test_latest_on_or_before_exact_hit(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25"))]
+    )
+    assert repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 2)) == (
+        date(2025, 1, 2),
+        Decimal("1.25"),
+    )
+
+
+def test_latest_on_or_before_falls_back_to_earlier_day(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    # Friday rate only; query Sunday (2 days later).
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 3), rate=Decimal("1.25"))]
+    )
+    assert repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 5)) == (
+        date(2025, 1, 3),
+        Decimal("1.25"),
+    )
+
+
+def test_latest_on_or_before_returns_none_beyond_window(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="USD", rate_date=date(2024, 12, 1), rate=Decimal("1.25"))]
+    )
+    # Default lookback is 10 days — 2025-01-05 is > 10 days after 2024-12-01.
+    assert repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 5)) is None
+
+
+def test_latest_on_or_before_respects_quote_boundary(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="EUR", rate_date=date(2025, 1, 2), rate=Decimal("1.20"))]
+    )
+    # A EUR rate must not satisfy a USD lookup.
+    assert repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 2)) is None
+
+
+def test_latest_on_or_before_picks_most_recent(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [
+            FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25")),
+            FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 6), rate=Decimal("1.27")),
+        ]
+    )
+    # Query Jan 8: most recent ≤ that is Jan 6.
+    assert repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 8)) == (
+        date(2025, 1, 6),
+        Decimal("1.27"),
+    )
+
+
+def test_latest_on_or_before_rejects_negative_lookback(db: sqlite3.Connection) -> None:
+    repo = FXRateRepo(db)
+    with pytest.raises(ValueError, match="non-negative"):
+        repo.get_latest_on_or_before("GBP", "USD", date(2025, 1, 2), max_lookback_days=-1)
+
+
+def test_latest_on_or_before_uses_primary_key_index(db: sqlite3.Connection) -> None:
+    """EXPLAIN QUERY PLAN confirms the PK is used, not a table scan."""
+    repo = FXRateRepo(db)
+    repo.upsert_many(
+        [FXRate(base="GBP", quote="USD", rate_date=date(2025, 1, 2), rate=Decimal("1.25"))]
+    )
+    plan_rows = db.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT rate_date, rate FROM fx_rates "
+        "WHERE base = ? AND quote = ? AND rate_date <= ? AND rate_date >= ? "
+        "ORDER BY rate_date DESC LIMIT 1",
+        ("GBP", "USD", "2025-01-02", "2024-12-23"),
+    ).fetchall()
+    plan_text = " | ".join(r["detail"] for r in plan_rows)
+    # Either the PK or the secondary index is acceptable — both are
+    # covering enough to avoid a full scan. What matters is that
+    # "SCAN fx_rates" (no USING clause) is absent.
+    assert "PRIMARY KEY" in plan_text or "USING INDEX" in plan_text
+    assert "SCAN fx_rates" not in plan_text or "USING" in plan_text  # no bare scan

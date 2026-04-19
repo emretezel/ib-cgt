@@ -193,7 +193,8 @@ items marked ⬜ are pending.
 2. ✅ **Domain model** — dataclasses / enums; no I/O.
 3. ✅ **DB schema + migrations + repos** — tables, indexes, repositories
    with unit tests.
-4. ⬜ **FX service** — Frankfurter client, cache, business-day fallback.
+4. ✅ **FX service** — Frankfurter client, cache, business-day fallback.
+   See [`fx.md`](./fx.md).
 5. ✅ **Statement ingestion** — HTML parser, canonical mapping, dedup,
    CLI `ingest`.
 6. ⬜ **Matching engine + StockRuleEngine** — same-day / 30-day / S.104
@@ -216,11 +217,11 @@ items marked ⬜ are pending.
 | 2 | Domain model | `ib_cgt.domain` | ✅ Done |
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
-| 5 | FX service | `ib_cgt.fx` | ⬜ Pending |
+| 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ⬜ Pending |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md` + this page |

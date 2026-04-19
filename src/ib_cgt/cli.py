@@ -1,21 +1,25 @@
-"""Minimal Typer CLI — `db init`, `ingest`, `trades`.
+"""Minimal Typer CLI — `db init`, `ingest`, `trades`, `fx sync`.
 
 This ships ahead of the full CLI plan (architecture step 8) so the
-ingestion layer is runnable end-to-end. Commands:
+ingestion and FX layers are runnable end-to-end. Commands:
 
 * ``ib-cgt db init`` — open the configured DB and apply migrations.
 * ``ib-cgt ingest PATH`` — parse and persist an IB HTML statement.
 * ``ib-cgt trades [filters]`` — print a rich table of stored trades.
+* ``ib-cgt fx sync --year YYYY`` — pull ECB rates for every currency
+  observed in that tax year's trades (or a user-supplied list) and
+  cache them locally.
 
 The command surface and help text are deliberately terse; we'll flesh
-them out when the calculator, FX service, and reporting commands land
-in their own plans.
+them out when the calculator and reporting commands land in their own
+plans.
 
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
@@ -24,13 +28,17 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from ib_cgt.config import resolve_db_path
+from ib_cgt.config import resolve_db_path, resolve_fx_base_url
 from ib_cgt.db import (
+    FXRateRepo,
     TradeRepo,
     apply_migrations,
     open_connection,
 )
-from ib_cgt.domain import Trade
+from ib_cgt.db.codecs import date_to_text
+from ib_cgt.domain import TaxYear, Trade
+from ib_cgt.domain.tax_year import InvalidTaxYearError
+from ib_cgt.fx import FrankfurterClient, FXService
 from ib_cgt.ingest import IngestResult, ingest_statement
 
 # Two sub-apps keeps related commands grouped in `--help` output: `db`
@@ -48,6 +56,11 @@ db_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(db_app, name="db")
+fx_app = typer.Typer(
+    help="FX rate cache management (Frankfurter / ECB).",
+    no_args_is_help=True,
+)
+app.add_typer(fx_app, name="fx")
 
 # One module-level Console so colour / width detection is shared across
 # commands — cheaper than re-constructing it per call.
@@ -219,6 +232,102 @@ def _render_trades(rows: list[Trade], db_path: Path) -> None:
         )
 
     _console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# `fx sync`
+# ---------------------------------------------------------------------------
+
+
+@fx_app.command("sync")
+def fx_sync(
+    year: Annotated[
+        int,
+        typer.Option(
+            "--year",
+            "-y",
+            help="UK tax year start calendar year (e.g. 2024 for the 2024/25 year).",
+        ),
+    ],
+    currency: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--currency",
+            "-c",
+            help=(
+                "Quote currency to fetch. Repeat the flag for multiple. "
+                "Defaults to every non-GBP currency observed in that year's trades."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Fetch ECB rates for the given tax year and cache them locally."""
+    try:
+        tax_year = TaxYear(year)
+    except InvalidTaxYearError as exc:
+        raise typer.BadParameter(f"invalid --year {year!r}: {exc}") from exc
+
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        apply_migrations(conn)
+        # Auto-detect the currency set when the caller didn't supply one.
+        # Single DISTINCT query rather than N per-instrument lookups so
+        # this stays O(#traded instruments) at the DB layer.
+        if currency:
+            currencies = sorted({c.upper() for c in currency if c.strip() != ""})
+        else:
+            currencies = _detect_currencies_for_year(conn, tax_year)
+
+        if not currencies:
+            _console.print(
+                f"[yellow]No non-GBP trades recorded for {tax_year.label}[/] — nothing to sync."
+            )
+            return
+
+        service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        written = service.sync_for_tax_year(tax_year, currencies=currencies)
+    finally:
+        conn.close()
+
+    _render_fx_sync_result(tax_year, currencies, written, db_path)
+
+
+def _detect_currencies_for_year(conn: sqlite3.Connection, tax_year: TaxYear) -> list[str]:
+    """Return every non-GBP instrument currency traded in `tax_year`.
+
+    Uses the `ix_trades_trade_date` index so the scan is O(#trades in
+    window). The join to `instruments` is by the narrow surrogate id,
+    so the plan is an index range scan followed by a PK lookup per
+    distinct instrument — fine for the result cardinality here (at
+    most a handful of currencies in practice).
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT i.currency "
+        "FROM trades t JOIN instruments i ON i.instrument_id = t.instrument_id "
+        "WHERE t.trade_date BETWEEN ? AND ? AND i.currency != 'GBP' "
+        "ORDER BY i.currency",
+        (date_to_text(tax_year.start_date), date_to_text(tax_year.end_date)),
+    ).fetchall()
+    return [r["currency"] for r in rows]
+
+
+def _render_fx_sync_result(
+    tax_year: TaxYear,
+    currencies: list[str],
+    written: int,
+    db_path: Path,
+) -> None:
+    """Print a short summary of the FX sync run."""
+    _console.print(
+        f"[green]Synced[/] [bold]{written}[/] new rate(s) for "
+        f"[bold]{tax_year.label}[/] "
+        f"across {', '.join(currencies)} "
+        f"[dim]→ {db_path}[/]"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path
