@@ -91,18 +91,25 @@ def test_future_expiry_differs() -> None:
         contract_multiplier=Decimal("50"),
         expiry_date=date(2025, 3, 21),
     )
-    base = {
-        "account_id": "U1",
-        "action": TradeAction.OPEN_LONG,
-        "trade_datetime": dt,
-        "trade_date": dt.date(),
-        "settlement_date": dt.date(),
-        "quantity": Decimal("1"),
-        "price": Money.of("4500", "USD"),
-        "fees": Money.zero("USD"),
-    }
-    t_jan = Trade(instrument=jan, **base)
-    t_mar = Trade(instrument=mar, **base)
+
+    # A typed builder closure beats a `**dict` splat: mypy preserves
+    # the per-field types end-to-end, and the only difference between
+    # the two trades stays obvious at the call site.
+    def make(instrument: FutureInstrument) -> Trade:
+        return Trade(
+            account_id="U1",
+            instrument=instrument,
+            action=TradeAction.OPEN_LONG,
+            trade_datetime=dt,
+            trade_date=dt.date(),
+            settlement_date=dt.date(),
+            quantity=Decimal("1"),
+            price=Money.of("4500", "USD"),
+            fees=Money.zero("USD"),
+        )
+
+    t_jan = make(jan)
+    t_mar = make(mar)
     assert build_trade_key(t_jan) != build_trade_key(t_mar)
 
 
@@ -118,28 +125,25 @@ def test_fx_pair_differs() -> None:
         currency="USD",
         currency_pair=CurrencyPair(base="USD", quote="GBP"),
     )
-    common_shared = {
-        "account_id": "U1",
-        "action": TradeAction.SELL,
-        "trade_datetime": dt,
-        "trade_date": dt.date(),
-        "settlement_date": dt.date(),
-        "quantity": Decimal("3.64"),
-    }
-    # Price currency must match instrument.currency, so separate Money
-    # values per instrument.
-    t_eur = Trade(
-        instrument=eurgbp,
-        price=Money.of("0.85742", "EUR"),
-        fees=Money.zero("EUR"),
-        **common_shared,
-    )
-    t_usd = Trade(
-        instrument=usdgbp,
-        price=Money.of("0.79", "USD"),
-        fees=Money.zero("USD"),
-        **common_shared,
-    )
+
+    # Price currency must match instrument.currency, so the helper
+    # takes price and fees explicitly. A typed closure preserves
+    # static checking that a `**dict` splat would lose.
+    def make(instrument: FXInstrument, price: Money, fees: Money) -> Trade:
+        return Trade(
+            account_id="U1",
+            instrument=instrument,
+            action=TradeAction.SELL,
+            trade_datetime=dt,
+            trade_date=dt.date(),
+            settlement_date=dt.date(),
+            quantity=Decimal("3.64"),
+            price=price,
+            fees=fees,
+        )
+
+    t_eur = make(eurgbp, Money.of("0.85742", "EUR"), Money.zero("EUR"))
+    t_usd = make(usdgbp, Money.of("0.79", "USD"), Money.zero("USD"))
     assert build_trade_key(t_eur) != build_trade_key(t_usd)
 
 

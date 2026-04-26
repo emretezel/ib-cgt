@@ -7,6 +7,7 @@ to exercise the same code path a real `ib-cgt ingest` invocation would.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
 
 
 @pytest.fixture
-def db(tmp_path: Path) -> sqlite3.Connection:
+def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     """Copy of the DB fixture from `tests/unit/db/conftest.py`.
 
     We redeclare it locally so the ingest test package doesn't reach

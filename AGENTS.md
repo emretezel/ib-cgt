@@ -86,7 +86,9 @@ When proposing database changes, include:
 
 - Use **mypy** for static type checking.
 - Use **ruff** for formatting, linting, and other checks.
-- Fix mypy errors in elegant ways — no hacks, no blanket `# type: ignore`, no weakening of types just to silence the checker.
+- **Always fix every mypy error.** `mypy src/ tests/` must report zero errors at the end of every change. Do not commit, push, or open a PR while errors remain — pre-existing errors are not an excuse to introduce more, and "the file I touched is clean" is not enough.
+- Fix mypy errors in elegant ways — no `# type: ignore` (blanket or targeted), no `Any` / `object` widening to silence the checker, no removing or loosening annotations to dodge a complaint. If mypy is unhappy, the type model is telling you something — fix the design, not the annotation.
+- Treat `ruff format`, `ruff check`, `mypy`, and `pytest` as a single quality gate. Every commit must pass all four locally before being pushed.
 
 ## 9. Coding Conventions
 
