@@ -19,6 +19,7 @@ implementation status.
   *(planned)*
 - `ingestion.md` — IB HTML format notes and known quirks. *(planned)*
 - [`fx.md`](./fx.md) — Frankfurter caching and business-day fallback.
+- [`db/index.md`](./db/index.md) — database reference, one page per table.
 - `cli.md` — command reference. *(planned)*
 
 ## Setup
