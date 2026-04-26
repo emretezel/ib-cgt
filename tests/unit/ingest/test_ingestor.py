@@ -77,3 +77,53 @@ def test_ingest_two_distinct_statements_accumulate(db: sqlite3.Connection) -> No
     assert a.inserted_count == 5
     assert b.inserted_count == 1
     assert TradeRepo(db).count() == 6
+
+
+def test_replace_overwrites_existing_statement(db: sqlite3.Connection) -> None:
+    """`replace=True` must delete the prior import and re-insert fresh.
+
+    Asserts (a) the trade count after replacement matches the
+    fixture (no duplicates from the prior import lingering), (b) the
+    `statements.imported_at` timestamp moves forward (a fresh row was
+    written), and (c) the result advertises `replaced=True` /
+    `already_imported=False`.
+    """
+    fixture = _FIXTURES / "mixed_tiny.htm"
+
+    first = ingest_statement(fixture, db)
+    first_imported_at = db.execute(
+        "SELECT imported_at FROM statements WHERE statement_hash = ?",
+        (first.statement_hash,),
+    ).fetchone()["imported_at"]
+
+    second = ingest_statement(fixture, db, replace=True)
+
+    assert second.replaced is True
+    assert second.already_imported is False
+    assert second.statement_hash == first.statement_hash
+    # Same fixture → same trade_count; the cascade prevented any
+    # leftover rows from the first import.
+    assert second.trade_count == first.trade_count
+    assert TradeRepo(db).count() == first.trade_count
+
+    second_imported_at = db.execute(
+        "SELECT imported_at FROM statements WHERE statement_hash = ?",
+        (first.statement_hash,),
+    ).fetchone()["imported_at"]
+    assert second_imported_at >= first_imported_at, (
+        "replace should rewrite the statements row with a fresh imported_at"
+    )
+
+
+def test_replace_on_unseen_statement_behaves_like_normal_ingest(
+    db: sqlite3.Connection,
+) -> None:
+    """`replace=True` on a never-seen file is just a normal ingest.
+
+    The flag's contract is "delete prior if any" — when there is no
+    prior, it must not error and must not flip `replaced` to True.
+    """
+    result = ingest_statement(_FIXTURES / "mixed_tiny.htm", db, replace=True)
+    assert result.replaced is False
+    assert result.already_imported is False
+    assert result.inserted_count == result.trade_count > 0

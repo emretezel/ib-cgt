@@ -33,7 +33,11 @@ time no-op rather than a full re-parse.
 
 - `account_id` → [`accounts.account_id`](./accounts.md). On delete:
   default (restrict). Inbound:
-  [`trades.source_statement_hash`](./trades.md) targets this table.
+  [`trades.source_statement_hash`](./trades.md) targets this table
+  with `ON DELETE CASCADE` (migration 004), so a `DELETE FROM
+  statements WHERE statement_hash = ?` also removes every trade for
+  that statement. This is what `ib-cgt ingest --replace` and
+  `ib-cgt db reset` rely on.
 
 ## Uniqueness constraints
 

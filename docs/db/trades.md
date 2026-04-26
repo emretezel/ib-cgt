@@ -43,13 +43,16 @@ PK collapses duplicates from re-running the same statement.
 
 ## Foreign keys
 
-- `account_id` → [`accounts.account_id`](./accounts.md)
-- `instrument_id` → [`instruments.instrument_id`](./instruments.md)
-- `source_statement_hash` → [`statements.statement_hash`](./statements.md)
+- `account_id` → [`accounts.account_id`](./accounts.md) — default `RESTRICT`.
+- `instrument_id` → [`instruments.instrument_id`](./instruments.md) — default `RESTRICT`.
+- `source_statement_hash` → [`statements.statement_hash`](./statements.md) — `ON DELETE CASCADE` (migration 004).
 
-All three default to `RESTRICT` on delete — a parent row with
-dependent trades cannot be removed without first deleting (or
-re-pointing) the trades.
+The cascade on `source_statement_hash` is what makes
+`ib-cgt ingest --replace` and `ib-cgt db reset` clean: deleting a
+`statements` row also removes every trade that pointed at it. The
+account and instrument FKs keep RESTRICT semantics because deleting
+an account or instrument that still has trades is almost always a
+mistake.
 
 ## Uniqueness constraints
 

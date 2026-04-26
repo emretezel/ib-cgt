@@ -24,11 +24,12 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`3`** (`001_initial.sql`, `002_ix_instruments_currency.sql`, and
-`003_split_instruments.sql` all applied). Whenever a new migration
-lands in the repository, run `ib-cgt db init` against this database
-and regenerate this documentation so the per-table pages reflect what
-is actually deployed.
+`4`** (`001_initial.sql`, `002_ix_instruments_currency.sql`,
+`003_split_instruments.sql`, and
+`004_cascade_trades_on_statement_delete.sql` all applied). Whenever a
+new migration lands in the repository, run `ib-cgt db init` against
+this database and regenerate this documentation so the per-table
+pages reflect what is actually deployed.
 
 ## Tables
 
@@ -70,7 +71,7 @@ Foreign-key chain in detail:
 - `statements.account_id`              → `accounts.account_id`
 - `trades.account_id`                  → `accounts.account_id`
 - `trades.instrument_id`               → `instruments.instrument_id`
-- `trades.source_statement_hash`       → `statements.statement_hash`
+- `trades.source_statement_hash`       → `statements.statement_hash` `ON DELETE CASCADE`
 - `stock_instruments.instrument_id`    → `instruments.instrument_id` `ON DELETE CASCADE`
 - `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
 - `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`

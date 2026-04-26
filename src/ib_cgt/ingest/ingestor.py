@@ -49,7 +49,12 @@ class IngestResult:
             `trade_count` if some trades were already present from a
             prior, partially-overlapping import.
         already_imported: True iff the byte-identical statement had
-            been imported before — parse/map were skipped.
+            been imported before — parse/map were skipped. Mutually
+            exclusive with `replaced`.
+        replaced: True iff a prior import of this exact hash existed
+            and was deleted before this fresh ingest landed (the
+            `replace=True` path). Mutually exclusive with
+            `already_imported`.
     """
 
     statement_hash: str
@@ -57,15 +62,27 @@ class IngestResult:
     trade_count: int
     inserted_count: int
     already_imported: bool
+    replaced: bool = False
 
 
-def ingest_statement(path: Path, conn: sqlite3.Connection) -> IngestResult:
+def ingest_statement(
+    path: Path,
+    conn: sqlite3.Connection,
+    *,
+    replace: bool = False,
+) -> IngestResult:
     """Parse the file at `path` and persist its trades via `conn`.
 
     Args:
         path: Absolute or CWD-relative path to an IB HTML `.htm` file.
         conn: An already-open, already-migrated SQLite connection
             (typically from `open_connection` + `apply_migrations`).
+        replace: When True, a prior import of the same hash is
+            *deleted* (along with its trades, via the migration-004
+            cascade) before this fresh ingest runs. The default
+            `False` preserves the historical short-circuit behaviour
+            — a repeat ingest of an already-imported statement is a
+            constant-time no-op.
 
     Returns:
         `IngestResult` — see docstring for field semantics.
@@ -78,7 +95,9 @@ def ingest_statement(path: Path, conn: sqlite3.Connection) -> IngestResult:
     statement_hash = compute_statement_hash(source_bytes)
 
     statements = StatementRepo(conn)
-    if statements.exists(statement_hash):
+    prior_existed = statements.exists(statement_hash)
+
+    if prior_existed and not replace:
         # We could re-derive the account id via a secondary SELECT on
         # `statements`, but it's cheaper to reparse only the header —
         # except that hash-based short-circuits exist precisely to avoid
@@ -107,8 +126,19 @@ def ingest_statement(path: Path, conn: sqlite3.Connection) -> IngestResult:
 
     # One transaction for everything the parser produced. `with conn:`
     # issues COMMIT on successful exit and ROLLBACK on exception, which
-    # is exactly the atomicity the idempotency story relies on.
+    # is exactly the atomicity the idempotency story relies on. When
+    # `replace` is set, the prior-row delete also lives inside this
+    # transaction so a failure between the delete and the re-insert
+    # leaves the DB exactly as it was before the call.
     with conn:
+        if prior_existed and replace:
+            # Migration 004 made `trades.source_statement_hash`
+            # ON DELETE CASCADE, so removing the `statements` row also
+            # removes every trade that pointed at it.
+            conn.execute(
+                "DELETE FROM statements WHERE statement_hash = ?",
+                (statement_hash,),
+            )
         accounts.upsert(Account(account_id=parsed.account_id))
         statements.record(
             statement_hash=statement_hash,
@@ -128,6 +158,7 @@ def ingest_statement(path: Path, conn: sqlite3.Connection) -> IngestResult:
         trade_count=len(trades),
         inserted_count=inserted,
         already_imported=False,
+        replaced=prior_existed and replace,
     )
 
 
