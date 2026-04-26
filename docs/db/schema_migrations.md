@@ -70,8 +70,12 @@ None.
 
 ## Sample (first 5 rows)
 
+Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM schema_migrations LIMIT 5;"` (the literal token `NULL`
+is shown for null values, to distinguish them from empty strings).
+
 ```
-version  applied_at
--------  --------------------------------
-1        2026-04-18T22:19:57.419700+00:00
+version|applied_at
+1|2026-04-18T22:19:57.419700+00:00
+2|2026-04-26T10:36:46.827346+00:00
 ```

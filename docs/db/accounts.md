@@ -67,4 +67,11 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM accounts LIMIT 5;"` (the literal token `NULL` is shown
+for null values).
+
+```
+account_id|label
+U1004320|NULL
+```

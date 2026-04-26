@@ -68,12 +68,7 @@ None outbound. Inbound references:
 | Name | Columns | Query pattern served |
 |---|---|---|
 | `ix_instruments_symbol` | `(symbol)` | `ib-cgt trades --symbol …` filtering and other CLI lookups by symbol. |
-
-> **Note.** Migration `002_ix_instruments_currency.sql` adds
-> `ix_instruments_currency` on `(currency)` to serve the FX sync
-> ("which currencies do we have rates to fetch for?") but is not
-> applied to the live database at the time of writing. Run
-> `ib-cgt db init` to apply it.
+| `ix_instruments_currency` | `(currency)` | FX sync — "which currencies do we have rates to fetch for?" |
 
 ## Views
 
@@ -105,4 +100,15 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM instruments LIMIT 5;"` (the literal token `NULL` is
+shown for null values).
+
+```
+instrument_id|asset_class|symbol|currency|isin|is_cgt_exempt|contract_multiplier|expiry_date|fx_base|fx_quote
+1|stock|EOLU B|SEK|NULL|NULL|NULL|NULL|NULL|NULL
+2|future|ECOK8|EUR|NULL|NULL|50|2018-04-30|NULL|NULL
+3|future|ECOK8|EUR|NULL|NULL|50|2018-04-30|NULL|NULL
+4|future|FGBM JUN 18|EUR|NULL|NULL|1000|2018-06-07|NULL|NULL
+5|future|FGBM JUN 18|EUR|NULL|NULL|1000|2018-06-07|NULL|NULL
+```

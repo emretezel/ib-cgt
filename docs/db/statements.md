@@ -75,4 +75,11 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM statements LIMIT 5;"` (the literal token `NULL` is
+shown for null values).
+
+```
+statement_hash|source_path|account_id|imported_at|trade_count
+a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7|/Users/emre/opt/ib-cgt/statements/futures/17_18.htm|U1004320|2026-04-26T10:36:46.941668+00:00|34
+```

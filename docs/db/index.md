@@ -24,11 +24,11 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`1`**. Migration `002_ix_instruments_currency.sql` exists in the
-repository but has not yet been applied to the live database, so the
-index it adds (`ix_instruments_currency`) is **not** in the per-table
-pages below. Re-run `ib-cgt db init` to bring the live schema up to the
-latest version, after which this documentation should be regenerated.
+`2`** (`001_initial.sql` and `002_ix_instruments_currency.sql` both
+applied). Whenever a new migration lands in the repository, run
+`ib-cgt db init` against this database and regenerate this
+documentation so the per-table pages reflect what is actually
+deployed.
 
 ## Tables
 

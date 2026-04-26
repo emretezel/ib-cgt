@@ -18,7 +18,7 @@ executed in; FX conversion to GBP is applied later, from the
 | `trade_key` | `TEXT` | No (PK) | Composite business key produced by ingestion (account + datetime + symbol + …). |
 | `account_id` | `TEXT` | No (FK) | Owning IB account. |
 | `instrument_id` | `INTEGER` | No (FK) | The instrument traded. |
-| `action` | `TEXT` | No | Trade action; in the domain enum: `BUY` or `SELL`. |
+| `action` | `TEXT` | No | Trade action; values come from the domain `TradeAction` enum (e.g. `sell`, `open_long`, `close_long`). |
 | `trade_datetime` | `TEXT` | No | Execution timestamp, ISO-8601 UTC with offset. |
 | `trade_date` | `TEXT` | No | `YYYY-MM-DD` execution date — used for tax-year cut-off and 30-day rule windows. |
 | `settlement_date` | `TEXT` | No | `YYYY-MM-DD` settlement date as reported by IB. |
@@ -60,7 +60,8 @@ uniqueness invariant the table needs.
 
 None at the database level. The `action` enum is enforced by the
 domain layer (`TradeAction`) on read/write rather than by a SQL CHECK
-— a deliberate gap that should be tightened in a future migration.
+— a deliberate gap that should be tightened in a future migration to
+restrict the column to the enum's value set.
 
 ## Indexes
 
@@ -108,4 +109,15 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM trades LIMIT 5;"` (the literal token `NULL` is shown
+for null values; lines wrap because the row is wide).
+
+```
+trade_key|account_id|instrument_id|action|trade_datetime|trade_date|settlement_date|quantity|price_amount|price_currency|fees_amount|fees_currency|accrued_amount|accrued_currency|source_statement_hash
+8949b30740b13cb72026be56dd9429abed77f44b21125d84344720e955ea8718|U1004320|1|sell|2018-01-03T06:28:02+00:00|2018-01-03|2018-01-03|2500|29.7000|SEK|49.00|SEK|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+27dca15bbee3d1e35eb5e8010d2d6b3568a32e138efea024997749a95e60c80a|U1004320|2|open_long|2018-02-07T05:26:06+00:00|2018-02-07|2018-02-07|1|350.5000|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+342f128a792972c47d3851dba752920281482124088240978c81b60a6c958a78|U1004320|2|close_long|2018-04-04T03:47:57+00:00|2018-04-04|2018-04-04|1|349.0000|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+1b8ba81ef8a12dbf1448cd8d9627bb393b9c77356a22e432f623a50c0640d61a|U1004320|4|open_long|2018-03-07T05:08:45+00:00|2018-03-07|2018-03-07|1|130.1700|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+fd67ebf58ab2e763f124c074e431ca370a05cc6850f3e1647d20408b83f2ab65|U1004320|4|close_long|2018-03-28T03:36:13+00:00|2018-03-28|2018-03-28|1|131.2400|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+```
