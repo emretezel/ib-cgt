@@ -67,11 +67,12 @@ None.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM accounts LIMIT 5;"` (the literal token `NULL` is shown
-for null values).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM accounts LIMIT 5;"`. Each row is rendered as a block
+of `column = value` lines (SQLite's `-line` mode) separated by a
+blank line; nulls appear as the literal token `NULL`.
 
 ```
-account_id|label
-U1004320|NULL
+account_id = U1004320
+     label = NULL
 ```

@@ -69,11 +69,13 @@ of the UNION ALL.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM stock_instruments LIMIT 5;"` (the literal token `NULL`
-is shown for null values).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM stock_instruments LIMIT 5;"`. Each row is rendered as
+a block of `column = value` lines (SQLite's `-line` mode) separated
+by a blank line; nulls appear as the literal token `NULL`.
 
 ```
-instrument_id|symbol|currency
-1|EOLU B|SEK
+instrument_id = 1
+       symbol = EOLU B
+     currency = SEK
 ```

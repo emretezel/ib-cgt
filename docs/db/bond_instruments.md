@@ -70,9 +70,4 @@ of the UNION ALL also exposes `is_cgt_exempt`.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM bond_instruments LIMIT 5;"`.
-
-```
-(table is currently empty)
-```
+Table is currently empty.

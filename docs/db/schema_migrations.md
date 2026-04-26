@@ -70,13 +70,18 @@ None.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM schema_migrations LIMIT 5;"` (the literal token `NULL`
-is shown for null values, to distinguish them from empty strings).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM schema_migrations LIMIT 5;"`. Each row is rendered as
+a block of `column = value` lines (SQLite's `-line` mode) separated
+by a blank line; nulls appear as the literal token `NULL`.
 
 ```
-version|applied_at
-1|2026-04-26T16:12:22.822754+00:00
-2|2026-04-26T16:12:22.824096+00:00
-3|2026-04-26T16:12:22.824225+00:00
+   version = 1
+applied_at = 2026-04-26T16:12:22.822754+00:00
+
+   version = 2
+applied_at = 2026-04-26T16:12:22.824096+00:00
+
+   version = 3
+applied_at = 2026-04-26T16:12:22.824225+00:00
 ```

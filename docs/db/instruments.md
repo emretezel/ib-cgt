@@ -94,15 +94,29 @@ column shape for callers that don't care about the discriminator.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM instruments LIMIT 5;"` (the literal token `NULL` is
-shown for null values).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM instruments LIMIT 5;"`. Each row is rendered as a
+block of `column = value` lines (SQLite's `-line` mode) separated by
+a blank line; nulls appear as the literal token `NULL`.
 
 ```
-instrument_id|asset_class|isin
-1|stock|NULL
-2|future|NULL
-3|future|NULL
-4|future|NULL
-5|future|NULL
+instrument_id = 1
+  asset_class = stock
+         isin = NULL
+
+instrument_id = 2
+  asset_class = future
+         isin = NULL
+
+instrument_id = 3
+  asset_class = future
+         isin = NULL
+
+instrument_id = 4
+  asset_class = future
+         isin = NULL
+
+instrument_id = 5
+  asset_class = future
+         isin = NULL
 ```

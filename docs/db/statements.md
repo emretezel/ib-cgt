@@ -75,11 +75,15 @@ None.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM statements LIMIT 5;"` (the literal token `NULL` is
-shown for null values).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM statements LIMIT 5;"`. Each row is rendered as a
+block of `column = value` lines (SQLite's `-line` mode) separated by
+a blank line; nulls appear as the literal token `NULL`.
 
 ```
-statement_hash|source_path|account_id|imported_at|trade_count
-a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7|/Users/emre/opt/ib-cgt/statements/futures/17_18.htm|U1004320|2026-04-26T16:12:23.932442+00:00|34
+statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+   source_path = /Users/emre/opt/ib-cgt/statements/futures/17_18.htm
+    account_id = U1004320
+   imported_at = 2026-04-26T16:12:23.932442+00:00
+   trade_count = 34
 ```

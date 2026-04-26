@@ -78,13 +78,33 @@ the UNION ALL exposes `fx_base` and `fx_quote`.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM fx_instruments LIMIT 5;"`.
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM fx_instruments LIMIT 5;"`. Each row is rendered as a
+block of `column = value` lines (SQLite's `-line` mode) separated by
+a blank line; nulls appear as the literal token `NULL`.
 
 ```
-instrument_id|symbol|currency|fx_base|fx_quote
-14|GBP.CHF|GBP|GBP|CHF
-15|GBP.SEK|GBP|GBP|SEK
-16|USD.SEK|USD|USD|SEK
-17|GBP.USD|GBP|GBP|USD
+instrument_id = 14
+       symbol = GBP.CHF
+     currency = GBP
+      fx_base = GBP
+     fx_quote = CHF
+
+instrument_id = 15
+       symbol = GBP.SEK
+     currency = GBP
+      fx_base = GBP
+     fx_quote = SEK
+
+instrument_id = 16
+       symbol = USD.SEK
+     currency = USD
+      fx_base = USD
+     fx_quote = SEK
+
+instrument_id = 17
+       symbol = GBP.USD
+     currency = GBP
+      fx_base = GBP
+     fx_quote = USD
 ```

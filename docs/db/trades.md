@@ -109,15 +109,91 @@ None.
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM trades LIMIT 5;"` (the literal token `NULL` is shown
-for null values; lines wrap because the row is wide).
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM trades LIMIT 5;"`. Each row is rendered as a block of
+`column = value` lines (SQLite's `-line` mode) separated by a blank
+line; nulls appear as the literal token `NULL`. Line mode keeps wide
+rows readable here — pipe-delimited would wrap awkwardly given the
+15-column row width.
 
 ```
-trade_key|account_id|instrument_id|action|trade_datetime|trade_date|settlement_date|quantity|price_amount|price_currency|fees_amount|fees_currency|accrued_amount|accrued_currency|source_statement_hash
-8949b30740b13cb72026be56dd9429abed77f44b21125d84344720e955ea8718|U1004320|1|sell|2018-01-03T06:28:02+00:00|2018-01-03|2018-01-03|2500|29.7000|SEK|49.00|SEK|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-27dca15bbee3d1e35eb5e8010d2d6b3568a32e138efea024997749a95e60c80a|U1004320|2|open_long|2018-02-07T05:26:06+00:00|2018-02-07|2018-02-07|1|350.5000|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-342f128a792972c47d3851dba752920281482124088240978c81b60a6c958a78|U1004320|2|close_long|2018-04-04T03:47:57+00:00|2018-04-04|2018-04-04|1|349.0000|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-1b8ba81ef8a12dbf1448cd8d9627bb393b9c77356a22e432f623a50c0640d61a|U1004320|3|open_long|2018-03-07T05:08:45+00:00|2018-03-07|2018-03-07|1|130.1700|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-fd67ebf58ab2e763f124c074e431ca370a05cc6850f3e1647d20408b83f2ab65|U1004320|3|close_long|2018-03-28T03:36:13+00:00|2018-03-28|2018-03-28|1|131.2400|EUR|2.00|EUR|NULL|NULL|a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+            trade_key = 8949b30740b13cb72026be56dd9429abed77f44b21125d84344720e955ea8718
+           account_id = U1004320
+        instrument_id = 1
+               action = sell
+       trade_datetime = 2018-01-03T06:28:02+00:00
+           trade_date = 2018-01-03
+      settlement_date = 2018-01-03
+             quantity = 2500
+         price_amount = 29.7000
+       price_currency = SEK
+          fees_amount = 49.00
+        fees_currency = SEK
+       accrued_amount = NULL
+     accrued_currency = NULL
+source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+
+            trade_key = 27dca15bbee3d1e35eb5e8010d2d6b3568a32e138efea024997749a95e60c80a
+           account_id = U1004320
+        instrument_id = 2
+               action = open_long
+       trade_datetime = 2018-02-07T05:26:06+00:00
+           trade_date = 2018-02-07
+      settlement_date = 2018-02-07
+             quantity = 1
+         price_amount = 350.5000
+       price_currency = EUR
+          fees_amount = 2.00
+        fees_currency = EUR
+       accrued_amount = NULL
+     accrued_currency = NULL
+source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+
+            trade_key = 342f128a792972c47d3851dba752920281482124088240978c81b60a6c958a78
+           account_id = U1004320
+        instrument_id = 2
+               action = close_long
+       trade_datetime = 2018-04-04T03:47:57+00:00
+           trade_date = 2018-04-04
+      settlement_date = 2018-04-04
+             quantity = 1
+         price_amount = 349.0000
+       price_currency = EUR
+          fees_amount = 2.00
+        fees_currency = EUR
+       accrued_amount = NULL
+     accrued_currency = NULL
+source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+
+            trade_key = 1b8ba81ef8a12dbf1448cd8d9627bb393b9c77356a22e432f623a50c0640d61a
+           account_id = U1004320
+        instrument_id = 3
+               action = open_long
+       trade_datetime = 2018-03-07T05:08:45+00:00
+           trade_date = 2018-03-07
+      settlement_date = 2018-03-07
+             quantity = 1
+         price_amount = 130.1700
+       price_currency = EUR
+          fees_amount = 2.00
+        fees_currency = EUR
+       accrued_amount = NULL
+     accrued_currency = NULL
+source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+
+            trade_key = fd67ebf58ab2e763f124c074e431ca370a05cc6850f3e1647d20408b83f2ab65
+           account_id = U1004320
+        instrument_id = 3
+               action = close_long
+       trade_datetime = 2018-03-28T03:36:13+00:00
+           trade_date = 2018-03-28
+      settlement_date = 2018-03-28
+             quantity = 1
+         price_amount = 131.2400
+       price_currency = EUR
+          fees_amount = 2.00
+        fees_currency = EUR
+       accrued_amount = NULL
+     accrued_currency = NULL
+source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 ```

@@ -83,14 +83,39 @@ arm of the UNION ALL exposes `contract_multiplier` and
 
 ## Sample (first 5 rows)
 
-Captured via `sqlite3 -header -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
-"SELECT * FROM future_instruments LIMIT 5;"`.
+Captured via `sqlite3 -line -nullvalue NULL ~/.ib-cgt/ibcgt.sqlite
+"SELECT * FROM future_instruments LIMIT 5;"`. Each row is rendered
+as a block of `column = value` lines (SQLite's `-line` mode)
+separated by a blank line; nulls appear as the literal token `NULL`.
 
 ```
-instrument_id|symbol|currency|contract_multiplier|expiry_date
-2|ECOK8|EUR|50|2018-04-30
-3|FGBM JUN 18|EUR|1000|2018-06-07
-4|FGBM MAR 18|EUR|1000|2018-03-08
-5|FGBM SEP 18|EUR|1000|2018-09-06
-6|CCH8|USD|10|2018-03-15
+      instrument_id = 2
+             symbol = ECOK8
+           currency = EUR
+contract_multiplier = 50
+        expiry_date = 2018-04-30
+
+      instrument_id = 3
+             symbol = FGBM JUN 18
+           currency = EUR
+contract_multiplier = 1000
+        expiry_date = 2018-06-07
+
+      instrument_id = 4
+             symbol = FGBM MAR 18
+           currency = EUR
+contract_multiplier = 1000
+        expiry_date = 2018-03-08
+
+      instrument_id = 5
+             symbol = FGBM SEP 18
+           currency = EUR
+contract_multiplier = 1000
+        expiry_date = 2018-09-06
+
+      instrument_id = 6
+             symbol = CCH8
+           currency = USD
+contract_multiplier = 10
+        expiry_date = 2018-03-15
 ```
