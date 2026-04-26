@@ -190,7 +190,10 @@ class TradeRepo:
             # We need the instrument to reconstruct the domain object
             # anyway (via `_row_to_trade` → InstrumentRepo.get), so this
             # join does not add net I/O — just lets us filter in SQL.
-            joins = " JOIN instruments i ON i.instrument_id = t.instrument_id"
+            # Joining `v_instruments` (the parent + asset-class-children
+            # view) means this code stays oblivious to the class-table
+            # split introduced in migration 003.
+            joins = " JOIN v_instruments i ON i.instrument_id = t.instrument_id"
             clauses.append("i.symbol = ?")
             params.append(symbol)
         if since is not None:

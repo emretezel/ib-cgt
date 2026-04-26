@@ -24,11 +24,11 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`2`** (`001_initial.sql` and `002_ix_instruments_currency.sql` both
-applied). Whenever a new migration lands in the repository, run
-`ib-cgt db init` against this database and regenerate this
-documentation so the per-table pages reflect what is actually
-deployed.
+`3`** (`001_initial.sql`, `002_ix_instruments_currency.sql`, and
+`003_split_instruments.sql` all applied). Whenever a new migration
+lands in the repository, run `ib-cgt db init` against this database
+and regenerate this documentation so the per-table pages reflect what
+is actually deployed.
 
 ## Tables
 
@@ -36,7 +36,11 @@ deployed.
 |---|---|---|
 | `schema_migrations` | Bookkeeping for applied migration versions | [`schema_migrations.md`](./schema_migrations.md) |
 | `accounts` | One row per Interactive Brokers account | [`accounts.md`](./accounts.md) |
-| `instruments` | One row per traded instrument (stock / bond / future / fx) | [`instruments.md`](./instruments.md) |
+| `instruments` | Thin parent: id, asset-class discriminator, ISIN | [`instruments.md`](./instruments.md) |
+| `stock_instruments` | Asset-class child of `instruments` for equity listings | [`stock_instruments.md`](./stock_instruments.md) |
+| `bond_instruments` | Asset-class child of `instruments` for bonds (with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
+| `future_instruments` | Asset-class child of `instruments` for futures (multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
+| `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
 | `statements` | One row per imported IB HTML statement (idempotency) | [`statements.md`](./statements.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
@@ -47,27 +51,41 @@ deployed.
 
 ```
 accounts (account_id) ──┐
-                        ├── statements ── trades ── instruments
+                        ├── statements ── trades ── instruments ── {stock,bond,future,fx}_instruments
                         │                             ▲
 tax_runs ── matched_disposals ───────────────────────┘
 
 fx_rates (standalone cache; no FK in or out)
 ```
 
+`instruments` is a thin parent (id + discriminator + ISIN); each row
+has exactly one matching child row in one of `stock_instruments`,
+`bond_instruments`, `future_instruments`, or `fx_instruments`,
+selected by `instruments.asset_class`. Trade and disposal references
+target the parent so callers don't need to know the discriminator
+when joining.
+
 Foreign-key chain in detail:
 
-- `statements.account_id`            → `accounts.account_id`
-- `trades.account_id`                → `accounts.account_id`
-- `trades.instrument_id`             → `instruments.instrument_id`
-- `trades.source_statement_hash`     → `statements.statement_hash`
-- `matched_disposals.run_id`         → `tax_runs.run_id` `ON DELETE CASCADE`
-- `matched_disposals.instrument_id`  → `instruments.instrument_id`
+- `statements.account_id`              → `accounts.account_id`
+- `trades.account_id`                  → `accounts.account_id`
+- `trades.instrument_id`               → `instruments.instrument_id`
+- `trades.source_statement_hash`       → `statements.statement_hash`
+- `stock_instruments.instrument_id`    → `instruments.instrument_id` `ON DELETE CASCADE`
+- `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
+- `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`
+- `fx_instruments.instrument_id`       → `instruments.instrument_id` `ON DELETE CASCADE`
+- `matched_disposals.run_id`           → `tax_runs.run_id` `ON DELETE CASCADE`
+- `matched_disposals.instrument_id`    → `instruments.instrument_id`
 
 ## Views
 
-The live database defines **no views**. Composed reads are served from
-the application layer (`src/ib_cgt/db/repos/*`) rather than from
-database views.
+| View | Purpose |
+|---|---|
+| `v_instruments` | UNION-ALL of the four asset-class children with the parent, projecting the unified pre-003 column shape so external readers do not need to know about the per-class split. Callers that filter by `symbol` or `currency` (CLI's FX-sync `DISTINCT currency`, `TradeRepo.list_filtered`'s symbol join) target this view. |
+
+The view does not duplicate truth — it is a read-time projection only,
+which is the use CLAUDE.md §3 explicitly allows.
 
 ## Encoding conventions
 

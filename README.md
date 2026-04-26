@@ -16,6 +16,10 @@ top-level pages:
   also one page per table:
   [`accounts`](./docs/db/accounts.md),
   [`instruments`](./docs/db/instruments.md),
+  [`stock_instruments`](./docs/db/stock_instruments.md),
+  [`bond_instruments`](./docs/db/bond_instruments.md),
+  [`future_instruments`](./docs/db/future_instruments.md),
+  [`fx_instruments`](./docs/db/fx_instruments.md),
   [`statements`](./docs/db/statements.md),
   [`trades`](./docs/db/trades.md),
   [`fx_rates`](./docs/db/fx_rates.md),

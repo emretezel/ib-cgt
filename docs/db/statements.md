@@ -81,5 +81,5 @@ shown for null values).
 
 ```
 statement_hash|source_path|account_id|imported_at|trade_count
-a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7|/Users/emre/opt/ib-cgt/statements/futures/17_18.htm|U1004320|2026-04-26T10:36:46.941668+00:00|34
+a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7|/Users/emre/opt/ib-cgt/statements/futures/17_18.htm|U1004320|2026-04-26T16:12:23.932442+00:00|34
 ```

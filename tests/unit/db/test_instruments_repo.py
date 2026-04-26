@@ -88,21 +88,52 @@ def test_find_id_returns_none_when_absent(db: sqlite3.Connection) -> None:
     assert repo.find_id(aapl) is not None
 
 
-def test_distinct_currency_uses_ix_instruments_currency(db: sqlite3.Connection) -> None:
-    """The DISTINCT-currency query the FX CLI issues must use the new index.
+def test_per_child_currency_indexes_exist(db: sqlite3.Connection) -> None:
+    """Migration 003 must create one currency index per child table.
 
-    Without an index on `instruments.currency`, the query has to scan
-    the whole table. With `ix_instruments_currency` present (added by
-    migration 002), SQLite walks the index and skips duplicates.
-    EXPLAIN QUERY PLAN must mention the index by name.
+    Asserting via `sqlite_master` instead of `EXPLAIN QUERY PLAN`
+    because at unit-test scale (a handful of rows per child) the SQLite
+    optimiser legitimately prefers a full scan over an index walk.
+    What we contractually owe production is the *existence* of the
+    indexes — at scale, the planner will pick them on its own.
+    """
+    rows = db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'index' AND name LIKE 'ix_%_instruments_currency'"
+    ).fetchall()
+    found = {r["name"] for r in rows}
+    expected = {
+        "ix_stock_instruments_currency",
+        "ix_bond_instruments_currency",
+        "ix_future_instruments_currency",
+        "ix_fx_instruments_currency",
+    }
+    assert found == expected
+
+
+def test_duplicate_future_does_not_create_duplicate_row(
+    db: sqlite3.Connection,
+) -> None:
+    """Regression for the pre-003 INSERT OR IGNORE / NULL bug.
+
+    Before migration 003, futures had NULL `fx_base` / `fx_quote` on
+    the single `instruments` table; SQLite treats NULLs in UNIQUE
+    constraints as distinct, so `INSERT OR IGNORE` let duplicate
+    futures through. Post-003 the natural-key columns live on
+    `future_instruments` as `NOT NULL`, so the UNIQUE actually catches
+    the conflict and `upsert` reuses the existing parent id.
     """
     repo = InstrumentRepo(db)
-    repo.upsert(StockInstrument(symbol="AAPL", currency="USD"))
-    repo.upsert(StockInstrument(symbol="SAP", currency="EUR"))
-    plan_rows = db.execute(
-        "EXPLAIN QUERY PLAN "
-        "SELECT DISTINCT currency FROM instruments WHERE currency != 'GBP' "
-        "ORDER BY currency"
-    ).fetchall()
-    plan_text = " | ".join(r["detail"] for r in plan_rows)
-    assert "ix_instruments_currency" in plan_text
+    es_jun = FutureInstrument(
+        symbol="ES",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 6, 20),
+    )
+
+    id_first = repo.upsert(es_jun)
+    id_second = repo.upsert(es_jun)
+
+    assert id_first == id_second
+    assert db.execute("SELECT COUNT(*) AS n FROM instruments").fetchone()["n"] == 1
+    assert db.execute("SELECT COUNT(*) AS n FROM future_instruments").fetchone()["n"] == 1

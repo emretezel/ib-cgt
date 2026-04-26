@@ -296,14 +296,16 @@ def fx_sync(
 def _detect_all_currencies(conn: sqlite3.Connection) -> list[str]:
     """Return every non-GBP currency referenced by any instrument.
 
-    Uses the `ix_instruments_currency` index so this is an index scan
-    that skips duplicates rather than a full table scan. The result
-    cardinality is small (a handful of currencies for a typical UK
-    taxpayer's IB portfolio), so the ordering is a stable sort that
-    makes the subsequent Rich table output deterministic.
+    Reads from the `v_instruments` view (parent + four asset-class
+    children) so this code does not have to know about the table split.
+    Each child's `ix_<class>_instruments_currency` index lets SQLite
+    walk the indexes rather than the table heap. The result cardinality
+    is small (a handful of currencies for a typical UK taxpayer's IB
+    portfolio), so the ordering is a stable sort that makes the
+    subsequent Rich table output deterministic.
     """
     rows = conn.execute(
-        "SELECT DISTINCT currency FROM instruments WHERE currency != 'GBP' ORDER BY currency"
+        "SELECT DISTINCT currency FROM v_instruments WHERE currency != 'GBP' ORDER BY currency"
     ).fetchall()
     return [r["currency"] for r in rows]
 
