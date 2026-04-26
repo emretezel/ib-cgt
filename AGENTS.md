@@ -18,40 +18,47 @@ Instructions for AI coding assistants (Claude Code, Codex, Cursor, etc.) working
 
 ## 3. Database and SQL Design
 
-When writing code involving databases, schema design, or SQL, treat performance as the highest priority unless the user explicitly says otherwise.
+When writing code involving databases, schema design, or SQL, prioritise **correctness, purity, and structural elegance** above all else. Performance is a secondary concern: achieve it through well-chosen indexes, views, and query tuning — never by duplicating truth or denormalising prematurely.
 
-### Core Rules
-- Start with access patterns: how the data will be filtered, joined, grouped, sorted, inserted, and updated.
-- Design tables for the fastest expected production queries, not just for conceptual neatness.
-- Choose data types carefully and keep rows as narrow as practical.
-- Define primary keys, foreign keys, and uniqueness constraints deliberately.
-- Propose and justify indexes based on actual query patterns.
-- Avoid over-indexing, but do not leave important query paths unindexed.
-- Be explicit about trade-offs between read speed, write speed, storage, and complexity.
-- For large tables, consider partitioning, clustering, materialized summaries, or denormalization when they materially improve the expected workload.
-- Avoid ORM-generated inefficiencies in performance-critical paths.
+### Schema Design Principles
+- **Single source of truth.** Every fact must live in exactly one place. Never replicate a value across tables to avoid a join.
+- **Each table represents one thing.** A table should model exactly one entity, event, or relationship. Mixing concerns in one table is a design smell.
+- **Normalise to at least 3NF by default.** Deviate only when a clear, justified performance need exists — and document the deviation explicitly.
+- **Primary keys must be meaningful and minimal.** Prefer natural keys when they are genuinely stable and unique; use surrogate keys only when no natural key exists or when the natural key is composite and unwieldy.
+- **Foreign keys must always be declared.** Referential integrity is enforced at the schema level, not in application code.
+- **Uniqueness constraints must be declared explicitly** on every column or column combination that is semantically unique, regardless of whether it is also the primary key.
+- **Nullable columns signal optionality, not laziness.** A column is nullable only when the absence of a value is a meaningful, valid state. Default to NOT NULL.
+- **Choose the most precise data type.** Use the narrowest type that correctly represents the domain (e.g., `DATE` not `TEXT` for dates, `NUMERIC` not `FLOAT` for money).
+- **No magic values.** Do not use sentinel values (e.g., `0`, `-1`, `"N/A"`) to represent absence or special states — use NULL or a proper status column with a CHECK constraint.
+- **CHECK constraints encode invariants.** Encode domain rules (e.g., `amount > 0`, valid enum values) as CHECK constraints so the database enforces them, not only the application.
+
+### Indexes and Performance
+- Indexes exist to serve query patterns, not to patch schema weaknesses.
+- Add indexes after the schema is correct; never let a performance desire drive a denormalisation decision.
+- Justify each index: name the query pattern it supports.
+- Avoid redundant indexes (e.g., an index on `(a)` is redundant when `(a, b)` already exists and queries filter only on `a`).
+- Views may be used to pre-compose common joins or projections without duplicating data.
+
+### Schema Evolution
+- As new features are added, code is refactored, or behaviour is changed, re-evaluate the existing schema. If the design can be improved, plan and apply the necessary migrations.
 
 ### Query Rules
-- Write SQL for performance, not just correctness.
-- Avoid `SELECT *` in production code.
-- Minimize full table scans, unnecessary sorts, repeated subqueries, and N+1 query patterns.
-- Use joins, filters, aggregations, and pagination in ways that scale well.
-- Check whether each important query can use an index efficiently.
-- Call out queries that are likely to become slow at scale.
+- Write correct SQL first; optimise second.
+- Avoid `SELECT *` in production code — name every column.
+- Do not repeat logic that belongs in the schema (e.g., filtering soft-deleted rows in every query instead of using a view).
 
 ### Review Expectations
-- If an existing schema, index strategy, or query design is inefficient, say so clearly.
-- Report weak designs proactively, including missing or weak primary keys, wrong key choices, missing indexes, unused or redundant indexes, inefficient joins, wide or poorly typed columns, normalization or denormalization mistakes, and queries that do not match the schema design.
-- Do not silently preserve a bad database design just because it already exists.
-- When suggesting improvements, explain why they should be faster and what trade-offs they introduce.
+- Flag any schema that duplicates a fact, violates normal form without justification, uses the wrong data type, omits a constraint, or conflates multiple entities in one table.
+- Do not silently preserve a bad design because it already exists.
+- When proposing improvements, explain the relational principle being violated and what the corrected design achieves.
 
 ### Output Expectations
 When proposing database changes, include:
-1. recommended schema design
-2. key and index recommendations
-3. expected query patterns
-4. performance risks
-5. better alternatives if the current design is weak
+1. Recommended schema with all constraints (PK, FK, UNIQUE, CHECK, NOT NULL) stated explicitly
+2. Normalisation rationale: what normal form the design targets and why
+3. Index recommendations with the query patterns they serve
+4. Any deliberate deviations from normal form and their justification
+5. Better alternatives if the current design is structurally weak
 
 ## 4. Code Design
 
@@ -91,3 +98,4 @@ When proposing database changes, include:
 
 - Think carefully about the best documentation approach and tooling for the project.
 - Do not use a single large, long `README.md` file. Instead, use a `docs/` folder structure with multiple focused pages, and use links between them as necessary.
+- Include detailed database documentation: for each table, provide a dedicated Markdown file covering what the table is for, its fields, PKs, FKs, constraints, views, indexes, read paths, write paths, and a sample of the first 5 rows (no sorting or additional queries — just the raw first 5 rows).
