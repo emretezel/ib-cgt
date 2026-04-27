@@ -67,7 +67,7 @@ class FXConverter(Protocol):
     wires in the real `FXService`.
     """
 
-    def convert(self, amount: Money, target: str, on: date) -> Money:
+    def convert(self, amount: Money, *, target: str, on: date) -> Money:
         """Return `amount` converted to `target` currency at `on`'s rate."""
 
 
@@ -353,8 +353,8 @@ class FutureRuleEngine:
 
             proceeds_native = Money(proceeds_native_amount, native_currency)
             cost_native = Money(cost_native_amount, native_currency)
-            proceeds_gbp = self._fx.convert(proceeds_native, "GBP", proceeds_date)
-            cost_gbp = self._fx.convert(cost_native, "GBP", cost_date)
+            proceeds_gbp = self._fx.convert(proceeds_native, target="GBP", on=proceeds_date)
+            cost_gbp = self._fx.convert(cost_native, target="GBP", on=cost_date)
 
             realisations.append(
                 FutureRealisation(

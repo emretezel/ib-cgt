@@ -120,6 +120,57 @@ class TradeRepo:
             ).fetchall()
         return [self._row_to_trade(r) for r in rows]
 
+    def for_instrument_with_ids(
+        self,
+        instrument_id: int,
+        *,
+        account_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> list[tuple[int, Trade]]:
+        """Return `(trade_id, Trade)` pairs for one instrument, chronologically.
+
+        Sibling of `for_instrument` for callers that need the surrogate
+        `trade_id` alongside the domain object — namely
+        `FutureRuleEngine.compute`, which takes
+        `Sequence[tuple[int, Trade]]`. The optional `account_id`,
+        `since`, and `until` filters are applied in SQL so the
+        underlying `ix_trades_instrument_dt` index still drives the
+        scan (composite key starts with `instrument_id`).
+
+        Args:
+            instrument_id: The `trades.instrument_id` to scope the
+                read to.
+            account_id: If supplied, restricts to that single account.
+            since: Inclusive lower bound on `trade_date`. `None` means
+                no lower bound.
+            until: Inclusive upper bound on `trade_date`. `None` means
+                no upper bound.
+
+        Returns:
+            A list of `(trade_id, Trade)` pairs ordered by
+            `trade_datetime` ascending, which is the order the rule
+            engines consume.
+        """
+        # Build the WHERE incrementally so optional filters drop out of
+        # the SQL completely rather than appearing as `col = col` — keeps
+        # the planner's job obvious and EXPLAIN output readable.
+        clauses: list[str] = ["instrument_id = ?"]
+        params: list[object] = [instrument_id]
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if since is not None:
+            clauses.append("trade_date >= ?")
+            params.append(date_to_text(since))
+        if until is not None:
+            clauses.append("trade_date <= ?")
+            params.append(date_to_text(until))
+
+        sql = "SELECT * FROM trades WHERE " + " AND ".join(clauses) + " ORDER BY trade_datetime ASC"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
+
     def distinct_instruments_in(self, year: TaxYear) -> list[int]:
         """Return instrument ids touched by any trade within `year`.
 

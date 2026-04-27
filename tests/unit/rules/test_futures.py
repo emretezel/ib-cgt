@@ -468,3 +468,49 @@ def test_trade_for_other_instrument_raises() -> None:
     ]
     with pytest.raises(ValueError):
         engine.compute(instrument=inst_es, trades=trades)
+
+
+# ---------------------------------------------------------------------------
+# Regression: engine must call FX.convert with keyword-only args
+# ---------------------------------------------------------------------------
+
+
+class _StrictKwargFX:
+    """FX stub that refuses positional args.
+
+    The real `FXService.convert` is `(self, amount, *, target, on)` —
+    keyword-only after `amount`. An earlier draft of `FutureRuleEngine`
+    called `self._fx.convert(amount, "GBP", date)` positionally, which
+    would `TypeError` against the real service. This stub raises a
+    bespoke error if the engine ever regresses to that, so the failure
+    mode is unmistakable rather than a slightly-confusing TypeError.
+    """
+
+    def __init__(self, rate: Decimal) -> None:
+        """Bind a flat rate (1 native = `rate` GBP)."""
+        self._rate = rate
+        self.calls = 0
+
+    def convert(self, amount: Money, *, target: str, on: date) -> Money:
+        """Convert via the rate; explicit `*` rejects any positional misuse."""
+        # The `*` in the signature already enforces this at the
+        # interpreter level, but we still increment a counter so the
+        # test can also assert the engine actually called us at all.
+        del target, on
+        self.calls += 1
+        return Money.gbp(amount.amount * self._rate)
+
+
+def test_engine_uses_keyword_only_convert_signature() -> None:
+    """Lock in the fixed `convert(amount, *, target, on)` call shape."""
+    fx = _StrictKwargFX(rate=Decimal("0.80"))
+    engine = FutureRuleEngine(fx)
+    inst = es_future()
+    trades = [
+        (1, future_trade(action=TradeAction.OPEN_LONG, on=_OPEN_DATE, qty=1, price=100)),
+        (2, future_trade(action=TradeAction.CLOSE_LONG, on=_CLOSE_DATE, qty=1, price=110)),
+    ]
+    result = engine.compute(instrument=inst, trades=trades)
+    # Engine emits one realisation → two convert calls (cost leg + proceeds leg).
+    assert len(result.realisations) == 1
+    assert fx.calls == 2

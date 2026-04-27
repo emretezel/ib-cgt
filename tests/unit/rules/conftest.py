@@ -152,7 +152,7 @@ class StubFXService:
         """Initialise with a date→rate map (native→GBP)."""
         self._rates = dict(rates_native_to_gbp)
 
-    def convert(self, amount: Money, target: str, on: date) -> Money:
+    def convert(self, amount: Money, *, target: str, on: date) -> Money:
         """Convert `amount` to `target` currency at the rate for `on`.
 
         Tests in this module only need native→GBP, so the stub only

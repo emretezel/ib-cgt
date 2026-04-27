@@ -1,7 +1,8 @@
-"""Minimal Typer CLI — `db init`, `ingest`, `trades`, `fx sync`.
+"""Minimal Typer CLI — `db init`, `ingest`, `trades`, `fx sync`, `match futures`.
 
 This ships ahead of the full CLI plan (architecture step 8) so the
-ingestion and FX layers are runnable end-to-end. Commands:
+ingestion, FX, and futures-matching layers are runnable end-to-end.
+Commands:
 
 * ``ib-cgt db init`` — open the configured DB and apply migrations.
 * ``ib-cgt ingest PATH`` — parse and persist an IB HTML statement.
@@ -10,6 +11,10 @@ ingestion and FX layers are runnable end-to-end. Commands:
   in imported statements, pull newer ECB rates from Frankfurter into
   the local cache. First run for a pair pulls the full ECB history;
   subsequent runs only fetch what is newer than what is cached.
+* ``ib-cgt match futures [filters]`` — read-only debug command that
+  runs the per-contract close-out engine against ingested futures
+  trades and renders realisations / open positions to the terminal.
+  Persists nothing.
 
 The command surface and help text are deliberately terse; we'll flesh
 them out when the calculator and reporting commands land in their own
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -32,13 +38,26 @@ from rich.table import Table
 from ib_cgt.config import resolve_db_path, resolve_fx_base_url
 from ib_cgt.db import (
     FXRateRepo,
+    InstrumentRepo,
     TradeRepo,
     apply_migrations,
     open_connection,
 )
-from ib_cgt.domain import Trade
-from ib_cgt.fx import FrankfurterClient, FXService
+from ib_cgt.domain import (
+    FutureInstrument,
+    FutureRealisation,
+    Money,
+    OpenPosition,
+    Trade,
+)
+from ib_cgt.fx import FrankfurterClient, FXService, RateNotFoundError
 from ib_cgt.ingest import IngestResult, ingest_statement
+from ib_cgt.rules import (
+    FutureResult,
+    FutureRuleEngine,
+    InconsistentTradeError,
+    WrongAssetClassError,
+)
 
 # Two sub-apps keeps related commands grouped in `--help` output: `db`
 # hosts schema-management commands, the top level hosts the user-facing
@@ -60,6 +79,14 @@ fx_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(fx_app, name="fx")
+match_app = typer.Typer(
+    help=(
+        "Run rule engines against ingested data without persisting "
+        "results — for debugging and audit only."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(match_app, name="match")
 
 # One module-level Console so colour / width detection is shared across
 # commands — cheaper than re-constructing it per call.
@@ -452,6 +479,303 @@ def _render_fx_sync_result(
         )
     _console.print(table)
     _console.print(f"[green]Synced[/] [bold]{total}[/] new rate(s) total.")
+
+
+# ---------------------------------------------------------------------------
+# `match futures`
+# ---------------------------------------------------------------------------
+
+
+@match_app.command("futures")
+def match_futures(
+    account: Annotated[
+        str | None,
+        typer.Option("--account", "-a", help="Filter to a single IB account id."),
+    ] = None,
+    symbol: Annotated[
+        str | None,
+        typer.Option(
+            "--symbol",
+            "-s",
+            help=(
+                "Filter to one futures symbol (e.g. 'ES'). One symbol "
+                "typically spans multiple expiries — this narrows by "
+                "symbol but does not pin a single contract."
+            ),
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Inclusive lower bound on trade_date (YYYY-MM-DD). "
+                "Caveat: matching is sensitive to date clipping; for "
+                "production output omit this. Use only to construct "
+                "edge-case scenarios for debugging."
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "Inclusive upper bound on trade_date (YYYY-MM-DD). "
+                "Same caveat as --since: clipping mid-slice produces "
+                "misleading partial-close realisations."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Dry-run the futures rule engine against ingested trades.
+
+    Walks every futures instrument that matches the filters, runs
+    `FutureRuleEngine.compute` against its trade history using the
+    real `FXService`, and prints the resulting realisations and open
+    positions. Nothing is written to the database — this command is a
+    read-only audit tool.
+    """
+    since_date = _parse_iso_date(since, "--since")
+    until_date = _parse_iso_date(until, "--until")
+
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        # Defensive — same as `ingest`. A fresh DB file would otherwise
+        # surface as a confusing "no such table" error.
+        apply_migrations(conn)
+        fx_service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        engine = FutureRuleEngine(fx_service)
+        instruments = InstrumentRepo(conn).list_futures(symbol=symbol)
+        results = _run_match_futures(
+            conn=conn,
+            engine=engine,
+            instruments=instruments,
+            account=account,
+            since=since_date,
+            until=until_date,
+        )
+    finally:
+        conn.close()
+
+    if not instruments:
+        _console.print("[yellow]No futures instruments match the given filters.[/]")
+        return
+
+    _render_match_futures(results, db_path)
+
+
+def _parse_iso_date(value: str | None, flag_name: str) -> date | None:
+    """Parse an optional ISO-format date, mapping errors to BadParameter."""
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        # Same friendly-error pattern as `trades --since`. Surfaces a
+        # one-line `BadParameter` instead of a deep traceback.
+        raise typer.BadParameter(f"invalid {flag_name} value {value!r}: {exc}") from exc
+
+
+# A per-instrument outcome — either a successful `FutureResult` or the
+# exception the engine raised. The CLI walks instruments rather than
+# aborting on the first failure, so error isolation is the whole
+# point of carrying both shapes through the same channel.
+_MatchFuturesRow = tuple[FutureInstrument, FutureResult | None, Exception | None]
+
+
+def _run_match_futures(
+    *,
+    conn: sqlite3.Connection,
+    engine: FutureRuleEngine,
+    instruments: list[tuple[int, FutureInstrument]],
+    account: str | None,
+    since: date | None,
+    until: date | None,
+) -> list[_MatchFuturesRow]:
+    """Run the futures engine per-instrument with per-instrument error capture."""
+    trade_repo = TradeRepo(conn)
+    out: list[_MatchFuturesRow] = []
+    for instrument_id, instrument in instruments:
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id,
+            account_id=account,
+            since=since,
+            until=until,
+        )
+        # Catch only the engine and FX errors that this command is
+        # specifically designed to surface — anything else (programmer
+        # error, IO error) should still propagate so the operator
+        # sees it loud and clear.
+        try:
+            result = engine.compute(instrument, trades)
+        except (WrongAssetClassError, InconsistentTradeError, RateNotFoundError) as exc:
+            out.append((instrument, None, exc))
+            continue
+        out.append((instrument, result, None))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers (Rich)
+# ---------------------------------------------------------------------------
+
+
+def _render_match_futures(rows: list[_MatchFuturesRow], db_path: Path) -> None:
+    """Render the realisations, open-positions, and summary tables."""
+    _render_match_futures_realisations(rows)
+    _render_match_futures_open_positions(rows)
+    _render_match_futures_summary(rows, db_path)
+
+
+def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
+    """Print a per-instrument section: bold header then a Rich realisations table.
+
+    Per-instrument sections (rather than one combined table) keep the
+    output readable on narrow terminals — Rich's auto-sizing was
+    splitting both the divider text and the empty-state placeholder
+    across multiple lines per cell when everything was crammed into a
+    single 9-column table.
+    """
+    _console.print("[bold]Futures realisations (dry-run)[/]")
+    for instrument, result, error in rows:
+        divider = _instrument_divider(instrument)
+        _console.print(f"\n[bold cyan]{divider}[/]")
+        if error is not None:
+            # The ERROR line is the operator's whole reason for
+            # running this command — print it plainly outside any
+            # table so it can't be wrapped or hidden.
+            _console.print(f"  [red]ERROR:[/] {error}")
+            continue
+        assert result is not None  # mypy — error/result are mutually exclusive
+        if not result.realisations:
+            _console.print("  [dim](no realisations)[/]")
+            continue
+        table = Table(header_style="bold", show_lines=False)
+        table.add_column("Open ID", justify="right")
+        table.add_column("Close ID", justify="right")
+        table.add_column("Side")
+        table.add_column("Open Date")
+        table.add_column("Close Date")
+        table.add_column("Qty", justify="right")
+        table.add_column("Cost (GBP)", justify="right")
+        table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Gain (GBP)", justify="right")
+        for realisation in result.realisations:
+            table.add_row(*_realisation_to_cells(realisation))
+        _console.print(table)
+
+
+def _render_match_futures_open_positions(rows: list[_MatchFuturesRow]) -> None:
+    """One flat table of every still-open slice across all instruments."""
+    open_positions = [
+        (instrument, position)
+        for instrument, result, error in rows
+        if error is None and result is not None
+        for position in result.open_positions
+    ]
+    if not open_positions:
+        _console.print("[dim]No open positions remain after matching.[/]")
+        return
+
+    table = Table(
+        title="Open positions at end of input",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Expiry")
+    table.add_column("Side")
+    table.add_column("Open Date")
+    table.add_column("Open Trade ID", justify="right")
+    table.add_column("Qty", justify="right")
+    table.add_column("Open Price")
+    table.add_column("Fees Remaining")
+
+    for _, position in open_positions:
+        table.add_row(*_open_position_to_cells(position))
+
+    _console.print(table)
+
+
+def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -> None:
+    """Small summary: instrument counts, totals, total realised gain."""
+    error_count = sum(1 for _, _, error in rows if error is not None)
+    realisation_count = sum(
+        len(result.realisations)
+        for _, result, error in rows
+        if error is None and result is not None
+    )
+    open_count = sum(
+        len(result.open_positions)
+        for _, result, error in rows
+        if error is None and result is not None
+    )
+    # Aggregate gain via Money so currency invariants stay enforced —
+    # every realisation is GBP per `FutureRealisation.__post_init__`,
+    # so the running total stays GBP without explicit checks here.
+    total_gain = Money.gbp(Decimal("0"))
+    for _, result, error in rows:
+        if error is not None or result is None:
+            continue
+        for realisation in result.realisations:
+            total_gain = total_gain + realisation.gain_gbp
+
+    table = Table(
+        title="Summary",
+        caption=f"[dim]{db_path}[/]",
+        header_style="bold",
+    )
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("…with errors", str(error_count))
+    table.add_row("Realisations", str(realisation_count))
+    table.add_row("Open positions", str(open_count))
+    gain_style = "green" if total_gain.amount >= 0 else "red"
+    table.add_row("Total realised gain (GBP)", f"[{gain_style}]{total_gain.amount}[/]")
+
+    _console.print(table)
+
+
+def _instrument_divider(instrument: FutureInstrument) -> str:
+    """Stable label used in section dividers and error rows."""
+    return f"{instrument.symbol} {instrument.expiry_date.isoformat()} ({instrument.currency})"
+
+
+def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
+    """Project a `FutureRealisation` into the columns of the realisations table."""
+    gain = realisation.gain_gbp
+    gain_style = "green" if gain.amount >= 0 else "red"
+    return (
+        str(realisation.open_trade_id),
+        str(realisation.close_trade_id),
+        realisation.side,
+        realisation.open_date.isoformat(),
+        realisation.close_date.isoformat(),
+        f"{realisation.quantity}",
+        f"{realisation.cost_gbp.amount}",
+        f"{realisation.proceeds_gbp.amount}",
+        f"[{gain_style}]{gain.amount}[/]",
+    )
+
+
+def _open_position_to_cells(position: OpenPosition) -> tuple[str, ...]:
+    """Project an `OpenPosition` into the columns of the open-positions table."""
+    return (
+        position.instrument.symbol,
+        position.instrument.expiry_date.isoformat(),
+        position.side,
+        position.open_date.isoformat(),
+        str(position.open_trade_id),
+        f"{position.quantity_remaining}",
+        f"{position.open_price.amount} {position.open_price.currency}",
+        f"{position.fees_remaining.amount} {position.fees_remaining.currency}",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

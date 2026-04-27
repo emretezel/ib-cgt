@@ -120,6 +120,62 @@ class InstrumentRepo:
         """
         return self._find_id_by_natural_key(instrument)
 
+    def list_futures(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> list[tuple[int, FutureInstrument]]:
+        """Return every futures instrument as `(instrument_id, FutureInstrument)`.
+
+        Drives the `ib-cgt match futures` debug command — that loop
+        needs both the surrogate id (to fetch trades) and the reified
+        domain object (to feed into `FutureRuleEngine.compute`). The
+        result is ordered by `(symbol, expiry_date)` so the rendered
+        output is stable run-to-run.
+
+        Args:
+            symbol: If supplied, restricts to futures with that exact
+                symbol (e.g. ``"ES"``). Same symbol typically spans
+                multiple expiries — this filter narrows by symbol but
+                does **not** pin a single contract.
+
+        Returns:
+            A list of `(instrument_id, FutureInstrument)` pairs. Empty
+            when no future rows match the filter.
+        """
+        # Join the parent only for the optional ISIN; everything else
+        # we need lives on the child table. The ix_future_instruments_*
+        # indexes cover both the symbol filter and the ORDER BY.
+        clauses: list[str] = []
+        params: list[object] = []
+        if symbol is not None:
+            clauses.append("f.symbol = ?")
+            params.append(symbol)
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        sql = (
+            "SELECT f.instrument_id, f.symbol, f.currency, "
+            "       f.contract_multiplier, f.expiry_date, p.isin "
+            "FROM future_instruments AS f "
+            "JOIN instruments AS p ON p.instrument_id = f.instrument_id"
+            + where_sql
+            + " ORDER BY f.symbol, f.expiry_date"
+        )
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [
+            (
+                int(r["instrument_id"]),
+                FutureInstrument(
+                    symbol=r["symbol"],
+                    currency=r["currency"],
+                    isin=r["isin"],
+                    contract_multiplier=text_to_dec(r["contract_multiplier"]),
+                    expiry_date=text_to_date(r["expiry_date"]),
+                ),
+            )
+            for r in rows
+        ]
+
     # ------------------------------------------------------------------
     # Internals — write dispatch
     # ------------------------------------------------------------------
