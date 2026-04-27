@@ -11,18 +11,31 @@ from ib_cgt.domain.disposal import (
     Acquisition,
     DirectAcquisition,
     Disposal,
+    FutureRealisation,
     MatchBasis,
     MatchedDisposal,
+    OpenPosition,
     TaxLot,
     TaxLotSnapshot,
+    UnmatchedAcquisition,
 )
 from ib_cgt.domain.enums import MatchRule
 from ib_cgt.domain.money import Money
-from ib_cgt.domain.trading import StockInstrument
+from ib_cgt.domain.trading import FutureInstrument, StockInstrument
 
 
 def _aapl() -> StockInstrument:
     return StockInstrument(symbol="AAPL", currency="USD")
+
+
+def _es_future() -> FutureInstrument:
+    """Sample futures contract for tests — ES (E-mini S&P) Mar25."""
+    return FutureInstrument(
+        symbol="ES",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 3, 21),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,4 +255,277 @@ def test_tax_lot_rejects_negative_quantity() -> None:
             instrument=_aapl(),
             quantity=Decimal("-1"),
             total_cost_gbp=Money.gbp("0"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# UnmatchedAcquisition
+# ---------------------------------------------------------------------------
+
+
+def test_unmatched_acquisition_basic() -> None:
+    ua = UnmatchedAcquisition(
+        trade_id=42,
+        instrument=_aapl(),
+        acquisition_date=date(2024, 5, 1),
+        quantity_remaining=Decimal("70"),
+        cost_remaining_gbp=Money.gbp("700"),
+    )
+    assert ua.quantity_remaining == Decimal("70")
+    assert ua.cost_remaining_gbp == Money.gbp("700")
+
+
+def test_unmatched_acquisition_rejects_zero_quantity() -> None:
+    with pytest.raises(ValueError):
+        UnmatchedAcquisition(
+            trade_id=1,
+            instrument=_aapl(),
+            acquisition_date=date(2024, 5, 1),
+            quantity_remaining=Decimal("0"),
+            cost_remaining_gbp=Money.gbp("0"),
+        )
+
+
+def test_unmatched_acquisition_rejects_negative_quantity() -> None:
+    with pytest.raises(ValueError):
+        UnmatchedAcquisition(
+            trade_id=1,
+            instrument=_aapl(),
+            acquisition_date=date(2024, 5, 1),
+            quantity_remaining=Decimal("-1"),
+            cost_remaining_gbp=Money.gbp("0"),
+        )
+
+
+def test_unmatched_acquisition_rejects_non_gbp_cost() -> None:
+    with pytest.raises(ValueError):
+        UnmatchedAcquisition(
+            trade_id=1,
+            instrument=_aapl(),
+            acquisition_date=date(2024, 5, 1),
+            quantity_remaining=Decimal("10"),
+            cost_remaining_gbp=Money.of("100", "USD"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# FutureRealisation
+# ---------------------------------------------------------------------------
+
+
+def test_future_realisation_long_gain() -> None:
+    fr = FutureRealisation(
+        open_trade_id=10,
+        close_trade_id=11,
+        instrument=_es_future(),
+        side="LONG",
+        open_date=date(2024, 4, 1),
+        close_date=date(2024, 6, 1),
+        quantity=Decimal("1"),
+        # Numbers chosen so gain reads as 410 GBP (close 5410 - cost 5000).
+        proceeds_gbp=Money.gbp("5410"),
+        cost_gbp=Money.gbp("5000"),
+    )
+    assert fr.gain_gbp == Money.gbp("410")
+
+
+def test_future_realisation_short_loss() -> None:
+    # Shorts: open is "proceeds", close is "cost". A close *above* open
+    # is a loss for a short.
+    fr = FutureRealisation(
+        open_trade_id=20,
+        close_trade_id=21,
+        instrument=_es_future(),
+        side="SHORT",
+        open_date=date(2024, 4, 1),
+        close_date=date(2024, 6, 1),
+        quantity=Decimal("1"),
+        proceeds_gbp=Money.gbp("5000"),  # opened at 100 effective
+        cost_gbp=Money.gbp("5410"),  # closed at 110 effective
+    )
+    assert fr.gain_gbp == Money.gbp("-410")
+
+
+def test_future_realisation_rejects_non_future_instrument() -> None:
+    with pytest.raises(ValueError):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_aapl(),  # type: ignore[arg-type]  # explicit wrong-type test
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+        )
+
+
+def test_future_realisation_rejects_invalid_side() -> None:
+    with pytest.raises(ValueError):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="UP",  # type: ignore[arg-type]  # invalid literal
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+        )
+
+
+def test_future_realisation_rejects_zero_quantity() -> None:
+    with pytest.raises(ValueError):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("0"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+        )
+
+
+def test_future_realisation_rejects_non_gbp_proceeds() -> None:
+    with pytest.raises(ValueError):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.of("100", "USD"),
+            cost_gbp=Money.gbp("90"),
+        )
+
+
+def test_future_realisation_rejects_non_gbp_cost() -> None:
+    with pytest.raises(ValueError):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.of("90", "USD"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# OpenPosition
+# ---------------------------------------------------------------------------
+
+
+def test_open_position_basic() -> None:
+    op = OpenPosition(
+        open_trade_id=100,
+        instrument=_es_future(),
+        side="LONG",
+        open_date=date(2024, 4, 1),
+        quantity_remaining=Decimal("3"),
+        open_price=Money.of("100", "USD"),
+        fees_remaining=Money.of("0.30", "USD"),
+    )
+    assert op.quantity_remaining == Decimal("3")
+    assert op.open_price.currency == "USD"
+
+
+def test_open_position_zero_fees_allowed() -> None:
+    op = OpenPosition(
+        open_trade_id=100,
+        instrument=_es_future(),
+        side="SHORT",
+        open_date=date(2024, 4, 1),
+        quantity_remaining=Decimal("1"),
+        open_price=Money.of("100", "USD"),
+        fees_remaining=Money.of("0", "USD"),
+    )
+    assert op.fees_remaining.amount == Decimal("0")
+
+
+def test_open_position_rejects_non_future_instrument() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_aapl(),  # type: ignore[arg-type]  # explicit wrong-type test
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("1"),
+            open_price=Money.of("100", "USD"),
+            fees_remaining=Money.of("0", "USD"),
+        )
+
+
+def test_open_position_rejects_invalid_side() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_es_future(),
+            side="DOWN",  # type: ignore[arg-type]  # invalid literal
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("1"),
+            open_price=Money.of("100", "USD"),
+            fees_remaining=Money.of("0", "USD"),
+        )
+
+
+def test_open_position_rejects_zero_quantity() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("0"),
+            open_price=Money.of("100", "USD"),
+            fees_remaining=Money.of("0", "USD"),
+        )
+
+
+def test_open_position_rejects_negative_fees() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("1"),
+            open_price=Money.of("100", "USD"),
+            fees_remaining=Money.of("-0.01", "USD"),
+        )
+
+
+def test_open_position_rejects_currency_mismatch_on_price() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_es_future(),  # USD
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("1"),
+            open_price=Money.gbp("100"),  # GBP — wrong
+            fees_remaining=Money.of("0", "USD"),
+        )
+
+
+def test_open_position_rejects_currency_mismatch_on_fees() -> None:
+    with pytest.raises(ValueError):
+        OpenPosition(
+            open_trade_id=100,
+            instrument=_es_future(),  # USD
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            quantity_remaining=Decimal("1"),
+            open_price=Money.of("100", "USD"),
+            fees_remaining=Money.gbp("0.30"),  # GBP — wrong
         )

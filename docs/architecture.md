@@ -79,10 +79,15 @@ where noted.
    - `StockRuleEngine` — full S.104 matching.
    - `BondRuleEngine` — S.104 matching; skips QCB/gilt-exempt instruments;
      attaches purchase/sale accrued interest to cost/proceeds.
-   - `FutureRuleEngine` — per-contract realised-gain on close-out; no pooling.
+   - `FutureRuleEngine` — per-contract realised-gain on close-out; no
+     pooling. Emits a separate `FutureRealisation` shape because UK
+     share-matching rules (s.104 / s.105 / s.106A) do not apply to
+     individual-investor futures (HMRC HS292) — `MatchedDisposal` and
+     `MatchRule` stay strictly for the share-matching engines.
    - `FXRuleEngine` — S.104-style matching per currency pair vs GBP.
    A shared `MatchingEngine` implements the generic same-day / 30-day / S.104
-   algorithm reused by Stock, Bond, and FX engines.
+   algorithm reused by Stock, Bond, and FX engines. See
+   [`rules.md`](./rules.md) for the per-engine details.
 
 6. **CGT calculator / orchestrator** — `ib_cgt.calculator` — entry point
    for a tax-year computation. Loads trades from the DB, routes each to the
@@ -109,8 +114,8 @@ where noted.
     golden reports.
 
 11. **Documentation** — `docs/` — multi-page (`cgt-rules.md`,
-    `ingestion.md`, `fx.md`, `cli.md`, this page). Per `AGENTS.md` rule 18,
-    no single-page README.
+    `ingestion.md`, `fx.md`, `rules.md`, `cli.md`, this page). Per
+    `AGENTS.md` rule 18, no single-page README.
 
 ## Dependency graph
 
@@ -197,16 +202,20 @@ items marked ⬜ are pending.
    See [`fx.md`](./fx.md).
 5. ✅ **Statement ingestion** — HTML parser, canonical mapping, dedup,
    CLI `ingest`.
-6. ⬜ **Matching engine + StockRuleEngine** — same-day / 30-day / S.104
-   mechanics on the simplest case.
-7. ⬜ **BondRuleEngine** — add QCB / gilt exempt handling; attach accrued
-   interest; reuse matching engine.
-8. ⬜ **FutureRuleEngine** — per-contract close-out model.
-9. ⬜ **FXRuleEngine** — S.104-style matching per currency pair.
-10. ⬜ **Calculator orchestrator** — wire engines together, tax-year
-    filtering, persist `tax_run`.
-11. ⬜ **Reporting** — console + CSV + JSON renderers.
-12. ⬜ **End-to-end tests + docs** — golden-report integration tests;
+6. ✅ **Matching engine** — generic same-day / 30-day / S.104 mechanics
+   in isolation; FX-free; itemised pool residuals via pro-rata
+   attribution. Will be consumed by Stock / Bond / FX engines later.
+7. ✅ **FutureRuleEngine** — per-contract close-out model (HMRC HS292),
+   FIFO long/short queues, `FutureRealisation` output (separate from
+   `MatchedDisposal`).
+8. ⬜ **StockRuleEngine** — full S.104 matching using the matching engine.
+9. ⬜ **BondRuleEngine** — add QCB / gilt exempt handling; attach accrued
+   interest; reuse the matching engine.
+10. ⬜ **FXRuleEngine** — S.104-style matching per currency pair.
+11. ⬜ **Calculator orchestrator** — wire engines together, tax-year
+    filtering, persist `tax_run` and `future_realisations`.
+12. ⬜ **Reporting** — console + CSV + JSON renderers.
+13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
 
 ## Status
@@ -218,13 +227,13 @@ items marked ⬜ are pending.
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
-| 6 | Rule engines | `ib_cgt.rules` | ⬜ Pending |
+| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` + `FutureRuleEngine` done |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
 | 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
-| 11 | Documentation | `docs/` | 🟡 `index.md` + this page |
+| 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |
 
 ## How to keep this in sync
 

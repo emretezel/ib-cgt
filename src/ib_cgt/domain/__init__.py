@@ -19,10 +19,13 @@ from ib_cgt.domain.disposal import (
     Acquisition,
     DirectAcquisition,
     Disposal,
+    FutureRealisation,
     MatchBasis,
     MatchedDisposal,
+    OpenPosition,
     TaxLot,
     TaxLotSnapshot,
+    UnmatchedAcquisition,
 )
 from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
 from ib_cgt.domain.money import (
@@ -59,6 +62,7 @@ __all__ = [
     "Disposal",
     "FXInstrument",
     "FutureInstrument",
+    "FutureRealisation",
     "Instrument",
     "InvalidInstrumentError",
     "InvalidTaxYearError",
@@ -67,6 +71,7 @@ __all__ = [
     "MatchRule",
     "MatchedDisposal",
     "Money",
+    "OpenPosition",
     "StockInstrument",
     "TaxLot",
     "TaxLotSnapshot",
@@ -74,5 +79,6 @@ __all__ = [
     "TaxYearReport",
     "Trade",
     "TradeAction",
+    "UnmatchedAcquisition",
     "validate_currency_code",
 ]
