@@ -36,9 +36,10 @@ class Acquisition:
     """A buy event projected into GBP, ready to contribute to matching.
 
     Attributes:
-        trade_key: Stable identifier linking back to the originating
-            raw `Trade`. Produced by the ingestion layer; the domain
-            layer treats it as an opaque string.
+        trade_id: Surrogate id of the originating raw `Trade` row
+            (`trades.trade_id`). The domain layer treats it as an
+            opaque integer — it just has to round-trip back to the
+            same trade.
         account_id: The IB account the buy executed against.
         instrument: The instrument being acquired.
         acquisition_date: UK-local acquisition date.
@@ -47,7 +48,7 @@ class Acquisition:
             FX conversion at the transaction-date spot rate.
     """
 
-    trade_key: str
+    trade_id: int
     account_id: str
     instrument: AnyInstrument
     acquisition_date: date
@@ -67,8 +68,8 @@ class Disposal:
     """A sell event projected into GBP, ready to be matched.
 
     Attributes:
-        trade_key: Stable identifier linking back to the originating raw
-            `Trade`.
+        trade_id: Surrogate id of the originating raw `Trade` row
+            (`trades.trade_id`).
         account_id: The IB account the sell executed against.
         instrument: The instrument being disposed.
         disposal_date: UK-local disposal date.
@@ -77,7 +78,7 @@ class Disposal:
             fees (cost-of-disposal reduces proceeds per CGT rules).
     """
 
-    trade_key: str
+    trade_id: int
     account_id: str
     instrument: AnyInstrument
     disposal_date: date
@@ -102,10 +103,10 @@ class DirectAcquisition:
     """Basis for a same-day or 30-day (s.106A) match.
 
     These two rules cancel a disposal against a *specific* acquisition,
-    so the basis is simply the acquisition's trade key.
+    so the basis is simply the acquisition's trade id.
     """
 
-    acquisition_trade_key: str
+    acquisition_trade_id: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -159,7 +160,8 @@ class MatchedDisposal:
     against the S.104 pool — which is common on busy trading days.
 
     Attributes:
-        disposal_trade_key: The originating disposal's trade key.
+        disposal_trade_id: The originating disposal's
+            `trades.trade_id`.
         instrument: The instrument being disposed.
         disposal_date: UK-local disposal date.
         match_rule: Which of the three rules produced this match.
@@ -172,7 +174,7 @@ class MatchedDisposal:
             `TaxLotSnapshot` for SECTION_104.
     """
 
-    disposal_trade_key: str
+    disposal_trade_id: int
     instrument: AnyInstrument
     disposal_date: date
     match_rule: MatchRule

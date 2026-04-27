@@ -24,12 +24,13 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`4`** (`001_initial.sql`, `002_ix_instruments_currency.sql`,
-`003_split_instruments.sql`, and
-`004_cascade_trades_on_statement_delete.sql` all applied). Whenever a
-new migration lands in the repository, run `ib-cgt db init` against
-this database and regenerate this documentation so the per-table
-pages reflect what is actually deployed.
+`5`** (`001_initial.sql`, `002_ix_instruments_currency.sql`,
+`003_split_instruments.sql`,
+`004_cascade_trades_on_statement_delete.sql`, and
+`005_trades_integer_pk.sql` all applied). Whenever a new migration
+lands in the repository, run `ib-cgt db init` against this database
+and regenerate this documentation so the per-table pages reflect
+what is actually deployed.
 
 ## Tables
 

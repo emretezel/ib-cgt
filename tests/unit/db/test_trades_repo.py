@@ -57,11 +57,7 @@ def test_insert_then_for_instrument_round_trips(db: sqlite3.Connection) -> None:
     repo = TradeRepo(db)
     trade = _aapl_buy()
 
-    inserted = repo.insert_many(
-        [trade],
-        trade_keys=["TRADE-1"],
-        source_statement_hash="hash-a",
-    )
+    inserted = repo.insert_many([trade], source_statement_hash="hash-a")
     assert inserted == 1
 
     from ib_cgt.db import InstrumentRepo
@@ -72,14 +68,21 @@ def test_insert_then_for_instrument_round_trips(db: sqlite3.Connection) -> None:
     assert loaded[0] == trade
 
 
-def test_insert_is_idempotent_on_trade_key(db: sqlite3.Connection) -> None:
+def test_insert_is_idempotent_on_natural_key(db: sqlite3.Connection) -> None:
+    """Re-inserting the same trade is a no-op via the natural-key UNIQUE.
+
+    Migration 005 declares
+    `UNIQUE (account_id, instrument_id, trade_datetime, action, quantity, price_amount)`
+    on `trades`. `INSERT OR IGNORE` short-circuits each duplicate at
+    constraint check, so the row count stays at one and the second
+    `insert_many` reports zero new rows.
+    """
     _seed_account_and_statement(db)
     repo = TradeRepo(db)
     trade = _aapl_buy()
 
-    assert repo.insert_many([trade], trade_keys=["K1"], source_statement_hash="hash-a") == 1
-    # Re-importing the same statement reinserts the same trade key — ignored.
-    assert repo.insert_many([trade], trade_keys=["K1"], source_statement_hash="hash-a") == 0
+    assert repo.insert_many([trade], source_statement_hash="hash-a") == 1
+    assert repo.insert_many([trade], source_statement_hash="hash-a") == 0
     assert repo.count() == 1
 
 
@@ -91,11 +94,7 @@ def test_for_instrument_returns_trades_in_chronological_order(db: sqlite3.Connec
     early = _aapl_buy(day=10)
     mid = _aapl_buy(day=15)
 
-    repo.insert_many(
-        [late, early, mid],
-        trade_keys=["K-late", "K-early", "K-mid"],
-        source_statement_hash="hash-a",
-    )
+    repo.insert_many([late, early, mid], source_statement_hash="hash-a")
 
     from ib_cgt.db import InstrumentRepo
 
@@ -114,7 +113,6 @@ def test_for_instrument_honours_up_to_cutoff(db: sqlite3.Connection) -> None:
 
     repo.insert_many(
         [_aapl_buy(day=10), _aapl_buy(day=20)],
-        trade_keys=["A", "B"],
         source_statement_hash="hash-a",
     )
 
@@ -130,11 +128,7 @@ def test_distinct_instruments_in_tax_year(db: sqlite3.Connection) -> None:
     repo = TradeRepo(db)
 
     # A trade in the 2024/25 tax year (starts 6 Apr 2024).
-    repo.insert_many(
-        [_aapl_buy(day=15)],
-        trade_keys=["K-in"],
-        source_statement_hash="hash-a",
-    )
+    repo.insert_many([_aapl_buy(day=15)], source_statement_hash="hash-a")
     # A trade well before the tax year.
     old = Trade(
         account_id="U1",
@@ -147,11 +141,7 @@ def test_distinct_instruments_in_tax_year(db: sqlite3.Connection) -> None:
         price=Money.of("400", "USD"),
         fees=Money.of("1", "USD"),
     )
-    repo.insert_many(
-        [old],
-        trade_keys=["K-old"],
-        source_statement_hash="hash-a",
-    )
+    repo.insert_many([old], source_statement_hash="hash-a")
 
     touched = repo.distinct_instruments_in(TaxYear(2024))
     assert len(touched) == 1  # only AAPL is in-window
@@ -161,19 +151,4 @@ def test_unknown_statement_hash_rejected(db: sqlite3.Connection) -> None:
     AccountRepo(db).upsert(Account(account_id="U1"))
     repo = TradeRepo(db)
     with pytest.raises(sqlite3.IntegrityError):
-        repo.insert_many(
-            [_aapl_buy()],
-            trade_keys=["K-1"],
-            source_statement_hash="unknown-hash",
-        )
-
-
-def test_mismatched_key_length_raises(db: sqlite3.Connection) -> None:
-    _seed_account_and_statement(db)
-    repo = TradeRepo(db)
-    with pytest.raises(ValueError):
-        repo.insert_many(
-            [_aapl_buy()],
-            trade_keys=["K-1", "K-2"],
-            source_statement_hash="hash-a",
-        )
+        repo.insert_many([_aapl_buy()], source_statement_hash="unknown-hash")

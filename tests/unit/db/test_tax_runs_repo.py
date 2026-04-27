@@ -42,14 +42,14 @@ def test_replace_for_deletes_prior_run(db: sqlite3.Connection) -> None:
         first_id,
         [
             MatchedDisposal(
-                disposal_trade_key="D1",
+                disposal_trade_id=101,
                 instrument=_aapl(),
                 disposal_date=date(2024, 5, 1),
                 match_rule=MatchRule.SAME_DAY,
                 matched_quantity=Decimal("1"),
                 matched_proceeds_gbp=Money.gbp("50"),
                 matched_cost_gbp=Money.gbp("40"),
-                basis=DirectAcquisition(acquisition_trade_key="A1"),
+                basis=DirectAcquisition(acquisition_trade_id=201),
             )
         ],
     )
@@ -81,14 +81,14 @@ def test_matched_disposal_direct_round_trip(db: sqlite3.Connection) -> None:
     run_id = runs.create(TaxYear(2024), Money.gbp("0"))
 
     m = MatchedDisposal(
-        disposal_trade_key="D1",
+        disposal_trade_id=101,
         instrument=_aapl(),
         disposal_date=date(2024, 5, 1),
         match_rule=MatchRule.BED_AND_BREAKFAST,
         matched_quantity=Decimal("5"),
         matched_proceeds_gbp=Money.gbp("500"),
         matched_cost_gbp=Money.gbp("400"),
-        basis=DirectAcquisition(acquisition_trade_key="A1"),
+        basis=DirectAcquisition(acquisition_trade_id=201),
     )
     matches.insert_many(run_id, [m])
 
@@ -103,7 +103,7 @@ def test_matched_disposal_pool_round_trip(db: sqlite3.Connection) -> None:
     run_id = runs.create(TaxYear(2024), Money.gbp("0"))
 
     m = MatchedDisposal(
-        disposal_trade_key="D2",
+        disposal_trade_id=102,
         instrument=_aapl(),
         disposal_date=date(2024, 5, 2),
         match_rule=MatchRule.SECTION_104,
@@ -123,23 +123,23 @@ def test_matched_disposal_pool_round_trip(db: sqlite3.Connection) -> None:
 
 
 def test_multiple_chunks_same_disposal_preserve_order(db: sqlite3.Connection) -> None:
-    """Seq column distinguishes multiple chunks for the same disposal_trade_key."""
+    """Seq column distinguishes multiple chunks for the same disposal_trade_id."""
     runs = TaxRunRepo(db)
     matches = MatchedDisposalRepo(db)
     run_id = runs.create(TaxYear(2024), Money.gbp("0"))
 
     chunk_a = MatchedDisposal(
-        disposal_trade_key="D1",
+        disposal_trade_id=101,
         instrument=_aapl(),
         disposal_date=date(2024, 5, 1),
         match_rule=MatchRule.SAME_DAY,
         matched_quantity=Decimal("1"),
         matched_proceeds_gbp=Money.gbp("100"),
         matched_cost_gbp=Money.gbp("80"),
-        basis=DirectAcquisition(acquisition_trade_key="A1"),
+        basis=DirectAcquisition(acquisition_trade_id=201),
     )
     chunk_b = MatchedDisposal(
-        disposal_trade_key="D1",
+        disposal_trade_id=101,
         instrument=_aapl(),
         disposal_date=date(2024, 5, 1),
         match_rule=MatchRule.SECTION_104,

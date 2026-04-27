@@ -15,7 +15,7 @@ executed in; FX conversion to GBP is applied later, from the
 
 | Column | Type | Nullable | Notes |
 |---|---|---|---|
-| `trade_key` | `TEXT` | No (PK) | Composite business key produced by ingestion (account + datetime + symbol + …). |
+| `trade_id` | `INTEGER` | No (PK) | Surrogate id; auto-issued by the SQLite `INTEGER PRIMARY KEY`. |
 | `account_id` | `TEXT` | No (FK) | Owning IB account. |
 | `instrument_id` | `INTEGER` | No (FK) | The instrument traded. |
 | `action` | `TEXT` | No | Trade action; values come from the domain `TradeAction` enum (e.g. `sell`, `open_long`, `close_long`). |
@@ -36,10 +36,10 @@ and date/datetime encoding conventions.
 
 ## Primary key
 
-`trade_key` — natural key. The key is a deterministic concatenation
-of the trade's identifying fields, computed by ingestion. Using it as
-the PK gives idempotent re-import for free: `INSERT OR IGNORE` on the
-PK collapses duplicates from re-running the same statement.
+`trade_id` — surrogate. The natural key (six columns; see below) is
+unwieldy enough to qualify for a surrogate per CLAUDE.md §3, and a
+narrow `INTEGER` keeps the FK column on dependent rows
+(`matched_disposals.disposal_trade_id`) correspondingly narrow.
 
 ## Foreign keys
 
@@ -56,8 +56,16 @@ mistake.
 
 ## Uniqueness constraints
 
-None beyond the primary key. `trade_key` already provides the only
-uniqueness invariant the table needs.
+- `UNIQUE (account_id, instrument_id, trade_datetime, action,
+  quantity, price_amount)` — the natural key (migration `005`).
+  `INSERT OR IGNORE` on this constraint is the dedup mechanism for
+  re-imports: even if the file's bytes change so the statement-hash
+  short-circuit misses, an overlapping trade rows is silently
+  collapsed at constraint-check time. Asset-class identity (symbol,
+  currency, expiry, fx-pair) is implicit in `instrument_id`. Fees,
+  accrued interest, settlement_date, and trade_date are deliberately
+  excluded so cosmetic export differences cannot produce duplicate
+  rows.
 
 ## CHECK constraints
 
@@ -94,11 +102,11 @@ None.
 
 ## Write paths
 
-- [`TradeRepo.insert_many(trades, *, trade_keys, source_statement_hash)`](../../src/ib_cgt/db/repos/trades.py)
-  — batched `INSERT OR IGNORE` on `trade_key`; resolves each trade's
-  `instrument_id` via `InstrumentRepo.upsert` and writes the FK to
-  the source statement. Returns the number of rows actually inserted
-  (ignored duplicates do not count).
+- [`TradeRepo.insert_many(trades, *, source_statement_hash)`](../../src/ib_cgt/db/repos/trades.py)
+  — batched `INSERT OR IGNORE` on the natural-key UNIQUE; resolves
+  each trade's `instrument_id` via `InstrumentRepo.upsert` and
+  writes the FK to the source statement. Returns the number of rows
+  actually inserted (ignored duplicates do not count).
 
 ## CLI commands that touch this table
 
@@ -120,7 +128,7 @@ rows readable here — pipe-delimited would wrap awkwardly given the
 15-column row width.
 
 ```
-            trade_key = 8949b30740b13cb72026be56dd9429abed77f44b21125d84344720e955ea8718
+             trade_id = 1
            account_id = U1004320
         instrument_id = 1
                action = sell
@@ -136,7 +144,7 @@ rows readable here — pipe-delimited would wrap awkwardly given the
      accrued_currency = NULL
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-            trade_key = 27dca15bbee3d1e35eb5e8010d2d6b3568a32e138efea024997749a95e60c80a
+             trade_id = 2
            account_id = U1004320
         instrument_id = 2
                action = open_long
@@ -152,7 +160,7 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
      accrued_currency = NULL
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-            trade_key = 342f128a792972c47d3851dba752920281482124088240978c81b60a6c958a78
+             trade_id = 3
            account_id = U1004320
         instrument_id = 2
                action = close_long
@@ -168,7 +176,7 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
      accrued_currency = NULL
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-            trade_key = 1b8ba81ef8a12dbf1448cd8d9627bb393b9c77356a22e432f623a50c0640d61a
+             trade_id = 4
            account_id = U1004320
         instrument_id = 3
                action = open_long
@@ -184,7 +192,7 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
      accrued_currency = NULL
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-            trade_key = fd67ebf58ab2e763f124c074e431ca370a05cc6850f3e1647d20408b83f2ab65
+             trade_id = 5
            account_id = U1004320
         instrument_id = 3
                action = close_long

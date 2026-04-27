@@ -32,7 +32,7 @@ def _aapl() -> StockInstrument:
 
 def test_acquisition_basic() -> None:
     a = Acquisition(
-        trade_key="buy-1",
+        trade_id=1,
         account_id="U1",
         instrument=_aapl(),
         acquisition_date=date(2024, 5, 1),
@@ -45,7 +45,7 @@ def test_acquisition_basic() -> None:
 def test_acquisition_rejects_non_gbp_cost() -> None:
     with pytest.raises(ValueError):
         Acquisition(
-            trade_key="buy-1",
+            trade_id=1,
             account_id="U1",
             instrument=_aapl(),
             acquisition_date=date(2024, 5, 1),
@@ -57,7 +57,7 @@ def test_acquisition_rejects_non_gbp_cost() -> None:
 def test_acquisition_rejects_zero_quantity() -> None:
     with pytest.raises(ValueError):
         Acquisition(
-            trade_key="buy-1",
+            trade_id=1,
             account_id="U1",
             instrument=_aapl(),
             acquisition_date=date(2024, 5, 1),
@@ -68,7 +68,7 @@ def test_acquisition_rejects_zero_quantity() -> None:
 
 def test_disposal_basic() -> None:
     d = Disposal(
-        trade_key="sell-1",
+        trade_id=2,
         account_id="U1",
         instrument=_aapl(),
         disposal_date=date(2024, 9, 1),
@@ -81,7 +81,7 @@ def test_disposal_basic() -> None:
 def test_disposal_rejects_non_gbp_proceeds() -> None:
     with pytest.raises(ValueError):
         Disposal(
-            trade_key="sell-1",
+            trade_id=2,
             account_id="U1",
             instrument=_aapl(),
             disposal_date=date(2024, 9, 1),
@@ -119,7 +119,7 @@ def test_tax_lot_snapshot_rejects_empty_pool() -> None:
 
 
 def _direct_basis() -> DirectAcquisition:
-    return DirectAcquisition(acquisition_trade_key="buy-1")
+    return DirectAcquisition(acquisition_trade_id=1)
 
 
 def _snapshot_basis() -> TaxLotSnapshot:
@@ -132,7 +132,7 @@ def _snapshot_basis() -> TaxLotSnapshot:
 
 def test_matched_disposal_gain() -> None:
     md = MatchedDisposal(
-        disposal_trade_key="sell-1",
+        disposal_trade_id=2,
         instrument=_aapl(),
         disposal_date=date(2024, 9, 1),
         match_rule=MatchRule.SAME_DAY,
@@ -146,7 +146,7 @@ def test_matched_disposal_gain() -> None:
 
 def test_matched_disposal_loss() -> None:
     md = MatchedDisposal(
-        disposal_trade_key="sell-1",
+        disposal_trade_id=2,
         instrument=_aapl(),
         disposal_date=date(2024, 9, 1),
         match_rule=MatchRule.SECTION_104,
@@ -161,7 +161,7 @@ def test_matched_disposal_loss() -> None:
 def test_section_104_rejects_direct_basis() -> None:
     with pytest.raises(ValueError):
         MatchedDisposal(
-            disposal_trade_key="sell-1",
+            disposal_trade_id=2,
             instrument=_aapl(),
             disposal_date=date(2024, 9, 1),
             match_rule=MatchRule.SECTION_104,
@@ -175,7 +175,7 @@ def test_section_104_rejects_direct_basis() -> None:
 def test_same_day_rejects_snapshot_basis() -> None:
     with pytest.raises(ValueError):
         MatchedDisposal(
-            disposal_trade_key="sell-1",
+            disposal_trade_id=2,
             instrument=_aapl(),
             disposal_date=date(2024, 9, 1),
             match_rule=MatchRule.SAME_DAY,
@@ -189,7 +189,7 @@ def test_same_day_rejects_snapshot_basis() -> None:
 def test_bed_and_breakfast_requires_direct_basis() -> None:
     with pytest.raises(ValueError):
         MatchedDisposal(
-            disposal_trade_key="sell-1",
+            disposal_trade_id=2,
             instrument=_aapl(),
             disposal_date=date(2024, 9, 1),
             match_rule=MatchRule.BED_AND_BREAKFAST,

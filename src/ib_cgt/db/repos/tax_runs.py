@@ -124,22 +124,22 @@ class MatchedDisposalRepo:
     def insert_many(self, run_id: int, matched: Iterable[MatchedDisposal]) -> int:
         """Persist every matched-disposal chunk for one run.
 
-        The `seq` column preserves insertion order per disposal_trade_key
+        The `seq` column preserves insertion order per disposal_trade_id
         so that when the reporting layer reads rows back it can reproduce
         the engine's original emit order without a secondary sort key.
         """
         rows: list[tuple[object, ...]] = []
-        per_disposal_seq: dict[str, int] = {}
+        per_disposal_seq: dict[int, int] = {}
         for m in matched:
-            seq = per_disposal_seq.get(m.disposal_trade_key, 0)
-            per_disposal_seq[m.disposal_trade_key] = seq + 1
+            seq = per_disposal_seq.get(m.disposal_trade_id, 0)
+            per_disposal_seq[m.disposal_trade_id] = seq + 1
 
             instrument_id = self._instruments.upsert(m.instrument)
-            basis_kind, acq_key, pool_qty, pool_cost, pool_avg = _encode_basis(m)
+            basis_kind, acq_id, pool_qty, pool_cost, pool_avg = _encode_basis(m)
             rows.append(
                 (
                     run_id,
-                    m.disposal_trade_key,
+                    m.disposal_trade_id,
                     instrument_id,
                     date_to_text(m.disposal_date),
                     m.match_rule.value,
@@ -147,7 +147,7 @@ class MatchedDisposalRepo:
                     dec_to_text(m.matched_proceeds_gbp.amount),
                     dec_to_text(m.matched_cost_gbp.amount),
                     basis_kind,
-                    acq_key,
+                    acq_id,
                     pool_qty,
                     pool_cost,
                     pool_avg,
@@ -159,9 +159,9 @@ class MatchedDisposalRepo:
             return 0
         self._conn.executemany(
             "INSERT INTO matched_disposals ("
-            "run_id, disposal_trade_key, instrument_id, disposal_date, "
+            "run_id, disposal_trade_id, instrument_id, disposal_date, "
             "match_rule, matched_quantity, matched_proceeds_gbp, matched_cost_gbp, "
-            "basis_kind, acquisition_trade_key, pool_quantity_before, "
+            "basis_kind, acquisition_trade_id, pool_quantity_before, "
             "pool_total_cost_before, pool_average_cost, seq"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
@@ -172,7 +172,7 @@ class MatchedDisposalRepo:
         """Return every matched-disposal row for `run_id`, in emit order."""
         rows = self._conn.execute(
             "SELECT * FROM matched_disposals WHERE run_id = ? "
-            "ORDER BY disposal_trade_key ASC, seq ASC",
+            "ORDER BY disposal_trade_id ASC, seq ASC",
             (run_id,),
         ).fetchall()
         return [self._row_to_matched(r) for r in rows]
@@ -182,7 +182,7 @@ class MatchedDisposalRepo:
         instrument = self._instruments.get(int(row["instrument_id"]))
         basis = _decode_basis(row)
         return MatchedDisposal(
-            disposal_trade_key=row["disposal_trade_key"],
+            disposal_trade_id=int(row["disposal_trade_id"]),
             instrument=instrument,
             disposal_date=text_to_date(row["disposal_date"]),
             match_rule=MatchRule(row["match_rule"]),
@@ -200,17 +200,17 @@ class MatchedDisposalRepo:
 
 def _encode_basis(
     m: MatchedDisposal,
-) -> tuple[str, str | None, str | None, str | None, str | None]:
-    """Return `(basis_kind, acq_key, pool_qty, pool_cost, pool_avg)` columns.
+) -> tuple[str, int | None, str | None, str | None, str | None]:
+    """Return `(basis_kind, acq_id, pool_qty, pool_cost, pool_avg)` columns.
 
     Exactly one branch populates the pool-* columns and the other
-    populates `acquisition_trade_key`, matching the CHECK constraint on
+    populates `acquisition_trade_id`, matching the CHECK constraint on
     `basis_kind`. The domain's `MatchedDisposal.__post_init__` has
     already asserted rule↔basis compatibility, so we don't re-check here.
     """
     basis = m.basis
     if isinstance(basis, DirectAcquisition):
-        return (_BASIS_DIRECT, basis.acquisition_trade_key, None, None, None)
+        return (_BASIS_DIRECT, basis.acquisition_trade_id, None, None, None)
     # `MatchBasis` is a two-variant union, so the else branch is a TaxLotSnapshot.
     snapshot: TaxLotSnapshot = basis
     return (
@@ -226,10 +226,10 @@ def _decode_basis(row: sqlite3.Row) -> DirectAcquisition | TaxLotSnapshot:
     """Inverse of `_encode_basis`."""
     kind = row["basis_kind"]
     if kind == _BASIS_DIRECT:
-        acq_key = row["acquisition_trade_key"]
-        if acq_key is None:
-            raise RuntimeError("DIRECT basis row missing acquisition_trade_key")
-        return DirectAcquisition(acquisition_trade_key=acq_key)
+        acq_id = row["acquisition_trade_id"]
+        if acq_id is None:
+            raise RuntimeError("DIRECT basis row missing acquisition_trade_id")
+        return DirectAcquisition(acquisition_trade_id=int(acq_id))
     if kind == _BASIS_POOL:
         qty = row["pool_quantity_before"]
         cost = row["pool_total_cost_before"]

@@ -50,7 +50,6 @@ def _seed(db: sqlite3.Connection) -> None:
             _trade(account="U1", symbol="MSFT", day=2),
             _trade(account="U2", symbol="AAPL", day=3),
         ],
-        trade_keys=["k1", "k2", "k3"],
         source_statement_hash="h1",
     )
 

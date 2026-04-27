@@ -14,7 +14,7 @@ The table holds two flavours of basis ("how was the cost computed?")
 discriminated by `basis_kind`:
 
 - `DIRECT` — matched directly against an acquisition trade
-  (same-day or 30-day rule). Populated columns: `acquisition_trade_key`.
+  (same-day or 30-day rule). Populated columns: `acquisition_trade_id`.
 - `POOL` — matched against the S.104 pool snapshot at disposal time.
   Populated columns: `pool_quantity_before`, `pool_total_cost_before`,
   `pool_average_cost`.
@@ -24,7 +24,7 @@ discriminated by `basis_kind`:
 | Column | Type | Nullable | Notes |
 |---|---|---|---|
 | `run_id` | `INTEGER` | No (PK, FK) | Parent run. |
-| `disposal_trade_key` | `TEXT` | No (PK) | The disposing trade's `trade_key` from [`trades`](./trades.md) (not declared as a FK so the disposal row may be reorganised without breaking historical audit data). |
+| `disposal_trade_id` | `INTEGER` | No (PK) | The disposing trade's `trades.trade_id` (not declared as a FK so the disposal row remains valid as audit data even if the underlying trade is later corrected and reingested). |
 | `instrument_id` | `INTEGER` | No (FK) | Resolved at write time so the audit row keeps working even if the instrument is later renamed. |
 | `disposal_date` | `TEXT` | No | `YYYY-MM-DD` — disposal trade's `trade_date`. |
 | `match_rule` | `TEXT` | No | Domain enum; values include `SAME_DAY`, `BED_AND_BREAKFAST`, `S104`. |
@@ -32,7 +32,7 @@ discriminated by `basis_kind`:
 | `matched_proceeds_gbp` | `TEXT` | No | Decimal string — proceeds attributed to this chunk, in GBP. |
 | `matched_cost_gbp` | `TEXT` | No | Decimal string — allowable cost attributed to this chunk, in GBP. |
 | `basis_kind` | `TEXT` | No | Discriminator — `DIRECT` or `POOL`. |
-| `acquisition_trade_key` | `TEXT` | Yes | Set iff `basis_kind = 'DIRECT'`; the matching acquisition trade's `trade_key`. |
+| `acquisition_trade_id` | `INTEGER` | Yes | Set iff `basis_kind = 'DIRECT'`; the matching acquisition trade's `trades.trade_id`. |
 | `pool_quantity_before` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool size before this disposal. |
 | `pool_total_cost_before` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool total cost (GBP) before this disposal. |
 | `pool_average_cost` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool average cost (GBP) at disposal time. |
@@ -43,9 +43,9 @@ and date encoding conventions.
 
 ## Primary key
 
-`(run_id, disposal_trade_key, seq)` — composite natural key.
+`(run_id, disposal_trade_id, seq)` — composite natural key.
 - `run_id` segregates rows by computation run.
-- `disposal_trade_key` groups all chunks belonging to the same
+- `disposal_trade_id` groups all chunks belonging to the same
   disposing trade.
 - `seq` distinguishes chunks within a disposal and preserves emit order.
 
@@ -60,11 +60,11 @@ ordering it encodes is content the reporting layer relies on.
 - `instrument_id` → [`instruments.instrument_id`](./instruments.md) —
   default restrict.
 
-`disposal_trade_key` and `acquisition_trade_key` are deliberately
-**not** declared as foreign keys to `trades.trade_key`. Disposal rows
-are an audit artefact: they should remain valid even if the underlying
-trade is later corrected and reingested with a different `trade_key`.
-The application layer joins on these columns when needed.
+`disposal_trade_id` and `acquisition_trade_id` are deliberately
+**not** declared as foreign keys to `trades.trade_id`. Disposal rows
+are an audit artefact: they should remain valid even if the
+underlying trade is later corrected and reingested under a fresh
+`trade_id`. The application layer joins on these columns when needed.
 
 ## Uniqueness constraints
 
@@ -75,7 +75,7 @@ None beyond the primary key.
 - `CHECK (basis_kind IN ('DIRECT', 'POOL'))` — closes the
   discriminator domain.
 
-The conditional invariant *"`acquisition_trade_key` is non-null iff
+The conditional invariant *"`acquisition_trade_id` is non-null iff
 `basis_kind = 'DIRECT'`, and the `pool_*` columns are non-null iff
 `basis_kind = 'POOL'`"* is **not** encoded as a SQL CHECK; it is
 enforced by [`_encode_basis` /
@@ -89,7 +89,7 @@ migration could tighten this with a multi-column CHECK.
 | `ix_matched_disposals_run` | `(run_id, disposal_date)` | Per-run scans ordered by disposal date — the reporting layer's primary access pattern. |
 
 The primary key alone covers single-disposal lookups
-(`run_id, disposal_trade_key, seq`); the secondary index handles the
+(`run_id, disposal_trade_id, seq`); the secondary index handles the
 "all disposals in a run, by date" report.
 
 ## Views
@@ -99,7 +99,7 @@ None.
 ## Read paths
 
 - [`MatchedDisposalRepo.for_run(run_id)`](../../src/ib_cgt/db/repos/tax_runs.py)
-  — every chunk for one run, ordered by `disposal_trade_key` then
+  — every chunk for one run, ordered by `disposal_trade_id` then
   `seq` to reproduce the engine's emit order. The repo's
   `_row_to_matched` decoder reconstitutes the `DirectAcquisition` /
   `TaxLotSnapshot` basis branch from the conditional columns.

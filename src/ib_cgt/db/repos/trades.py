@@ -50,42 +50,41 @@ class TradeRepo:
         self,
         trades: Iterable[Trade],
         *,
-        trade_keys: Iterable[str],
         source_statement_hash: str,
     ) -> int:
-        """Insert each trade, dedup'd on `trade_key`; return inserted count.
+        """Insert each trade, dedup'd on the natural-key UNIQUE; return inserted count.
 
-        `trade_keys` is a parallel sequence aligned one-to-one with `trades`.
-        The business key is an ingestion-level concern — the `Trade` domain
-        object doesn't carry it (architecture.md §Component map, item 3) —
-        so we take it here as a separate arg. The ingestion layer will
-        typically produce both sequences together.
+        Re-imports are idempotent because migration 005 declares
+        `UNIQUE (account_id, instrument_id, trade_datetime, action,
+        quantity, price_amount)` on the trades table — exactly the
+        fields that distinguish two genuine trades on the same
+        instrument. `INSERT OR IGNORE` skips a row whose natural key
+        already exists, and `cursor.rowcount` reflects only the rows
+        that actually landed.
 
-        The `source_statement_hash` must already exist in `statements`;
-        the FK will raise `IntegrityError` otherwise.
+        The `source_statement_hash` must already exist in
+        `statements`; the FK will raise `IntegrityError` otherwise.
         """
-        # Pair trades with their keys eagerly so we can reject a mismatch
-        # (e.g. caller passed a shorter key list) with a clear error.
-        pairs = list(zip_strict(trades, trade_keys))
-        if not pairs:
+        materialised = list(trades)
+        if not materialised:
             return 0
 
         rows: list[tuple[object, ...]] = []
-        for trade, trade_key in pairs:
+        for trade in materialised:
             # Resolve (or create) the instrument id — every trade needs one,
             # and upsert is idempotent. Batching by distinct instrument would
             # shave some calls but ingestion batches are small enough that
             # the simpler code wins.
             instrument_id = self._instruments.upsert(trade.instrument)
-            rows.append(_trade_to_row(trade, trade_key, instrument_id, source_statement_hash))
+            rows.append(_trade_to_row(trade, instrument_id, source_statement_hash))
 
         cursor = self._conn.executemany(
             "INSERT OR IGNORE INTO trades ("
-            "trade_key, account_id, instrument_id, action, "
+            "account_id, instrument_id, action, "
             "trade_datetime, trade_date, settlement_date, quantity, "
             "price_amount, price_currency, fees_amount, fees_currency, "
             "accrued_amount, accrued_currency, source_statement_hash"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         # `rowcount` is the number of rows actually inserted (ignored rows
@@ -247,11 +246,16 @@ class TradeRepo:
 
 def _trade_to_row(
     trade: Trade,
-    trade_key: str,
     instrument_id: int,
     source_statement_hash: str,
 ) -> tuple[object, ...]:
-    """Flatten a `Trade` into the column tuple used by INSERT."""
+    """Flatten a `Trade` into the column tuple used by INSERT.
+
+    `trade_id` is **not** in the tuple: the column is `INTEGER PRIMARY
+    KEY`, so SQLite issues a fresh value for every successful insert.
+    On `INSERT OR IGNORE` conflicts (the natural-key UNIQUE), no id is
+    issued and the row is skipped.
+    """
     price_amount, price_currency = money_to_cols(trade.price)
     fees_amount, fees_currency = money_to_cols(trade.fees)
     if trade.accrued_interest is not None:
@@ -259,7 +263,6 @@ def _trade_to_row(
     else:
         accrued_amount, accrued_currency = None, None
     return (
-        trade_key,
         trade.account_id,
         instrument_id,
         trade.action.value,
@@ -275,14 +278,3 @@ def _trade_to_row(
         accrued_currency,
         source_statement_hash,
     )
-
-
-def zip_strict(trades: Iterable[Trade], keys: Iterable[str]) -> list[tuple[Trade, str]]:
-    """Zip two iterables, raising if their lengths disagree.
-
-    Python 3.10+ ships `zip(..., strict=True)` which does the same job,
-    but it returns a `zip` object — we materialise to a list so the caller
-    can check `len()` for empty-input short-circuits without a second pass.
-    """
-    pairs = list(zip(trades, keys, strict=True))
-    return pairs

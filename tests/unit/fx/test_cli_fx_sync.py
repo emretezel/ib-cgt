@@ -101,11 +101,7 @@ def _seed_full_trade(conn: sqlite3.Connection, *, currency: str, trade_date: dat
         fees=Money.of("1", currency),
         accrued_interest=None,
     )
-    TradeRepo(conn).insert_many(
-        [trade],
-        trade_keys=[f"{currency}-{trade_date.isoformat()}"],
-        source_statement_hash=hash_key,
-    )
+    TradeRepo(conn).insert_many([trade], source_statement_hash=hash_key)
 
 
 # ---------------------------------------------------------------------------

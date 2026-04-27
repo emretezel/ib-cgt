@@ -29,14 +29,14 @@ def _stock_summary(net: str, gains: str = "0", losses: str = "0") -> AssetClassS
 
 def _matched_disposal() -> MatchedDisposal:
     return MatchedDisposal(
-        disposal_trade_key="s1",
+        disposal_trade_id=2,
         instrument=StockInstrument(symbol="AAPL", currency="USD"),
         disposal_date=date(2024, 9, 1),
         match_rule=MatchRule.SAME_DAY,
         matched_quantity=Decimal("5"),
         matched_proceeds_gbp=Money.gbp("1000"),
         matched_cost_gbp=Money.gbp("900"),
-        basis=DirectAcquisition(acquisition_trade_key="b1"),
+        basis=DirectAcquisition(acquisition_trade_id=1),
     )
 
 

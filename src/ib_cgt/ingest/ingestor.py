@@ -1,6 +1,6 @@
 """End-to-end ingestion orchestrator.
 
-Composes the three ingestion primitives (hash → parse → map) with the
+Composes the two ingestion primitives (hash → parse + map) with the
 existing persistence repositories to turn a path-on-disk into rows in
 the database. Everything inside `ingest_statement` runs in one SQLite
 transaction, so a failure mid-way leaves the DB exactly as it was at
@@ -11,10 +11,11 @@ Idempotency is layered:
 
 1. The statement hash short-circuits a re-import before we even parse:
    `StatementRepo.exists(hash)` → return `already_imported=True`.
-2. Even if the hash is new but a trade key was already inserted by a
-   different statement, `trades.trade_key` is the PK and
-   `INSERT OR IGNORE` silently skips the duplicate — the counts in the
-   result reflect what actually landed.
+2. Even if the file's hash is new but its trades overlap with rows
+   already in the DB, the natural-key UNIQUE on `trades` (declared
+   by migration 005) catches each duplicate at INSERT time. With
+   `INSERT OR IGNORE` the duplicates silently no-op — the counts in
+   the result reflect what actually landed.
 
 Author: Emre Tezel
 """
@@ -30,7 +31,6 @@ from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
 from ib_cgt.domain import Account
 from ib_cgt.ingest.hashing import compute_statement_hash
-from ib_cgt.ingest.keys import build_trade_key
 from ib_cgt.ingest.mapper import map_rows
 from ib_cgt.ingest.parser import parse_statement
 
@@ -119,7 +119,6 @@ def ingest_statement(
 
     parsed = parse_statement(source_bytes)
     trades = map_rows(parsed)
-    trade_keys = [build_trade_key(t) for t in trades]
 
     accounts = AccountRepo(conn)
     trade_repo = TradeRepo(conn)
@@ -148,7 +147,6 @@ def ingest_statement(
         )
         inserted = trade_repo.insert_many(
             trades,
-            trade_keys=trade_keys,
             source_statement_hash=statement_hash,
         )
 
