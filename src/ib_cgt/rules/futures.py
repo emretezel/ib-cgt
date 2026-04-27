@@ -61,14 +61,23 @@ from ib_cgt.rules.errors import InconsistentTradeError, WrongAssetClassError
 class FXConverter(Protocol):
     """Structural type for the FX dependency the engine consumes.
 
-    Matches the public read-path of `ib_cgt.fx.service.FXService.convert`:
-    convert a `Money` amount in some currency to `target` at the spot
-    rate for date `on`. Tests inject a deterministic stub; production
-    wires in the real `FXService`.
+    Matches the audit-grade read path
+    `ib_cgt.fx.service.FXService.convert_with_rate`: convert a `Money`
+    amount in some currency to `target` at the spot rate for date `on`,
+    returning both the converted amount **and** the cache-stored rate
+    that was applied. The engine attaches the rate to every
+    `FutureRealisation` so audit output can show the FX figure
+    directly.
+
+    The Protocol intentionally does **not** include the rate-less
+    `convert` method — every leg in the engine carries an FX rate, and
+    a typo dropping back to `convert` would silently lose audit data.
+    Tests inject a deterministic stub; production wires in
+    `FXService`.
     """
 
-    def convert(self, amount: Money, *, target: str, on: date) -> Money:
-        """Return `amount` converted to `target` currency at `on`'s rate."""
+    def convert_with_rate(self, amount: Money, *, target: str, on: date) -> tuple[Money, Decimal]:
+        """Return `(converted_amount, applied_rate)` at `on`'s spot rate."""
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +135,10 @@ class FutureRuleEngine:
         """Bind to an FX converter (real `FXService` or a test stub).
 
         Args:
-            fx: Anything implementing `convert(amount, target, on)`.
-                The engine never calls any other FX method, so the
-                Protocol above is the full surface.
+            fx: Anything implementing the `FXConverter` Protocol —
+                a single `convert_with_rate(amount, *, target, on) ->
+                (Money, Decimal)` method. The engine never calls any
+                other FX surface, so this is the full dependency.
         """
         self._fx = fx
 
@@ -340,21 +350,40 @@ class FutureRuleEngine:
             # happens at the open of a short and the "buy back" at the
             # close — but the disposal date for tax purposes is still
             # the close date for both sides.
+            #
+            # The `*_native_gross` figures are *before* fee deduction —
+            # they reconcile against IB's per-contract notional. The
+            # `*_native_amount` figures applied to FX conversion are
+            # net of the proceeds-side fee allocation and inclusive of
+            # the cost-side fee allocation, so the resulting GBP
+            # cost/proceeds match HS292.
             if side == "LONG":
                 proceeds_native_amount = close_notional_native - close_fee_share
                 cost_native_amount = open_notional_native + open_fee_share
                 proceeds_date = close_date
                 cost_date = slice_.open_date
+                proceeds_native_gross_amount = close_notional_native
+                cost_native_gross_amount = open_notional_native
             else:  # SHORT
                 proceeds_native_amount = open_notional_native - open_fee_share
                 cost_native_amount = close_notional_native + close_fee_share
                 proceeds_date = slice_.open_date
                 cost_date = close_date
+                proceeds_native_gross_amount = open_notional_native
+                cost_native_gross_amount = close_notional_native
 
             proceeds_native = Money(proceeds_native_amount, native_currency)
             cost_native = Money(cost_native_amount, native_currency)
-            proceeds_gbp = self._fx.convert(proceeds_native, target="GBP", on=proceeds_date)
-            cost_gbp = self._fx.convert(cost_native, target="GBP", on=cost_date)
+            # `convert_with_rate` returns the cache-stored
+            # "1 GBP = r native" rate alongside the converted amount;
+            # both go into the realisation row so the renderer can
+            # show the audit FX figure without a second cache hit.
+            proceeds_gbp, proceeds_fx_rate = self._fx.convert_with_rate(
+                proceeds_native, target="GBP", on=proceeds_date
+            )
+            cost_gbp, cost_fx_rate = self._fx.convert_with_rate(
+                cost_native, target="GBP", on=cost_date
+            )
 
             realisations.append(
                 FutureRealisation(
@@ -367,6 +396,11 @@ class FutureRuleEngine:
                     quantity=qty_step,
                     proceeds_gbp=proceeds_gbp,
                     cost_gbp=cost_gbp,
+                    proceeds_native_gross=Money(proceeds_native_gross_amount, native_currency),
+                    cost_native_gross=Money(cost_native_gross_amount, native_currency),
+                    fees_native=Money(open_fee_share + close_fee_share, native_currency),
+                    proceeds_fx_rate=proceeds_fx_rate,
+                    cost_fx_rate=cost_fx_rate,
                 )
             )
 

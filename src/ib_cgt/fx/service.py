@@ -113,23 +113,12 @@ class FXService:
                 fallback window for any leg of the conversion.
         """
         validate_currency_code(target)
-        # Early-exit for the identity conversion. We short-circuit
-        # without so much as touching the DB because every rule engine
-        # calls this on every Money it owns, GBP included.
-        if amount.currency == target:
-            return amount
-
-        # One-leg-GBP paths: one lookup, one multiply or divide.
-        if target == _GBP:
-            # native → GBP. Rate stored as `1 GBP = r native`; so
-            # `amount / r` gives GBP.
-            rate = self._lookup_rate(quote=amount.currency, on=on)
-            return Money.of(amount.amount / rate, _GBP)
-        if amount.currency == _GBP:
-            # GBP → native. Rate stored as `1 GBP = r native`; so
-            # `amount * r` gives native.
-            rate = self._lookup_rate(quote=target, on=on)
-            return Money.of(amount.amount * rate, target)
+        # Identity / GBP↔native paths share their math with
+        # `convert_with_rate`. `_convert_simple` returns `None` for
+        # the cross-currency path, which we handle inline below.
+        simple = self._convert_simple(amount, target=target, on=on)
+        if simple is not None:
+            return simple[0]
 
         # Cross-currency path: pivot through GBP. We keep precision in
         # Decimal throughout — no intermediate `Money` is needed, so we
@@ -139,6 +128,82 @@ class FXService:
         # amount_gbp = amount / rate_from;  result = amount_gbp * rate_to.
         result = (amount.amount / rate_from) * rate_to
         return Money.of(result, target)
+
+    def convert_with_rate(self, amount: Money, *, target: str, on: date) -> tuple[Money, Decimal]:
+        """Convert `amount` and additionally return the rate that was applied.
+
+        Designed for audit-grade callers (the futures rule engine,
+        which has to attach the FX rate to every realisation so the
+        operator can reconcile against IB statements). The returned
+        rate is the *stored* "1 GBP = r native" rate from the cache —
+        the same value the renderer should display.
+
+        Three shapes, mirroring `convert`:
+
+        * **same-currency** → returns `(amount, Decimal('1'))` with no
+          DB call.
+        * **target is GBP** → returns `(amount / r, r)` where `r` is
+          the stored `(GBP, amount.currency, on)` rate.
+        * **source is GBP** → returns `(amount * r, r)` where `r` is
+          the stored `(GBP, target, on)` rate.
+
+        Cross-currency (neither leg GBP) intentionally raises
+        `NotImplementedError`: there is no single rate to attach in
+        that path, and no current caller needs it. Use `convert` for
+        cross-currency.
+
+        Args:
+            amount: Source `Money` — carries its own ISO-4217 currency.
+            target: Target ISO-4217 currency code. Upper-case, 3 letters.
+            on: The UK-local date to look rates up on.
+
+        Returns:
+            A `(Money, Decimal)` pair. The rate is the cache-stored
+            "1 GBP = r quote" value; for the identity path the rate
+            is exactly `Decimal('1')` so callers do not have to
+            special-case GBP-denominated inputs.
+
+        Raises:
+            RateNotFoundError: If the cache has no rate within the
+                fallback window.
+            NotImplementedError: For cross-currency conversion.
+        """
+        validate_currency_code(target)
+        simple = self._convert_simple(amount, target=target, on=on)
+        if simple is not None:
+            return simple
+        raise NotImplementedError(
+            "convert_with_rate does not support cross-currency conversion "
+            f"({amount.currency} -> {target}); use convert() instead."
+        )
+
+    def _convert_simple(
+        self, amount: Money, *, target: str, on: date
+    ) -> tuple[Money, Decimal] | None:
+        """Single-rate paths shared by `convert` and `convert_with_rate`.
+
+        Returns `(result, rate)` for the three single-rate shapes;
+        returns `None` when the conversion is cross-currency, signalling
+        the caller to fall back to (or reject) the pivot path. The
+        rate returned is the stored "1 GBP = r native" cache value —
+        not an inverted "multiply by this" effective rate — because
+        that is the figure operators want to see in audit output.
+        """
+        # Identity. Short-circuit without touching the DB; every rule
+        # engine calls convert_* on every Money it owns, GBP included.
+        if amount.currency == target:
+            return amount, Decimal(1)
+        # native → GBP. Rate stored as `1 GBP = r native`; so
+        # `amount / r` gives GBP.
+        if target == _GBP:
+            rate = self._lookup_rate(quote=amount.currency, on=on)
+            return Money.of(amount.amount / rate, _GBP), rate
+        # GBP → native. Same stored rate; multiply this time.
+        if amount.currency == _GBP:
+            rate = self._lookup_rate(quote=target, on=on)
+            return Money.of(amount.amount * rate, target), rate
+        # Cross-currency: caller decides whether to pivot or reject.
+        return None
 
     # ------------------------------------------------------------------
     # Write path — sync_currencies()

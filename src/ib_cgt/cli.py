@@ -636,10 +636,12 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
     """Print a per-instrument section: bold header then a Rich realisations table.
 
     Per-instrument sections (rather than one combined table) keep the
-    output readable on narrow terminals — Rich's auto-sizing was
-    splitting both the divider text and the empty-state placeholder
-    across multiple lines per cell when everything was crammed into a
-    single 9-column table.
+    output readable on narrow terminals and let the native-currency
+    column headers carry the contract's own currency
+    (`Proceeds (USD)`, `Cost (EUR)`, etc.) without ambiguity. Each
+    table is 13 columns: identifiers + dates + qty, then the
+    native-currency audit triple, then the two FX rates, then the
+    GBP triple including the colour-coded gain.
     """
     _console.print("[bold]Futures realisations (dry-run)[/]")
     for instrument, result, error in rows:
@@ -655,6 +657,7 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
         if not result.realisations:
             _console.print("  [dim](no realisations)[/]")
             continue
+        ccy = instrument.currency
         table = Table(header_style="bold", show_lines=False)
         table.add_column("Open ID", justify="right")
         table.add_column("Close ID", justify="right")
@@ -662,6 +665,16 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
         table.add_column("Open Date")
         table.add_column("Close Date")
         table.add_column("Qty", justify="right")
+        # Native-currency audit columns — gross of fees so they
+        # reconcile directly against IB's per-contract notional.
+        table.add_column(f"Proceeds ({ccy})", justify="right")
+        table.add_column(f"Cost ({ccy})", justify="right")
+        table.add_column(f"Fees ({ccy})", justify="right")
+        # FX rates: stored "1 GBP = r native". 4dp gives 0.5 bp of
+        # display precision — enough for any G10 cross.
+        table.add_column("FX open", justify="right")
+        table.add_column("FX close", justify="right")
+        # GBP triple — net of fees, FX-converted at trade-date spot.
         table.add_column("Cost (GBP)", justify="right")
         table.add_column("Proceeds (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
@@ -737,7 +750,10 @@ def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -
     table.add_row("Realisations", str(realisation_count))
     table.add_row("Open positions", str(open_count))
     gain_style = "green" if total_gain.amount >= 0 else "red"
-    table.add_row("Total realised gain (GBP)", f"[{gain_style}]{total_gain.amount}[/]")
+    table.add_row(
+        "Total realised gain (GBP)",
+        f"[{gain_style}]{_format_money_2dp(total_gain)}[/]",
+    )
 
     _console.print(table)
 
@@ -748,9 +764,24 @@ def _instrument_divider(instrument: FutureInstrument) -> str:
 
 
 def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
-    """Project a `FutureRealisation` into the columns of the realisations table."""
+    """Project a `FutureRealisation` into the 13 columns of the realisations table.
+
+    Column order matches the `add_column` calls in
+    `_render_match_futures_realisations`. The two FX columns are
+    labelled by *date* (open / close) rather than *leg* (cost /
+    proceeds), so we map from realisation fields accordingly: for a
+    LONG the cost-leg uses the open date, while for a SHORT it is
+    the proceeds-leg that uses the open date — the table layout
+    stays consistent regardless of side.
+    """
     gain = realisation.gain_gbp
     gain_style = "green" if gain.amount >= 0 else "red"
+    if realisation.side == "LONG":
+        fx_open_rate = realisation.cost_fx_rate  # cost-leg = open-date
+        fx_close_rate = realisation.proceeds_fx_rate  # proceeds-leg = close-date
+    else:  # SHORT
+        fx_open_rate = realisation.proceeds_fx_rate  # proceeds-leg = open-date
+        fx_close_rate = realisation.cost_fx_rate  # cost-leg = close-date
     return (
         str(realisation.open_trade_id),
         str(realisation.close_trade_id),
@@ -758,9 +789,14 @@ def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
         realisation.open_date.isoformat(),
         realisation.close_date.isoformat(),
         f"{realisation.quantity}",
-        f"{realisation.cost_gbp.amount}",
-        f"{realisation.proceeds_gbp.amount}",
-        f"[{gain_style}]{gain.amount}[/]",
+        _format_money_2dp(realisation.proceeds_native_gross),
+        _format_money_2dp(realisation.cost_native_gross),
+        _format_money_2dp(realisation.fees_native),
+        _format_fx_rate(fx_open_rate),
+        _format_fx_rate(fx_close_rate),
+        _format_money_2dp(realisation.cost_gbp),
+        _format_money_2dp(realisation.proceeds_gbp),
+        f"[{gain_style}]{_format_money_2dp(gain)}[/]",
     )
 
 
@@ -773,9 +809,29 @@ def _open_position_to_cells(position: OpenPosition) -> tuple[str, ...]:
         position.open_date.isoformat(),
         str(position.open_trade_id),
         f"{position.quantity_remaining}",
-        f"{position.open_price.amount} {position.open_price.currency}",
-        f"{position.fees_remaining.amount} {position.fees_remaining.currency}",
+        f"{_format_money_2dp(position.open_price)} {position.open_price.currency}",
+        f"{_format_money_2dp(position.fees_remaining)} {position.fees_remaining.currency}",
     )
+
+
+def _format_money_2dp(value: Money) -> str:
+    """Format a `Money.amount` to 2dp with thousands separators.
+
+    Currency is *not* included — every consumer either has the
+    currency in the column header (realisations table, summary) or
+    appends it explicitly per cell (open-positions table).
+    """
+    return f"{value.amount:,.2f}"
+
+
+def _format_fx_rate(rate: Decimal) -> str:
+    """Format an FX rate to 4dp, no thousands separator.
+
+    The 4dp window covers everything from JPY (~150) to KRW
+    (~1,300) without losing 0.5 bp of precision; thousands
+    separators are unhelpful for figures this small.
+    """
+    return f"{rate:.4f}"
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

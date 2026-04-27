@@ -301,3 +301,41 @@ def test_match_futures_rejects_invalid_since(runner: CliRunner, populated_db: Pa
     # Typer surfaces BadParameter as part of its error stream.
     combined = (result.stdout or "") + (result.stderr or "")
     assert "--since" in combined
+
+
+def test_match_futures_renders_native_audit_columns(
+    runner: CliRunner, populated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native-currency, FX-rate and fees columns appear with the right format.
+
+    Filtered to ES so the assertion landscape is small and known:
+    OPEN_LONG qty=2 @ 5000 then CLOSE_LONG qty=2 @ 5050 with USD
+    multiplier 50 and a flat 1 GBP = 1.27 USD rate. Expected native
+    figures: cost 500,000.00 / proceeds 505,000.00 / fees 5.00.
+    """
+    # Widen the rendered terminal so Rich does not wrap the 13-column
+    # realisations table header text mid-cell. Without this, header
+    # substrings like "Proceeds (USD)" can land split across lines and
+    # the substring assertions below would break for purely
+    # cosmetic reasons.
+    monkeypatch.setenv("COLUMNS", "240")
+
+    result = runner.invoke(app, ["match", "futures", "-s", "ES"])
+    assert result.exit_code == 0, result.stdout
+
+    # Native-currency audit columns — header text carries the
+    # contract's currency dynamically.
+    assert "Proceeds (USD)" in result.stdout
+    assert "Cost (USD)" in result.stdout
+    assert "Fees (USD)" in result.stdout
+    # FX rate columns and the 4dp-formatted rate value.
+    assert "FX open" in result.stdout
+    assert "FX close" in result.stdout
+    assert "1.2700" in result.stdout
+    # 2dp + thousands-separator formatting on the gross native values.
+    assert "505,000.00" in result.stdout  # 5050 * 50 * 2 — proceeds gross
+    assert "500,000.00" in result.stdout  # 5000 * 50 * 2 — cost gross
+    # Fees: 2.50 (open) + 2.50 (close) = 5.00 USD per realisation.
+    # Use a context-bearing substring so we don't accidentally match
+    # "5.00" inside another number.
+    assert " 5.00 " in result.stdout or "  5.00\n" in result.stdout or " 5.00\n" in result.stdout

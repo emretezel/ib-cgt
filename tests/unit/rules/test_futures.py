@@ -471,39 +471,167 @@ def test_trade_for_other_instrument_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Regression: engine must call FX.convert with keyword-only args
+# Audit fields — native-gross notionals, fees, FX rates
 # ---------------------------------------------------------------------------
 
 
-class _StrictKwargFX:
-    """FX stub that refuses positional args.
+def test_long_realisation_carries_native_gross_fees_and_fx_rates() -> None:
+    """LONG: native-gross is `price*mult*qty`; fees summed; FX rates in prod convention."""
+    engine = _engine_with_open_close_rates()
+    inst = es_future()  # USD, multiplier 50
+    trades = [
+        (
+            1,
+            future_trade(
+                action=TradeAction.OPEN_LONG, on=_OPEN_DATE, qty=1, price=100, fees="2.50"
+            ),
+        ),
+        (
+            2,
+            future_trade(
+                action=TradeAction.CLOSE_LONG, on=_CLOSE_DATE, qty=1, price=110, fees="3.00"
+            ),
+        ),
+    ]
+    r = engine.compute(instrument=inst, trades=trades).realisations[0]
+    # Gross notionals are price * multiplier * qty, before any fee deduction.
+    assert r.proceeds_native_gross == Money.of("5500", "USD")  # close leg
+    assert r.cost_native_gross == Money.of("5000", "USD")  # open leg
+    # Fees attributed = open share + close share = original full fees here
+    # (single drain, single close → both fee residuals consumed).
+    assert r.fees_native == Money.of("5.50", "USD")
+    # Cost-leg FX uses open date; proceeds-leg uses close date.
+    # Stub returns the inverse of its stored rate (production convention).
+    assert r.cost_fx_rate == Decimal(1) / _FX_OPEN
+    assert r.proceeds_fx_rate == Decimal(1) / _FX_CLOSE
 
-    The real `FXService.convert` is `(self, amount, *, target, on)` —
-    keyword-only after `amount`. An earlier draft of `FutureRuleEngine`
-    called `self._fx.convert(amount, "GBP", date)` positionally, which
-    would `TypeError` against the real service. This stub raises a
-    bespoke error if the engine ever regresses to that, so the failure
-    mode is unmistakable rather than a slightly-confusing TypeError.
+
+def test_short_realisation_carries_native_gross_fees_and_fx_rates() -> None:
+    """SHORT: native-gross legs swap (proceeds=open-leg); FX dates swap symmetrically."""
+    engine = _engine_with_open_close_rates()
+    inst = es_future()
+    trades = [
+        (
+            1,
+            future_trade(
+                action=TradeAction.OPEN_SHORT, on=_OPEN_DATE, qty=1, price=110, fees="2.50"
+            ),
+        ),
+        (
+            2,
+            future_trade(
+                action=TradeAction.CLOSE_SHORT, on=_CLOSE_DATE, qty=1, price=100, fees="3.00"
+            ),
+        ),
+    ]
+    r = engine.compute(instrument=inst, trades=trades).realisations[0]
+    # SHORT: the original sale is the open leg, so it's the proceeds.
+    assert r.proceeds_native_gross == Money.of("5500", "USD")  # open leg
+    assert r.cost_native_gross == Money.of("5000", "USD")  # close leg
+    assert r.fees_native == Money.of("5.50", "USD")
+    # SHORT: proceeds-leg FX uses open date; cost-leg FX uses close date.
+    assert r.proceeds_fx_rate == Decimal(1) / _FX_OPEN
+    assert r.cost_fx_rate == Decimal(1) / _FX_CLOSE
+
+
+def test_partial_close_splits_fees_across_realisations() -> None:
+    """fees_native on a partial-close realisation reflects the pro-rata allocation."""
+    engine = _engine_with_open_close_rates()
+    inst = es_future()
+    trades = [
+        (
+            1,
+            future_trade(
+                action=TradeAction.OPEN_LONG, on=_OPEN_DATE, qty=5, price=100, fees="1.00"
+            ),
+        ),
+        (
+            2,
+            future_trade(
+                action=TradeAction.CLOSE_LONG, on=_CLOSE_DATE, qty=2, price=110, fees="0.50"
+            ),
+        ),
+    ]
+    r = engine.compute(instrument=inst, trades=trades).realisations[0]
+    # Open share: 1.00 * 2/5 = 0.40 (close drains 2 of 5 contracts).
+    # Close share: full close fee since this single drain is the last
+    # drain on the close trade (close_qty_remaining == qty_step).
+    # Total: 0.40 + 0.50 = 0.90.
+    assert r.fees_native == Money.of("0.90", "USD")
+
+
+def test_gbp_denominated_future_has_identity_fx_rates() -> None:
+    """GBP future: both rates collapse to Decimal('1') and GBP == native."""
+    # Empty rate map is fine — the stub's identity short-circuit
+    # never consults it for GBP→GBP conversion.
+    engine = FutureRuleEngine(StubFXService({}))
+    inst = es_future(currency="GBP")
+    trades = [
+        (
+            1,
+            future_trade(
+                action=TradeAction.OPEN_LONG,
+                on=_OPEN_DATE,
+                qty=1,
+                price=100,
+                fees="1.00",
+                instrument=inst,
+            ),
+        ),
+        (
+            2,
+            future_trade(
+                action=TradeAction.CLOSE_LONG,
+                on=_CLOSE_DATE,
+                qty=1,
+                price=110,
+                fees="2.00",
+                instrument=inst,
+            ),
+        ),
+    ]
+    r = engine.compute(instrument=inst, trades=trades).realisations[0]
+    assert r.proceeds_fx_rate == Decimal(1)
+    assert r.cost_fx_rate == Decimal(1)
+    # GBP figures equal the GBP-priced native figures, modulo fees:
+    # cost = open notional + open fee; proceeds = close notional - close fee.
+    assert r.cost_gbp == Money.gbp(r.cost_native_gross.amount + Decimal("1.00"))
+    assert r.proceeds_gbp == Money.gbp(r.proceeds_native_gross.amount - Decimal("2.00"))
+
+
+# ---------------------------------------------------------------------------
+# Regression: engine must call FX with the keyword-only `convert_with_rate`
+# ---------------------------------------------------------------------------
+
+
+class _StrictKwargFXWithRate:
+    """FX stub that refuses positional args on `convert_with_rate`.
+
+    The real `FXService.convert_with_rate` is `(self, amount, *,
+    target, on)` — keyword-only after `amount`. This stub locks in
+    that exact shape so a future regression to a different signature
+    (positional, or back to the rate-less `convert`) is caught by a
+    failing test rather than a silent loss of audit data.
     """
 
-    def __init__(self, rate: Decimal) -> None:
-        """Bind a flat rate (1 native = `rate` GBP)."""
-        self._rate = rate
+    def __init__(self, gbp_to_native: Decimal) -> None:
+        """Bind a flat rate (1 GBP = `gbp_to_native` native)."""
+        self._gbp_to_native = gbp_to_native
         self.calls = 0
 
-    def convert(self, amount: Money, *, target: str, on: date) -> Money:
+    def convert_with_rate(self, amount: Money, *, target: str, on: date) -> tuple[Money, Decimal]:
         """Convert via the rate; explicit `*` rejects any positional misuse."""
         # The `*` in the signature already enforces this at the
         # interpreter level, but we still increment a counter so the
         # test can also assert the engine actually called us at all.
         del target, on
         self.calls += 1
-        return Money.gbp(amount.amount * self._rate)
+        return Money.gbp(amount.amount / self._gbp_to_native), self._gbp_to_native
 
 
-def test_engine_uses_keyword_only_convert_signature() -> None:
-    """Lock in the fixed `convert(amount, *, target, on)` call shape."""
-    fx = _StrictKwargFX(rate=Decimal("0.80"))
+def test_engine_uses_keyword_only_convert_with_rate_signature() -> None:
+    """Lock in the kwarg-only `convert_with_rate(amount, *, target, on)` call shape."""
+    fx = _StrictKwargFXWithRate(gbp_to_native=Decimal("1.25"))
     engine = FutureRuleEngine(fx)
     inst = es_future()
     trades = [
@@ -511,6 +639,6 @@ def test_engine_uses_keyword_only_convert_signature() -> None:
         (2, future_trade(action=TradeAction.CLOSE_LONG, on=_CLOSE_DATE, qty=1, price=110)),
     ]
     result = engine.compute(instrument=inst, trades=trades)
-    # Engine emits one realisation → two convert calls (cost leg + proceeds leg).
+    # Engine emits one realisation → two convert_with_rate calls (cost + proceeds).
     assert len(result.realisations) == 1
     assert fx.calls == 2

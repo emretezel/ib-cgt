@@ -325,6 +325,13 @@ def test_future_realisation_long_gain() -> None:
         # Numbers chosen so gain reads as 410 GBP (close 5410 - cost 5000).
         proceeds_gbp=Money.gbp("5410"),
         cost_gbp=Money.gbp("5000"),
+        # Native gross figures consistent with a flat 1.25 USD/GBP rate
+        # (5410 GBP * 1.25 = 6762.50 USD, etc.). Fees zero for clarity.
+        proceeds_native_gross=Money.of("6762.50", "USD"),
+        cost_native_gross=Money.of("6250", "USD"),
+        fees_native=Money.of("0", "USD"),
+        proceeds_fx_rate=Decimal("1.25"),
+        cost_fx_rate=Decimal("1.25"),
     )
     assert fr.gain_gbp == Money.gbp("410")
 
@@ -342,6 +349,11 @@ def test_future_realisation_short_loss() -> None:
         quantity=Decimal("1"),
         proceeds_gbp=Money.gbp("5000"),  # opened at 100 effective
         cost_gbp=Money.gbp("5410"),  # closed at 110 effective
+        proceeds_native_gross=Money.of("6250", "USD"),
+        cost_native_gross=Money.of("6762.50", "USD"),
+        fees_native=Money.of("0", "USD"),
+        proceeds_fx_rate=Decimal("1.25"),
+        cost_fx_rate=Decimal("1.25"),
     )
     assert fr.gain_gbp == Money.gbp("-410")
 
@@ -358,6 +370,11 @@ def test_future_realisation_rejects_non_future_instrument() -> None:
             quantity=Decimal("1"),
             proceeds_gbp=Money.gbp("100"),
             cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
         )
 
 
@@ -373,6 +390,11 @@ def test_future_realisation_rejects_invalid_side() -> None:
             quantity=Decimal("1"),
             proceeds_gbp=Money.gbp("100"),
             cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
         )
 
 
@@ -388,6 +410,11 @@ def test_future_realisation_rejects_zero_quantity() -> None:
             quantity=Decimal("0"),
             proceeds_gbp=Money.gbp("100"),
             cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
         )
 
 
@@ -403,6 +430,11 @@ def test_future_realisation_rejects_non_gbp_proceeds() -> None:
             quantity=Decimal("1"),
             proceeds_gbp=Money.of("100", "USD"),
             cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
         )
 
 
@@ -418,6 +450,74 @@ def test_future_realisation_rejects_non_gbp_cost() -> None:
             quantity=Decimal("1"),
             proceeds_gbp=Money.gbp("100"),
             cost_gbp=Money.of("90", "USD"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
+        )
+
+
+def test_future_realisation_rejects_native_currency_mismatch() -> None:
+    """`proceeds_native_gross.currency` must match `instrument.currency`."""
+    with pytest.raises(ValueError, match="proceeds_native_gross"):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),  # USD
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "EUR"),  # wrong currency
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
+        )
+
+
+def test_future_realisation_rejects_negative_fees() -> None:
+    """`fees_native` must be non-negative."""
+    with pytest.raises(ValueError, match="fees_native"):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("-1", "USD"),
+            proceeds_fx_rate=Decimal("1.25"),
+            cost_fx_rate=Decimal("1.25"),
+        )
+
+
+def test_future_realisation_rejects_non_positive_fx_rate() -> None:
+    """`proceeds_fx_rate` and `cost_fx_rate` must be strictly positive."""
+    with pytest.raises(ValueError, match="proceeds_fx_rate"):
+        FutureRealisation(
+            open_trade_id=10,
+            close_trade_id=11,
+            instrument=_es_future(),
+            side="LONG",
+            open_date=date(2024, 4, 1),
+            close_date=date(2024, 6, 1),
+            quantity=Decimal("1"),
+            proceeds_gbp=Money.gbp("100"),
+            cost_gbp=Money.gbp("90"),
+            proceeds_native_gross=Money.of("125", "USD"),
+            cost_native_gross=Money.of("112.50", "USD"),
+            fees_native=Money.of("0", "USD"),
+            proceeds_fx_rate=Decimal("0"),  # zero rate is unusable
+            cost_fx_rate=Decimal("1.25"),
         )
 
 

@@ -138,30 +138,50 @@ def future_trade(
 class StubFXService:
     """Deterministic in-memory FX stand-in for unit tests.
 
-    Mirrors the interface of `ib_cgt.fx.service.FXService.convert` —
-    enough that `FutureRuleEngine` cannot tell it apart. Asserts on
-    unknown dates rather than going to the network, mirroring the
-    `_NetworkBannedClient` pattern in `tests/unit/fx/conftest.py`.
+    Implements the `FXConverter` Protocol consumed by
+    `FutureRuleEngine` — i.e. `convert_with_rate(amount, *, target,
+    on) -> (Money, Decimal)`. Asserts on unknown dates rather than
+    going to the network, mirroring the `_NetworkBannedClient`
+    pattern in `tests/unit/fx/conftest.py`.
 
-    Rates are stored as `1 native = rate * GBP`, consistent with the
-    way the test cases verbalise FX (e.g. `fx_close=Decimal("0.82")`
-    meaning "1 USD = 0.82 GBP").
+    Convention split worth knowing: the stub's **stored** rate map is
+    keyed by date and holds "1 native = r GBP" values (e.g.
+    `Decimal("0.80")` means "1 USD = 0.80 GBP"). This matches how
+    test cases verbalise FX. The **rate exposed** to the engine via
+    `convert_with_rate` is the *inverse* — "1 GBP = r native" —
+    because that is the production convention (matches what
+    `FXService` returns from its real Frankfurter-backed cache) and
+    therefore what `FutureRealisation.proceeds_fx_rate` /
+    `cost_fx_rate` must hold for the renderer to display the right
+    figure. Tests asserting on a rate field should pick stored
+    values whose inverse is exact (e.g. `0.80` → `1.25`,
+    `0.50` → `2`, `1` → `1`).
     """
 
     def __init__(self, rates_native_to_gbp: Mapping[date, Decimal]) -> None:
         """Initialise with a date→rate map (native→GBP)."""
         self._rates = dict(rates_native_to_gbp)
 
-    def convert(self, amount: Money, *, target: str, on: date) -> Money:
-        """Convert `amount` to `target` currency at the rate for `on`.
+    def convert_with_rate(self, amount: Money, *, target: str, on: date) -> tuple[Money, Decimal]:
+        """Convert `amount` to GBP and return the production-convention rate.
 
         Tests in this module only need native→GBP, so the stub only
         supports that direction. Any other path is asserted to fail
         loudly so a misuse in a test produces a useful error.
         """
         assert target == "GBP", f"StubFXService only supports native→GBP, asked for {target}"
+        if amount.currency == "GBP":
+            # Identity path — engine should never hit this for a
+            # non-GBP-denominated future, but it's the documented
+            # contract of `convert_with_rate` and we honour it so
+            # GBP-future test cases work without a special branch.
+            return amount, Decimal(1)
         if on not in self._rates:
             raise AssertionError(f"StubFXService has no rate configured for {on}")
-        rate = self._rates[on]
+        stored = self._rates[on]
         # Native amount * (GBP per native) = GBP amount.
-        return Money.gbp(amount.amount * rate)
+        gbp = Money.gbp(amount.amount * stored)
+        # Production convention is "1 GBP = r native" — invert the
+        # stored "1 native = r GBP" so the engine sees what
+        # `FXService.convert_with_rate` would return.
+        return gbp, Decimal(1) / stored

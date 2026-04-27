@@ -350,6 +350,15 @@ class FutureRealisation:
     Either way, the disposal date for tax purposes is `close_date`:
     HS292 says the gain crystallises when the contract is closed.
 
+    The `*_native_gross` and `fees_native` fields carry the audit
+    figures an operator needs to reconcile a realisation against an
+    IB statement — IB quotes notionals in trade currency and fees as
+    a separate line. The `*_fx_rate` fields capture the cache-stored
+    "1 GBP = r native" rate that was applied to each leg, so a
+    rendered audit row can show the exact FX figure without a second
+    cache hit. For a GBP-denominated future (FX identity), both rates
+    are exactly `Decimal('1')`.
+
     Attributes:
         open_trade_id: Surrogate id of the OPEN_LONG / OPEN_SHORT trade
             that established the slice being drained here.
@@ -368,6 +377,23 @@ class FutureRealisation:
             at the relevant trade-date spot.
         cost_gbp: GBP cost, inclusive of fee allocation, FX-converted
             at the relevant trade-date spot.
+        proceeds_native_gross: Proceeds in the contract's native
+            currency, **before** any fee deduction. Equals
+            `price * multiplier * quantity` of whichever leg is the
+            "sale" for this side. Reconciles directly against IB's
+            per-contract notional.
+        cost_native_gross: Cost in the contract's native currency,
+            **before** any fee deduction. Symmetric to
+            `proceeds_native_gross`.
+        fees_native: Sum of the open-side and close-side fee
+            allocations attributed to this realisation, in the
+            contract's native currency. Always non-negative.
+        proceeds_fx_rate: Stored "1 GBP = r native" rate that was
+            applied to the proceeds-leg conversion. `Decimal('1')`
+            for a GBP-denominated future. Strictly positive.
+        cost_fx_rate: Stored "1 GBP = r native" rate that was applied
+            to the cost-leg conversion. Same invariants as
+            `proceeds_fx_rate`.
     """
 
     open_trade_id: int
@@ -379,9 +405,14 @@ class FutureRealisation:
     quantity: Decimal
     proceeds_gbp: Money
     cost_gbp: Money
+    proceeds_native_gross: Money
+    cost_native_gross: Money
+    fees_native: Money
+    proceeds_fx_rate: Decimal
+    cost_fx_rate: Decimal
 
     def __post_init__(self) -> None:
-        """Enforce positivity, instrument class, side enum, and GBP."""
+        """Enforce positivity, instrument class, side enum, GBP/native invariants."""
         # Instrument class first — every other check assumes a future.
         if not isinstance(self.instrument, FutureInstrument):
             raise ValueError(
@@ -400,6 +431,40 @@ class FutureRealisation:
             raise ValueError(
                 f"FutureRealisation.cost_gbp must be GBP, got {self.cost_gbp.currency}"
             )
+        # Native-currency fields must match the instrument's currency —
+        # otherwise the audit columns lose their meaning.
+        native = self.instrument.currency
+        if self.proceeds_native_gross.currency != native:
+            raise ValueError(
+                f"FutureRealisation.proceeds_native_gross currency "
+                f"({self.proceeds_native_gross.currency}) must match "
+                f"instrument currency ({native})"
+            )
+        if self.cost_native_gross.currency != native:
+            raise ValueError(
+                f"FutureRealisation.cost_native_gross currency "
+                f"({self.cost_native_gross.currency}) must match "
+                f"instrument currency ({native})"
+            )
+        if self.fees_native.currency != native:
+            raise ValueError(
+                f"FutureRealisation.fees_native currency "
+                f"({self.fees_native.currency}) must match "
+                f"instrument currency ({native})"
+            )
+        if self.fees_native.amount < 0:
+            raise ValueError(
+                f"FutureRealisation.fees_native must be >= 0, got {self.fees_native.amount}"
+            )
+        # Rates are stored "1 GBP = r native"; r must be strictly
+        # positive (a zero rate is unusable, a negative rate is
+        # nonsense). Identity converts pass `Decimal('1')`.
+        if self.proceeds_fx_rate <= 0:
+            raise ValueError(
+                f"FutureRealisation.proceeds_fx_rate must be > 0, got {self.proceeds_fx_rate}"
+            )
+        if self.cost_fx_rate <= 0:
+            raise ValueError(f"FutureRealisation.cost_fx_rate must be > 0, got {self.cost_fx_rate}")
 
     @property
     def gain_gbp(self) -> Money:
