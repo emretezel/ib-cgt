@@ -638,10 +638,11 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
     Per-instrument sections (rather than one combined table) keep the
     output readable on narrow terminals and let the native-currency
     column headers carry the contract's own currency
-    (`Proceeds (USD)`, `Cost (EUR)`, etc.) without ambiguity. Each
-    table is 13 columns: identifiers + dates + qty, then the
-    native-currency audit triple, then the two FX rates, then the
-    GBP triple including the colour-coded gain.
+    (`Gross P&L (USD)`, `Open Fee (EUR)`, etc.) without ambiguity.
+    Each table is 14 columns: identifiers + dates + qty, then the
+    gross P&L plus the open and close commissions in native currency,
+    then the two FX rates, then the SA108 GBP triple — proceeds,
+    cost, and the colour-coded gain.
     """
     _console.print("[bold]Futures realisations (dry-run)[/]")
     for instrument, result, error in rows:
@@ -665,18 +666,25 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
         table.add_column("Open Date")
         table.add_column("Close Date")
         table.add_column("Qty", justify="right")
-        # Native-currency audit columns — gross of fees so they
-        # reconcile directly against IB's per-contract notional.
-        table.add_column(f"Proceeds ({ccy})", justify="right")
-        table.add_column(f"Cost ({ccy})", justify="right")
-        table.add_column(f"Fees ({ccy})", justify="right")
+        # Native-currency audit columns. Gross P&L is signed — the
+        # CFD disposal consideration per TCGA92/S143(5). The open and
+        # close commissions are shown separately so each one can be
+        # reconciled against its source trade; the GBP cost column
+        # combines them after translating each at its own date's
+        # FX rate.
+        table.add_column(f"Gross P&L ({ccy})", justify="right")
+        table.add_column(f"Open Fee ({ccy})", justify="right")
+        table.add_column(f"Close Fee ({ccy})", justify="right")
         # FX rates: stored "1 GBP = r native". 4dp gives 0.5 bp of
         # display precision — enough for any G10 cross.
         table.add_column("FX open", justify="right")
         table.add_column("FX close", justify="right")
-        # GBP triple — net of fees, FX-converted at trade-date spot.
-        table.add_column("Cost (GBP)", justify="right")
+        # GBP triple — the SA108 figures. Proceeds may be negative
+        # on a losing trade (HMRC: "money paid is treated as an
+        # incidental cost of disposal"); cost is always
+        # non-negative; gain is signed.
         table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Cost (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
         for realisation in result.realisations:
             table.add_row(*_realisation_to_cells(realisation))
@@ -764,24 +772,24 @@ def _instrument_divider(instrument: FutureInstrument) -> str:
 
 
 def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
-    """Project a `FutureRealisation` into the 13 columns of the realisations table.
+    """Project a `FutureRealisation` into the 14 columns of the realisations table.
 
     Column order matches the `add_column` calls in
-    `_render_match_futures_realisations`. The two FX columns are
-    labelled by *date* (open / close) rather than *leg* (cost /
-    proceeds), so we map from realisation fields accordingly: for a
-    LONG the cost-leg uses the open date, while for a SHORT it is
-    the proceeds-leg that uses the open date — the table layout
-    stays consistent regardless of side.
+    `_render_match_futures_realisations`. Under the CFD model, the
+    two FX columns map directly onto the realisation's two date
+    fields — no LONG/SHORT special-casing.
+
+    Money formatting:
+    - Gross P&L: signed (`+,.2f`) — a losing trade reads at a glance
+      without needing a colour code.
+    - Proceeds (GBP) and Gain (GBP): plain 2dp with green/red
+      colour-code on sign.
+    - Cost (GBP), Open Fee, Close Fee: plain 2dp; all non-negative.
     """
+    proceeds = realisation.proceeds_gbp
+    proceeds_style = "green" if proceeds.amount >= 0 else "red"
     gain = realisation.gain_gbp
     gain_style = "green" if gain.amount >= 0 else "red"
-    if realisation.side == "LONG":
-        fx_open_rate = realisation.cost_fx_rate  # cost-leg = open-date
-        fx_close_rate = realisation.proceeds_fx_rate  # proceeds-leg = close-date
-    else:  # SHORT
-        fx_open_rate = realisation.proceeds_fx_rate  # proceeds-leg = open-date
-        fx_close_rate = realisation.cost_fx_rate  # cost-leg = close-date
     return (
         str(realisation.open_trade_id),
         str(realisation.close_trade_id),
@@ -789,13 +797,13 @@ def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
         realisation.open_date.isoformat(),
         realisation.close_date.isoformat(),
         f"{realisation.quantity}",
-        _format_money_2dp(realisation.proceeds_native_gross),
-        _format_money_2dp(realisation.cost_native_gross),
-        _format_money_2dp(realisation.fees_native),
-        _format_fx_rate(fx_open_rate),
-        _format_fx_rate(fx_close_rate),
+        _format_money_signed_2dp(realisation.gross_pnl_native),
+        _format_money_2dp(realisation.open_fee_native),
+        _format_money_2dp(realisation.close_fee_native),
+        _format_fx_rate(realisation.open_fx_rate),
+        _format_fx_rate(realisation.close_fx_rate),
+        f"[{proceeds_style}]{_format_money_2dp(proceeds)}[/]",
         _format_money_2dp(realisation.cost_gbp),
-        _format_money_2dp(realisation.proceeds_gbp),
         f"[{gain_style}]{_format_money_2dp(gain)}[/]",
     )
 
@@ -822,6 +830,17 @@ def _format_money_2dp(value: Money) -> str:
     appends it explicitly per cell (open-positions table).
     """
     return f"{value.amount:,.2f}"
+
+
+def _format_money_signed_2dp(value: Money) -> str:
+    """Format a `Money.amount` to 2dp with an explicit leading sign.
+
+    Used for the Gross P&L column where the sign carries the whole
+    "winning vs losing trade" signal — a leading `+` or `-` makes it
+    visible without a colour code (which we reserve for the GBP
+    proceeds/gain triple).
+    """
+    return f"{value.amount:+,.2f}"
 
 
 def _format_fx_rate(rate: Decimal) -> str:

@@ -1,9 +1,16 @@
-"""Futures rule engine — per-contract close-out (HMRC HS292).
+"""Futures rule engine — per-contract close-out (TCGA92/S143(5)).
 
 Individual-investor UK CGT does not apply same-day / 30-day / S.104
 share-matching to futures. Each closed contract is its own disposal,
 realised on the close date, paired with the trade that opened it.
-This module implements that model.
+
+This module implements the **contract-for-difference model** required
+by TCGA92/S143(5) and worked out in HMRC's Capital Gains Manual
+(CG56063, CG56079): the disposal consideration is the *net cashflow*
+on close-out — `(close_price - open_price) * multiplier * qty` for
+LONG, or its inverse for SHORT — **not** the gross notional of either
+leg. Commissions are separately allowable as incidental costs of
+disposal.
 
 Mechanics
 ---------
@@ -11,14 +18,16 @@ Mechanics
 The engine maintains two FIFO deques per instrument: `long_q` (slices
 opened via OPEN_LONG) and `short_q` (slices opened via OPEN_SHORT).
 A close trade drains from the queue corresponding to its side until
-its quantity is satisfied; each drain step emits a `FutureRealisation`
-with the open slice's price as the cost leg and the close trade's
-price as the proceeds leg (long), or the symmetric reverse for shorts.
+its quantity is satisfied; each drain step emits one
+`FutureRealisation` recording: the gross P&L on this slice (signed,
+native currency), the pro-rata open and close commissions, and the
+two FX rates that were applied to the cashflows on each date.
 
-Both legs are FX-converted to GBP at the **trade-date spot** of their
-own date — the open-leg uses the open trade's date, the close-leg
-uses the close trade's date — because that is what UK CGT requires
-for native-currency disposals.
+FX-rate dates follow CG78310: each cashflow uses the spot rate on
+its own date. Two distinct dates feed three cashflows — the open
+commission lands at `open_date`; the gross P&L and the close
+commission both land at `close_date`. SHORT and LONG use the **same**
+date mapping; only the sign of the gross P&L differs.
 
 Fees are allocated pro-rata by quantity, with a "last-drain consumes
 residual" rule so multiple partial drains across a single slice (or a
@@ -341,49 +350,47 @@ class FutureRuleEngine:
             else:
                 close_fee_share = Decimal(0)
 
-            # Notional value of this drain step in native currency.
-            open_notional_native = slice_.price_amount * multiplier * qty_step
-            close_notional_native = close_price_amount * multiplier * qty_step
-
-            # Long: proceeds = close-leg, cost = open-leg.
-            # Short: proceeds = open-leg, cost = close-leg. The "sale"
-            # happens at the open of a short and the "buy back" at the
-            # close — but the disposal date for tax purposes is still
-            # the close date for both sides.
-            #
-            # The `*_native_gross` figures are *before* fee deduction —
-            # they reconcile against IB's per-contract notional. The
-            # `*_native_amount` figures applied to FX conversion are
-            # net of the proceeds-side fee allocation and inclusive of
-            # the cost-side fee allocation, so the resulting GBP
-            # cost/proceeds match HS292.
+            # Side-aware gross P&L in native currency, **signed**.
+            # CFD model (TCGA92/S143(5)): disposal proceeds are the
+            # net cashflow on close-out, not the gross notional.
+            # LONG profits when price rises; SHORT profits when it
+            # falls — only the sign of `(close - open)` differs.
             if side == "LONG":
-                proceeds_native_amount = close_notional_native - close_fee_share
-                cost_native_amount = open_notional_native + open_fee_share
-                proceeds_date = close_date
-                cost_date = slice_.open_date
-                proceeds_native_gross_amount = close_notional_native
-                cost_native_gross_amount = open_notional_native
+                gross_pnl_amount = (
+                    (close_price_amount - slice_.price_amount) * multiplier * qty_step
+                )
             else:  # SHORT
-                proceeds_native_amount = open_notional_native - open_fee_share
-                cost_native_amount = close_notional_native + close_fee_share
-                proceeds_date = slice_.open_date
-                cost_date = close_date
-                proceeds_native_gross_amount = open_notional_native
-                cost_native_gross_amount = close_notional_native
+                gross_pnl_amount = (
+                    (slice_.price_amount - close_price_amount) * multiplier * qty_step
+                )
 
-            proceeds_native = Money(proceeds_native_amount, native_currency)
-            cost_native = Money(cost_native_amount, native_currency)
-            # `convert_with_rate` returns the cache-stored
-            # "1 GBP = r native" rate alongside the converted amount;
-            # both go into the realisation row so the renderer can
-            # show the audit FX figure without a second cache hit.
-            proceeds_gbp, proceeds_fx_rate = self._fx.convert_with_rate(
-                proceeds_native, target="GBP", on=proceeds_date
+            gross_pnl_native = Money(gross_pnl_amount, native_currency)
+            open_fee_native = Money(open_fee_share, native_currency)
+            close_fee_native = Money(close_fee_share, native_currency)
+
+            # Three FX lookups — one per cashflow date. The gross P&L
+            # and the close-side commission both settle on close_date
+            # (and therefore share the same rate); only the open
+            # commission sits at open_date. `convert_with_rate`
+            # returns the cache-stored "1 GBP = r native" rate
+            # alongside the converted amount, which we attach to the
+            # realisation so the renderer can show the audit figures
+            # without a second cache hit.
+            proceeds_gbp_money, close_fx_rate = self._fx.convert_with_rate(
+                gross_pnl_native, target="GBP", on=close_date
             )
-            cost_gbp, cost_fx_rate = self._fx.convert_with_rate(
-                cost_native, target="GBP", on=cost_date
+            open_fee_gbp, open_fx_rate = self._fx.convert_with_rate(
+                open_fee_native, target="GBP", on=slice_.open_date
             )
+            close_fee_gbp, _ = self._fx.convert_with_rate(
+                close_fee_native, target="GBP", on=close_date
+            )
+            # The close-fee FX call returns the same `close_fx_rate`
+            # as the gross-P&L call by construction; we discard the
+            # duplicate. Cost = open commission @ open-date + close
+            # commission @ close-date (each at its own spot rate per
+            # CG78310). Always non-negative since both fee shares are.
+            cost_gbp_money = open_fee_gbp + close_fee_gbp
 
             realisations.append(
                 FutureRealisation(
@@ -394,13 +401,13 @@ class FutureRuleEngine:
                     open_date=slice_.open_date,
                     close_date=close_date,
                     quantity=qty_step,
-                    proceeds_gbp=proceeds_gbp,
-                    cost_gbp=cost_gbp,
-                    proceeds_native_gross=Money(proceeds_native_gross_amount, native_currency),
-                    cost_native_gross=Money(cost_native_gross_amount, native_currency),
-                    fees_native=Money(open_fee_share + close_fee_share, native_currency),
-                    proceeds_fx_rate=proceeds_fx_rate,
-                    cost_fx_rate=cost_fx_rate,
+                    gross_pnl_native=gross_pnl_native,
+                    open_fee_native=open_fee_native,
+                    close_fee_native=close_fee_native,
+                    open_fx_rate=open_fx_rate,
+                    close_fx_rate=close_fx_rate,
+                    proceeds_gbp=proceeds_gbp_money,
+                    cost_gbp=cost_gbp_money,
                 )
             )
 

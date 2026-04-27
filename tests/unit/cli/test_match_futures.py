@@ -306,36 +306,63 @@ def test_match_futures_rejects_invalid_since(runner: CliRunner, populated_db: Pa
 def test_match_futures_renders_native_audit_columns(
     runner: CliRunner, populated_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The native-currency, FX-rate and fees columns appear with the right format.
+    """The CFD-model columns appear with the right headers and value formats.
 
     Filtered to ES so the assertion landscape is small and known:
     OPEN_LONG qty=2 @ 5000 then CLOSE_LONG qty=2 @ 5050 with USD
-    multiplier 50 and a flat 1 GBP = 1.27 USD rate. Expected native
-    figures: cost 500,000.00 / proceeds 505,000.00 / fees 5.00.
+    multiplier 50 and a flat 1 GBP = 1.27 USD rate.
+
+    Under TCGA92/S143(5) (CFD model) the rendered figures are:
+        gross_pnl_native = (5050-5000)*50*2 = $5,000
+        open_fee_native  = $2.50
+        close_fee_native = $2.50
+        proceeds_gbp     = $5,000 / 1.27 ≈ £3,937.01
+        cost_gbp         = ($2.50 + $2.50) / 1.27 ≈ £3.94
+        gain_gbp         ≈ £3,933.07
     """
-    # Widen the rendered terminal so Rich does not wrap the 13-column
+    # Widen the rendered terminal so Rich does not wrap the 14-column
     # realisations table header text mid-cell. Without this, header
-    # substrings like "Proceeds (USD)" can land split across lines and
+    # substrings like "Gross P&L (USD)" can land split across lines and
     # the substring assertions below would break for purely
     # cosmetic reasons.
-    monkeypatch.setenv("COLUMNS", "240")
+    monkeypatch.setenv("COLUMNS", "260")
 
     result = runner.invoke(app, ["match", "futures", "-s", "ES"])
     assert result.exit_code == 0, result.stdout
 
-    # Native-currency audit columns — header text carries the
-    # contract's currency dynamically.
-    assert "Proceeds (USD)" in result.stdout
-    assert "Cost (USD)" in result.stdout
-    assert "Fees (USD)" in result.stdout
+    # CFD-model native-currency columns. "Gross P&L" replaces the
+    # equity model's "Proceeds (USD)" + "Cost (USD)" pair, and the
+    # fees column is now split per-leg so each commission is
+    # reconcilable against its source trade.
+    assert "Gross P&L (USD)" in result.stdout
+    assert "Open Fee (USD)" in result.stdout
+    assert "Close Fee (USD)" in result.stdout
+    # Regression guard: the equity-model column headers must NOT
+    # reappear (they would mean the CLI drifted back to the wrong
+    # model). The combined "Fees (USD)" header was replaced by the
+    # per-leg pair above, so it must not appear either.
+    assert "Proceeds (USD)" not in result.stdout
+    assert "Cost (USD)" not in result.stdout
+    assert "Fees (USD)" not in result.stdout
     # FX rate columns and the 4dp-formatted rate value.
     assert "FX open" in result.stdout
     assert "FX close" in result.stdout
     assert "1.2700" in result.stdout
-    # 2dp + thousands-separator formatting on the gross native values.
-    assert "505,000.00" in result.stdout  # 5050 * 50 * 2 — proceeds gross
-    assert "500,000.00" in result.stdout  # 5000 * 50 * 2 — cost gross
-    # Fees: 2.50 (open) + 2.50 (close) = 5.00 USD per realisation.
-    # Use a context-bearing substring so we don't accidentally match
-    # "5.00" inside another number.
-    assert " 5.00 " in result.stdout or "  5.00\n" in result.stdout or " 5.00\n" in result.stdout
+    # GBP triple — the SA108 figures.
+    assert "Proceeds (GBP)" in result.stdout
+    assert "Cost (GBP)" in result.stdout
+    assert "Gain (GBP)" in result.stdout
+    # Gross P&L cell: signed `+,.2f` formatting on a winning trade.
+    assert "+5,000.00" in result.stdout
+    # Per-leg fee cells: each is $2.50 (the seed sets a flat $2.50
+    # commission per trade; full close so the whole open commission
+    # is consumed in this one realisation).
+    assert "2.50" in result.stdout
+    # Equity-model artefacts must not appear anywhere — under CFD
+    # the gross notionals (500,000 / 505,000) are no longer rendered.
+    assert "500,000.00" not in result.stdout
+    assert "505,000.00" not in result.stdout
+    # GBP figures from the CFD computation. These pin Decimal
+    # precision into the rendered output.
+    assert "3,937.01" in result.stdout  # proceeds_gbp = 5000 / 1.27
+    assert "3,933.07" in result.stdout  # gain_gbp = proceeds - cost

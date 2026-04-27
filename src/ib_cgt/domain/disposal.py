@@ -331,33 +331,40 @@ class UnmatchedAcquisition:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FutureRealisation:
-    """A single closed-out futures contract under HMRC HS292.
+    """A single closed-out futures contract under TCGA92/S143(5) (CG56079, CG56063).
 
-    The only tax event for individual-investor futures. Distinct from
-    `MatchedDisposal` because UK share-matching rules (s.104 / s.105 /
-    s.106A) do not apply: each closeout is a standalone disposal,
-    paired one-to-one (or one-to-many on partial closes) with the open
-    trade that established the contract.
+    A futures close-out is a contract for difference: the disposal
+    consideration is the *net cashflow* received (or paid) on
+    close-out — **not** the gross notional of either leg.
+    Commissions are separately allowable as incidental costs of
+    disposal. Each cashflow is translated to GBP at the spot FX rate
+    on its own date (CG78310 — Bentley v Pike, Capcount Trading v
+    Evans rule out a foreign-currency-then-translate computation).
 
-    `proceeds_gbp` and `cost_gbp` swap legs depending on `side` so the
-    final `gain_gbp` reads naturally as `proceeds - cost` regardless of
-    long vs short:
+    Concretely:
 
-    * **LONG**:  proceeds = close-leg, cost = open-leg.
-    * **SHORT**: proceeds = open-leg (the original "sale"), cost =
-      close-leg (the "buy back").
+    * **gross_pnl_native** for LONG:
+      `(close_price - open_price) * multiplier * quantity`.
+      For SHORT: `(open_price - close_price) * multiplier *
+      quantity`. Signed — negative on losing trades.
+    * **proceeds_gbp** = `gross_pnl_native` translated at
+      `close_fx_rate` (the disposal cashflow lands at close).
+    * **cost_gbp** = `open_fee_native @ open_fx_rate` +
+      `close_fee_native @ close_fx_rate` (each commission at its own
+      date).
+    * **gain_gbp** = `proceeds_gbp - cost_gbp` — the SA108 figure.
 
-    Either way, the disposal date for tax purposes is `close_date`:
-    HS292 says the gain crystallises when the contract is closed.
+    The disposal date for tax purposes is `close_date`: that is when
+    the gain crystallises and the cashflow is settled, regardless of
+    side.
 
-    The `*_native_gross` and `fees_native` fields carry the audit
-    figures an operator needs to reconcile a realisation against an
-    IB statement — IB quotes notionals in trade currency and fees as
-    a separate line. The `*_fx_rate` fields capture the cache-stored
-    "1 GBP = r native" rate that was applied to each leg, so a
-    rendered audit row can show the exact FX figure without a second
-    cache hit. For a GBP-denominated future (FX identity), both rates
-    are exactly `Decimal('1')`.
+    The native-currency fields reconcile against IB's per-trade
+    figures (Realized P&L and per-leg commissions). The two
+    `*_fx_rate` fields capture the cache-stored "1 GBP = r native"
+    rate that was applied on each cashflow date, so a rendered audit
+    row can show the FX figures without a second cache hit. For a
+    GBP-denominated future (FX identity), both rates are exactly
+    `Decimal('1')`.
 
     Attributes:
         open_trade_id: Surrogate id of the OPEN_LONG / OPEN_SHORT trade
@@ -366,34 +373,32 @@ class FutureRealisation:
             trade that drained this slice.
         instrument: The futures contract (always a `FutureInstrument`).
         side: Whether the closed position was LONG or SHORT.
-        open_date: UK-local date of the opening trade — used as the
-            cost-leg FX-rate date.
+        open_date: UK-local date of the opening trade — the FX-rate
+            date for `open_fee_native`.
         close_date: UK-local date of the closing trade — the disposal
-            date for tax purposes and the proceeds-leg FX-rate date
-            (long) / cost-leg FX-rate date (short).
+            date for tax purposes, and the FX-rate date for both
+            `gross_pnl_native` and `close_fee_native`.
         quantity: Number of contracts closed in this realisation
             (strictly positive).
-        proceeds_gbp: GBP proceeds, net of fee allocation, FX-converted
-            at the relevant trade-date spot.
-        cost_gbp: GBP cost, inclusive of fee allocation, FX-converted
-            at the relevant trade-date spot.
-        proceeds_native_gross: Proceeds in the contract's native
-            currency, **before** any fee deduction. Equals
-            `price * multiplier * quantity` of whichever leg is the
-            "sale" for this side. Reconciles directly against IB's
-            per-contract notional.
-        cost_native_gross: Cost in the contract's native currency,
-            **before** any fee deduction. Symmetric to
-            `proceeds_native_gross`.
-        fees_native: Sum of the open-side and close-side fee
-            allocations attributed to this realisation, in the
-            contract's native currency. Always non-negative.
-        proceeds_fx_rate: Stored "1 GBP = r native" rate that was
-            applied to the proceeds-leg conversion. `Decimal('1')`
-            for a GBP-denominated future. Strictly positive.
-        cost_fx_rate: Stored "1 GBP = r native" rate that was applied
-            to the cost-leg conversion. Same invariants as
-            `proceeds_fx_rate`.
+        gross_pnl_native: Gross profit/loss in the contract's native
+            currency. **Signed** — negative on losing trades. Matches
+            what IB statements call "Realized P&L" per closed trade.
+        open_fee_native: Pro-rata share of the open trade's
+            commission allocated to this realisation. Non-negative.
+        close_fee_native: Pro-rata share of the close trade's
+            commission allocated to this realisation. Non-negative.
+        open_fx_rate: Stored "1 GBP = r native" rate applied to
+            `open_fee_native` (open-date spot). `Decimal('1')` for a
+            GBP-denominated future. Strictly positive.
+        close_fx_rate: Stored "1 GBP = r native" rate applied to
+            both `gross_pnl_native` and `close_fee_native`
+            (close-date spot). Same invariants as `open_fx_rate`.
+        proceeds_gbp: Disposal proceeds in GBP. **Signed** —
+            `gross_pnl_native` translated at `close_fx_rate`. May be
+            negative on a losing trade.
+        cost_gbp: Allowable costs in GBP — `open_fee_native @
+            open_fx_rate` plus `close_fee_native @ close_fx_rate`.
+            Always non-negative.
     """
 
     open_trade_id: int
@@ -403,16 +408,16 @@ class FutureRealisation:
     open_date: date
     close_date: date
     quantity: Decimal
+    gross_pnl_native: Money
+    open_fee_native: Money
+    close_fee_native: Money
+    open_fx_rate: Decimal
+    close_fx_rate: Decimal
     proceeds_gbp: Money
     cost_gbp: Money
-    proceeds_native_gross: Money
-    cost_native_gross: Money
-    fees_native: Money
-    proceeds_fx_rate: Decimal
-    cost_fx_rate: Decimal
 
     def __post_init__(self) -> None:
-        """Enforce positivity, instrument class, side enum, GBP/native invariants."""
+        """Enforce instrument class, side enum, GBP/native invariants."""
         # Instrument class first — every other check assumes a future.
         if not isinstance(self.instrument, FutureInstrument):
             raise ValueError(
@@ -432,39 +437,46 @@ class FutureRealisation:
                 f"FutureRealisation.cost_gbp must be GBP, got {self.cost_gbp.currency}"
             )
         # Native-currency fields must match the instrument's currency —
-        # otherwise the audit columns lose their meaning.
+        # otherwise the audit columns lose their meaning. gross_pnl_native
+        # is signed (a losing trade makes it negative); the two fee fields
+        # are non-negative (commissions cannot reduce the cost basis).
         native = self.instrument.currency
-        if self.proceeds_native_gross.currency != native:
+        if self.gross_pnl_native.currency != native:
             raise ValueError(
-                f"FutureRealisation.proceeds_native_gross currency "
-                f"({self.proceeds_native_gross.currency}) must match "
+                f"FutureRealisation.gross_pnl_native currency "
+                f"({self.gross_pnl_native.currency}) must match "
                 f"instrument currency ({native})"
             )
-        if self.cost_native_gross.currency != native:
+        if self.open_fee_native.currency != native:
             raise ValueError(
-                f"FutureRealisation.cost_native_gross currency "
-                f"({self.cost_native_gross.currency}) must match "
+                f"FutureRealisation.open_fee_native currency "
+                f"({self.open_fee_native.currency}) must match "
                 f"instrument currency ({native})"
             )
-        if self.fees_native.currency != native:
+        if self.close_fee_native.currency != native:
             raise ValueError(
-                f"FutureRealisation.fees_native currency "
-                f"({self.fees_native.currency}) must match "
+                f"FutureRealisation.close_fee_native currency "
+                f"({self.close_fee_native.currency}) must match "
                 f"instrument currency ({native})"
             )
-        if self.fees_native.amount < 0:
+        if self.open_fee_native.amount < 0:
             raise ValueError(
-                f"FutureRealisation.fees_native must be >= 0, got {self.fees_native.amount}"
+                f"FutureRealisation.open_fee_native must be >= 0, got {self.open_fee_native.amount}"
+            )
+        if self.close_fee_native.amount < 0:
+            raise ValueError(
+                f"FutureRealisation.close_fee_native must be >= 0, "
+                f"got {self.close_fee_native.amount}"
             )
         # Rates are stored "1 GBP = r native"; r must be strictly
-        # positive (a zero rate is unusable, a negative rate is
-        # nonsense). Identity converts pass `Decimal('1')`.
-        if self.proceeds_fx_rate <= 0:
+        # positive (zero is unusable, negative is nonsense). Identity
+        # converts pass `Decimal('1')`.
+        if self.open_fx_rate <= 0:
+            raise ValueError(f"FutureRealisation.open_fx_rate must be > 0, got {self.open_fx_rate}")
+        if self.close_fx_rate <= 0:
             raise ValueError(
-                f"FutureRealisation.proceeds_fx_rate must be > 0, got {self.proceeds_fx_rate}"
+                f"FutureRealisation.close_fx_rate must be > 0, got {self.close_fx_rate}"
             )
-        if self.cost_fx_rate <= 0:
-            raise ValueError(f"FutureRealisation.cost_fx_rate must be > 0, got {self.cost_fx_rate}")
 
     @property
     def gain_gbp(self) -> Money:
