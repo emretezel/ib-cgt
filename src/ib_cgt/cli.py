@@ -626,10 +626,17 @@ def _run_match_futures(
 
 
 def _render_match_futures(rows: list[_MatchFuturesRow], db_path: Path) -> None:
-    """Render the realisations, open-positions, and summary tables."""
+    """Render the realisations, open-positions, summary, and errors blocks.
+
+    Errors are deliberately printed last — collected together at the
+    bottom of the output rather than scattered through the
+    per-instrument realisations sections — so the operator can scan
+    every failure in one place after a multi-instrument run.
+    """
     _render_match_futures_realisations(rows)
     _render_match_futures_open_positions(rows)
     _render_match_futures_summary(rows, db_path)
+    _render_match_futures_errors(rows)
 
 
 def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
@@ -646,15 +653,14 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
     """
     _console.print("[bold]Futures realisations (dry-run)[/]")
     for instrument, result, error in rows:
-        divider = _instrument_divider(instrument)
-        _console.print(f"\n[bold cyan]{divider}[/]")
+        # Errors are surfaced together at the end of the output by
+        # `_render_match_futures_errors`; skip them here so this
+        # section only contains successful per-instrument tables.
         if error is not None:
-            # The ERROR line is the operator's whole reason for
-            # running this command — print it plainly outside any
-            # table so it can't be wrapped or hidden.
-            _console.print(f"  [red]ERROR:[/] {error}")
             continue
         assert result is not None  # mypy — error/result are mutually exclusive
+        divider = _instrument_divider(instrument)
+        _console.print(f"\n[bold cyan]{divider}[/]")
         if not result.realisations:
             _console.print("  [dim](no realisations)[/]")
             continue
@@ -764,6 +770,22 @@ def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -
     )
 
     _console.print(table)
+
+
+def _render_match_futures_errors(rows: list[_MatchFuturesRow]) -> None:
+    """Print every per-instrument error in one block at the end of the output.
+
+    Each failing instrument gets a single bullet line — the same
+    instrument label used in the realisations section followed by the
+    captured exception's message. Returns silently when no rows
+    failed so a clean run produces no trailing block at all.
+    """
+    error_rows = [(instrument, error) for instrument, _, error in rows if error is not None]
+    if not error_rows:
+        return
+    _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
+    for instrument, error in error_rows:
+        _console.print(f"  [bold cyan]{_instrument_divider(instrument)}[/] [red]→ {error}[/]")
 
 
 def _instrument_divider(instrument: FutureInstrument) -> str:

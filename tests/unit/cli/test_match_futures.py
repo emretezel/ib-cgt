@@ -366,3 +366,94 @@ def test_match_futures_renders_native_audit_columns(
     # precision into the rendered output.
     assert "3,937.01" in result.stdout  # proceeds_gbp = 5000 / 1.27
     assert "3,933.07" in result.stdout  # gain_gbp = proceeds - cost
+
+
+def test_match_futures_collects_errors_in_trailing_block(
+    runner: CliRunner, populated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-instrument errors are surfaced together at the end of the output.
+
+    The fixture seeds GBP/USD rates only. Adding a EUR-denominated
+    future with a closed round-trip drives the engine through
+    `FXService.convert` for an unseeded GBP/EUR pair, which raises
+    `RateNotFoundError`. The CLI captures the exception per-instrument
+    and renders it inside the trailing `Errors` block — not inline
+    inside the per-instrument realisations section. The successful
+    USD instruments must still render their own realisations.
+    """
+    # Same width pin as the audit-columns test — keeps the trailing
+    # error line intact so the symbol substring assertion below is
+    # not at the mercy of Rich's wrap heuristics.
+    monkeypatch.setenv("COLUMNS", "260")
+
+    eur_future = FutureInstrument(
+        symbol="FDAX",
+        currency="EUR",
+        contract_multiplier=Decimal("25"),
+        expiry_date=date(2025, 12, 19),
+    )
+    # Trade builder is hard-coded to USD price/fees, so build the EUR
+    # round-trip inline rather than widening the helper for a one-off.
+    eur_open = Trade(
+        account_id="U1",
+        instrument=eur_future,
+        action=TradeAction.OPEN_LONG,
+        trade_datetime=datetime(2025, 4, 1, 14, 0, tzinfo=_UK),
+        trade_date=date(2025, 4, 1),
+        settlement_date=date(2025, 4, 1),
+        quantity=Decimal("1"),
+        price=Money.of(Decimal("18000"), "EUR"),
+        fees=Money.of(Decimal("2.50"), "EUR"),
+    )
+    eur_close = Trade(
+        account_id="U1",
+        instrument=eur_future,
+        action=TradeAction.CLOSE_LONG,
+        trade_datetime=datetime(2025, 4, 8, 14, 0, tzinfo=_UK),
+        trade_date=date(2025, 4, 8),
+        settlement_date=date(2025, 4, 8),
+        quantity=Decimal("1"),
+        price=Money.of(Decimal("18100"), "EUR"),
+        fees=Money.of(Decimal("2.50"), "EUR"),
+    )
+    conn = open_connection(populated_db)
+    try:
+        StatementRepo(conn).record(
+            statement_hash="hash-eur",
+            source_path="/tmp/stmt-eur.html",
+            account_id="U1",
+            trade_count=0,
+        )
+        TradeRepo(conn).insert_many([eur_open, eur_close], source_statement_hash="hash-eur")
+    finally:
+        conn.close()
+
+    result = runner.invoke(app, ["match", "futures"])
+    assert result.exit_code == 0, result.stdout
+
+    # The errors header must appear after the summary so the operator
+    # reads the count line first then scans the detailed list right
+    # below it.
+    summary_idx = result.stdout.find("Summary")
+    errors_idx = result.stdout.find("Errors")
+    assert summary_idx != -1, "Summary block missing"
+    assert errors_idx != -1, "Errors block missing"
+    assert errors_idx > summary_idx, (
+        "Errors block must render after the Summary table, "
+        f"got summary@{summary_idx} errors@{errors_idx}"
+    )
+
+    # The failing symbol must appear inside the trailing errors block
+    # (not just earlier as a section divider — there is no section
+    # divider for an erroring instrument any more).
+    assert "FDAX" in result.stdout[errors_idx:]
+
+    # And the inline ERROR row that the old layout produced must be
+    # gone — its absence is what makes this a trailing-block layout.
+    assert "ERROR:" not in result.stdout
+
+    # Successful USD instruments still render their realisations
+    # tables — the trailing-error refactor must not regress the
+    # happy path.
+    for symbol in ("ES", "NQ", "CL"):
+        assert symbol in result.stdout, f"symbol {symbol} missing from output"
