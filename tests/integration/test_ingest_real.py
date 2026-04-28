@@ -71,3 +71,42 @@ def test_idempotent_on_real_statements(db_conn) -> None:  # type: ignore[no-unty
         assert result.already_imported is True
         assert result.inserted_count == 0
     assert TradeRepo(db_conn).count() == first_count
+
+
+def test_fesx_dec_23_multifill_opens_all_land(db_conn) -> None:  # type: ignore[no-untyped-def]
+    """Regression for the migration-005 dedup bug.
+
+    The FESX DEC 23 contract in `statements/futures/23_24.htm` has
+    fifteen short opens on 2023-09-12 — 1 fill at 04:13:04, four at
+    04:13:05, eight at 05:58:26, and two at 06:16:28 — all carrying
+    identical `(qty=-1)` but split across distinct fills of the same
+    parent order. Pre-006 the natural-key UNIQUE collapsed each
+    same-second cluster into one stored row (only four short slices
+    survived), and the matching engine later raised
+    `InconsistentTradeError` when a 14-contract close drained "more
+    contracts than exist". After 006 every fill is its own row.
+    """
+    futures_dir = _REAL_STATEMENTS / "futures"
+    statement = futures_dir / "23_24.htm"
+    if not statement.exists():
+        pytest.skip("23_24 futures statement not present")
+
+    ingest_statement(statement, db_conn)
+
+    # Pull every FESX DEC 23 short-open trade dated 2023-09-12. The
+    # joined query keeps the test resilient to instrument-id renumbering
+    # across fixture rebuilds.
+    rows = db_conn.execute(
+        "SELECT t.trade_datetime, t.quantity FROM trades t "
+        "JOIN future_instruments f ON f.instrument_id = t.instrument_id "
+        "WHERE f.symbol = 'FESX DEC 23' "
+        "  AND f.expiry_date = '2023-12-15' "
+        "  AND t.action = 'open_short' "
+        "  AND t.trade_date = '2023-09-12' "
+        "ORDER BY t.trade_datetime, t.statement_row_index"
+    ).fetchall()
+
+    assert len(rows) == 15, f"expected 15 short-open fills, got {len(rows)}"
+    # All fills carry quantity 1 (each row is one contract); the bug
+    # symptom was missing rows, not wrong-quantity rows.
+    assert all(str(r["quantity"]) == "1" for r in rows)

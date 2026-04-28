@@ -68,14 +68,18 @@ def test_insert_then_for_instrument_round_trips(db: sqlite3.Connection) -> None:
     assert loaded[0] == trade
 
 
-def test_insert_is_idempotent_on_natural_key(db: sqlite3.Connection) -> None:
-    """Re-inserting the same trade is a no-op via the natural-key UNIQUE.
+def test_insert_is_idempotent_on_statement_row_index(db: sqlite3.Connection) -> None:
+    """Re-presenting the same `(hash, row_index)` pair is a no-op.
 
-    Migration 005 declares
-    `UNIQUE (account_id, instrument_id, trade_datetime, action, quantity, price_amount)`
-    on `trades`. `INSERT OR IGNORE` short-circuits each duplicate at
-    constraint check, so the row count stays at one and the second
-    `insert_many` reports zero new rows.
+    Migration 006 identifies a `trades` row by
+    `(source_statement_hash, statement_row_index)` — provenance plus
+    position in the source. A repeat `insert_many` enumerates from
+    zero again, so each row collides with its earlier insert on the
+    new UNIQUE; `INSERT OR IGNORE` skips the lot. This is the
+    semantic that protects against a partial-batch retry within one
+    ingest call. Re-ingest of a corrected statement uses
+    `ingest --replace`, which CASCADE-deletes the prior trades first
+    and is exercised by the integration suite.
     """
     _seed_account_and_statement(db)
     repo = TradeRepo(db)
@@ -84,6 +88,37 @@ def test_insert_is_idempotent_on_natural_key(db: sqlite3.Connection) -> None:
     assert repo.insert_many([trade], source_statement_hash="hash-a") == 1
     assert repo.insert_many([trade], source_statement_hash="hash-a") == 0
     assert repo.count() == 1
+
+
+def test_identical_business_tuple_fills_both_land(db: sqlite3.Connection) -> None:
+    """Two fills with identical (datetime, action, qty, price) both land.
+
+    Regression for the migration-005 dedup bug: IB legitimately emits
+    multiple `<tr>` rows per parent order when a fill is split across
+    ticks at the same wall-clock second. Pre-006 the natural-key UNIQUE
+    folded them into a single stored row, dropping the rest and later
+    surfacing as `InconsistentTradeError` in the matching engine. The
+    new identity is `(source_statement_hash, statement_row_index)`,
+    which is unique by construction across enumeration, so each fill
+    keeps its own row.
+    """
+    _seed_account_and_statement(db)
+    repo = TradeRepo(db)
+
+    # Two byte-identical Trade objects. Under the old schema this was
+    # one stored row. Under 006 it is two — one per fill.
+    fill = _aapl_buy()
+    inserted = repo.insert_many([fill, fill], source_statement_hash="hash-a")
+    assert inserted == 2
+    assert repo.count() == 2
+
+    # Both rows are tied to the same statement at indices 0 and 1.
+    rows = db.execute(
+        "SELECT statement_row_index FROM trades "
+        "WHERE source_statement_hash = ? ORDER BY statement_row_index",
+        ("hash-a",),
+    ).fetchall()
+    assert [int(r["statement_row_index"]) for r in rows] == [0, 1]
 
 
 def test_for_instrument_returns_trades_in_chronological_order(db: sqlite3.Connection) -> None:

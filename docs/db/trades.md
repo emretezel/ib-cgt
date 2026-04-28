@@ -29,6 +29,7 @@ executed in; FX conversion to GBP is applied later, from the
 | `fees_currency` | `TEXT` | No | ISO-4217 currency for `fees_amount`. |
 | `accrued_amount` | `TEXT` | Yes | Decimal string — accrued interest on bond trades; `NULL` for non-bonds. |
 | `accrued_currency` | `TEXT` | Yes | ISO-4217 currency for `accrued_amount`; `NULL` when `accrued_amount` is `NULL`. |
+| `statement_row_index` | `INTEGER` | No | Zero-based offset of this fill within its source statement; assigned at ingest from `enumerate(map_rows(...))`. Distinguishes multiple genuine fills that share `(trade_datetime, action, quantity, price_amount)`. |
 | `source_statement_hash` | `TEXT` | No (FK) | Provenance — the statement this trade came from. |
 
 See [`index.md`](./index.md#encoding-conventions) for decimal, money,
@@ -56,16 +57,31 @@ mistake.
 
 ## Uniqueness constraints
 
-- `UNIQUE (account_id, instrument_id, trade_datetime, action,
-  quantity, price_amount)` — the natural key (migration `005`).
-  `INSERT OR IGNORE` on this constraint is the dedup mechanism for
-  re-imports: even if the file's bytes change so the statement-hash
-  short-circuit misses, an overlapping trade rows is silently
-  collapsed at constraint-check time. Asset-class identity (symbol,
-  currency, expiry, fx-pair) is implicit in `instrument_id`. Fees,
-  accrued interest, settlement_date, and trade_date are deliberately
-  excluded so cosmetic export differences cannot produce duplicate
-  rows.
+- `UNIQUE (source_statement_hash, statement_row_index)` — the
+  provenance-based identity introduced by migration `006`. Every fill
+  in a parsed IB statement gets its own zero-based offset, so the
+  composite is dense and unique within one ingest call by
+  construction. `INSERT OR IGNORE` on this constraint backstops a
+  partial-batch retry but no longer collapses genuinely-distinct
+  fills that happen to share `(trade_datetime, action, quantity,
+  price_amount)` — IB legitimately reports such fills when a single
+  parent order is filled across several ticks at the same wall-clock
+  second, and the prior natural-key UNIQUE was silently dropping them.
+
+## Re-import semantics
+
+Idempotency is layered:
+
+1. **Statement-hash short-circuit** on `statements`. A byte-identical
+   re-ingest is a constant-time no-op.
+2. **`ib-cgt ingest <path> --replace`** for re-ingesting a corrected
+   statement. The `ON DELETE CASCADE` on `source_statement_hash`
+   wipes the prior trades; the fresh ingest re-issues row indices
+   from zero.
+
+Anything more aggressive than this — e.g. trying to dedup by a
+business-key tuple — risks collapsing real fills, as the migration-005
+design did.
 
 ## CHECK constraints
 
@@ -128,7 +144,7 @@ rows readable here — pipe-delimited would wrap awkwardly given the
 15-column row width.
 
 ```
-             trade_id = 1
+             trade_id = 5657
            account_id = U1004320
         instrument_id = 1
                action = sell
@@ -142,9 +158,10 @@ rows readable here — pipe-delimited would wrap awkwardly given the
         fees_currency = SEK
        accrued_amount = NULL
      accrued_currency = NULL
+  statement_row_index = 0
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-             trade_id = 2
+             trade_id = 5658
            account_id = U1004320
         instrument_id = 2
                action = open_long
@@ -158,9 +175,10 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
         fees_currency = EUR
        accrued_amount = NULL
      accrued_currency = NULL
+  statement_row_index = 1
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-             trade_id = 3
+             trade_id = 5659
            account_id = U1004320
         instrument_id = 2
                action = close_long
@@ -174,9 +192,10 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
         fees_currency = EUR
        accrued_amount = NULL
      accrued_currency = NULL
+  statement_row_index = 2
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-             trade_id = 4
+             trade_id = 5660
            account_id = U1004320
         instrument_id = 3
                action = open_long
@@ -190,9 +209,10 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
         fees_currency = EUR
        accrued_amount = NULL
      accrued_currency = NULL
+  statement_row_index = 3
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 
-             trade_id = 5
+             trade_id = 5661
            account_id = U1004320
         instrument_id = 3
                action = close_long
@@ -206,5 +226,6 @@ source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc6
         fees_currency = EUR
        accrued_amount = NULL
      accrued_currency = NULL
+  statement_row_index = 4
 source_statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
 ```

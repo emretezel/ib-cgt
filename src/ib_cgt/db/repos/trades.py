@@ -52,15 +52,17 @@ class TradeRepo:
         *,
         source_statement_hash: str,
     ) -> int:
-        """Insert each trade, dedup'd on the natural-key UNIQUE; return inserted count.
+        """Insert each trade with a dense per-statement row index; return inserted count.
 
-        Re-imports are idempotent because migration 005 declares
-        `UNIQUE (account_id, instrument_id, trade_datetime, action,
-        quantity, price_amount)` on the trades table — exactly the
-        fields that distinguish two genuine trades on the same
-        instrument. `INSERT OR IGNORE` skips a row whose natural key
-        already exists, and `cursor.rowcount` reflects only the rows
-        that actually landed.
+        Identity is `(source_statement_hash, statement_row_index)` —
+        provenance plus position within the source. The index is the
+        zero-based offset of each `Trade` in the iterable, which mirrors
+        the order produced by `ingest.mapper.map_rows` (= the order the
+        fills appeared in the IB statement, after the `C;O` reversal
+        split). One ingest call corresponds to one statement, so the
+        composite is unique by construction and `INSERT OR IGNORE`
+        backstops a partial-batch retry without ever silently merging
+        two genuinely-distinct fills.
 
         The `source_statement_hash` must already exist in
         `statements`; the FK will raise `IntegrityError` otherwise.
@@ -70,21 +72,29 @@ class TradeRepo:
             return 0
 
         rows: list[tuple[object, ...]] = []
-        for trade in materialised:
+        for row_index, trade in enumerate(materialised):
             # Resolve (or create) the instrument id — every trade needs one,
             # and upsert is idempotent. Batching by distinct instrument would
             # shave some calls but ingestion batches are small enough that
             # the simpler code wins.
             instrument_id = self._instruments.upsert(trade.instrument)
-            rows.append(_trade_to_row(trade, instrument_id, source_statement_hash))
+            rows.append(
+                _trade_to_row(
+                    trade,
+                    instrument_id=instrument_id,
+                    statement_row_index=row_index,
+                    source_statement_hash=source_statement_hash,
+                )
+            )
 
         cursor = self._conn.executemany(
             "INSERT OR IGNORE INTO trades ("
             "account_id, instrument_id, action, "
             "trade_datetime, trade_date, settlement_date, quantity, "
             "price_amount, price_currency, fees_amount, fees_currency, "
-            "accrued_amount, accrued_currency, source_statement_hash"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "accrued_amount, accrued_currency, "
+            "statement_row_index, source_statement_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         # `rowcount` is the number of rows actually inserted (ignored rows
@@ -297,15 +307,20 @@ class TradeRepo:
 
 def _trade_to_row(
     trade: Trade,
+    *,
     instrument_id: int,
+    statement_row_index: int,
     source_statement_hash: str,
 ) -> tuple[object, ...]:
     """Flatten a `Trade` into the column tuple used by INSERT.
 
     `trade_id` is **not** in the tuple: the column is `INTEGER PRIMARY
     KEY`, so SQLite issues a fresh value for every successful insert.
-    On `INSERT OR IGNORE` conflicts (the natural-key UNIQUE), no id is
-    issued and the row is skipped.
+    On `INSERT OR IGNORE` conflicts (the `(source_statement_hash,
+    statement_row_index)` UNIQUE), no id is issued and the row is
+    skipped — this only fires when the same `(hash, index)` pair is
+    re-presented, e.g. an in-flight retry of a partially-completed
+    batch.
     """
     price_amount, price_currency = money_to_cols(trade.price)
     fees_amount, fees_currency = money_to_cols(trade.fees)
@@ -327,5 +342,6 @@ def _trade_to_row(
         fees_currency,
         accrued_amount,
         accrued_currency,
+        statement_row_index,
         source_statement_hash,
     )
