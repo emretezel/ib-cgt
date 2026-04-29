@@ -27,7 +27,7 @@ discriminated by `basis_kind`:
 | `disposal_trade_id` | `INTEGER` | No (PK) | The disposing trade's `trades.trade_id` (not declared as a FK so the disposal row remains valid as audit data even if the underlying trade is later corrected and reingested). |
 | `instrument_id` | `INTEGER` | No (FK) | Resolved at write time so the audit row keeps working even if the instrument is later renamed. |
 | `disposal_date` | `TEXT` | No | `YYYY-MM-DD` — disposal trade's `trade_date`. |
-| `match_rule` | `TEXT` | No | Domain enum; values include `SAME_DAY`, `BED_AND_BREAKFAST`, `S104`. |
+| `match_rule` | `TEXT` | No | Domain enum; values are `same_day`, `bed_and_breakfast`, `section_104`, `later_acquisition` (the four UK matching rules — see [`docs/rules.md`](../rules.md)). |
 | `matched_quantity` | `TEXT` | No | Decimal string — size of this matched chunk. |
 | `matched_proceeds_gbp` | `TEXT` | No | Decimal string — proceeds attributed to this chunk, in GBP. |
 | `matched_cost_gbp` | `TEXT` | No | Decimal string — allowable cost attributed to this chunk, in GBP. |

@@ -120,6 +120,63 @@ class InstrumentRepo:
         """
         return self._find_id_by_natural_key(instrument)
 
+    def list_stocks(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> list[tuple[int, StockInstrument]]:
+        """Return every stock instrument as `(instrument_id, StockInstrument)`.
+
+        Drives the `ib-cgt match stocks` debug command — the same
+        shape as `list_futures` but for `StockInstrument`s. The
+        result is ordered by `(symbol, currency)` so the rendered
+        output is stable run-to-run, including the ambiguous case
+        of two stocks with the same symbol on different exchanges
+        (which `(symbol, currency)` UNIQUE distinguishes via
+        `stock_instruments`'s natural-key index).
+
+        Args:
+            symbol: If supplied, restricts to stocks with that exact
+                symbol. The `(symbol, currency)` UNIQUE on
+                `stock_instruments` allows multiple instruments
+                sharing a symbol if they trade in different
+                currencies, so this filter narrows by symbol but
+                does not necessarily pin a single instrument.
+
+        Returns:
+            A list of `(instrument_id, StockInstrument)` pairs.
+            Empty when no stock rows match the filter.
+        """
+        # Join the parent only for the optional ISIN; everything else
+        # we need is on the child table. The ix_stock_instruments_*
+        # indexes cover both the symbol filter and the ORDER BY.
+        clauses: list[str] = []
+        params: list[object] = []
+        if symbol is not None:
+            clauses.append("s.symbol = ?")
+            params.append(symbol)
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        sql = (
+            "SELECT s.instrument_id, s.symbol, s.currency, p.isin "
+            "FROM stock_instruments AS s "
+            "JOIN instruments AS p ON p.instrument_id = s.instrument_id"
+            + where_sql
+            + " ORDER BY s.symbol, s.currency"
+        )
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [
+            (
+                int(r["instrument_id"]),
+                StockInstrument(
+                    symbol=r["symbol"],
+                    currency=r["currency"],
+                    isin=r["isin"],
+                ),
+            )
+            for r in rows
+        ]
+
     def list_futures(
         self,
         *,

@@ -29,17 +29,34 @@ class AssetClass(StrEnum):
 
 
 class MatchRule(StrEnum):
-    """The three UK share-matching rules (TCGA 1992 s.104 / s.105 / s.106A).
+    """The four UK share-matching rules (TCGA 1992 s.104 / s.105 / s.106A).
 
     Order matters to the matching engine but not to this enum — the engine
-    applies them same-day → 30-day → pooled. The string values are chosen
-    for readability in persisted audit rows; `BED_AND_BREAKFAST` keeps the
-    UK-accountant nickname for the 30-day rule (statutory name: s.106A).
+    applies them in this strict precedence:
+
+    1. `SAME_DAY` — disposals matched against same-date acquisitions
+       (TCGA92/S105(1)(b)).
+    2. `BED_AND_BREAKFAST` — disposals matched against acquisitions in
+       the 30 days *following* the disposal (TCGA92/S106A(5) and (5A)).
+       The `BED_AND_BREAKFAST` member name keeps the UK-accountant
+       nickname for the rule.
+    3. `SECTION_104` — disposals matched against the pooled holding
+       (TCGA92/S104), weighted-average cost basis.
+    4. `LATER_ACQUISITION` — residual disposals matched against
+       acquisitions made *after* the 30-day window (TCGA92/S105(2)),
+       earliest acquisition first. This rule is what covers a
+       sell-short followed by a buy-to-cover more than 30 days later,
+       and any disposal that runs past an under-sized S.104 pool.
+
+    The string values are chosen for readability in persisted audit
+    rows; persisted enum strings are stable so changing them is a
+    breaking change for the `matched_disposals` table.
     """
 
     SAME_DAY = "same_day"
     BED_AND_BREAKFAST = "bed_and_breakfast"
     SECTION_104 = "section_104"
+    LATER_ACQUISITION = "later_acquisition"
 
 
 class TradeAction(StrEnum):

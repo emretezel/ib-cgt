@@ -1,7 +1,7 @@
-"""Minimal Typer CLI — `db init`, `ingest`, `trades`, `fx sync`, `match futures`.
+"""Minimal Typer CLI — `db init`, `ingest`, `trades`, `fx sync`, `match` group.
 
 This ships ahead of the full CLI plan (architecture step 8) so the
-ingestion, FX, and futures-matching layers are runnable end-to-end.
+ingestion, FX, and rule-engine layers are runnable end-to-end.
 Commands:
 
 * ``ib-cgt db init`` — open the configured DB and apply migrations.
@@ -15,6 +15,10 @@ Commands:
   runs the per-contract close-out engine against ingested futures
   trades and renders realisations / open positions to the terminal.
   Persists nothing.
+* ``ib-cgt match stocks [filters]`` — read-only debug command that
+  runs the four-rule UK matching engine against ingested stock
+  trades. Cross-account by design (S.104 pools span every account
+  belonging to the taxpayer). Persists nothing.
 
 The command surface and help text are deliberately terse; we'll flesh
 them out when the calculator and reporting commands land in their own
@@ -44,11 +48,17 @@ from ib_cgt.db import (
     open_connection,
 )
 from ib_cgt.domain import (
+    DirectAcquisition,
     FutureInstrument,
     FutureRealisation,
+    MatchedDisposal,
     Money,
     OpenPosition,
+    StockInstrument,
+    TaxLot,
+    TaxLotSnapshot,
     Trade,
+    UnmatchedAcquisition,
 )
 from ib_cgt.fx import FrankfurterClient, FXService, RateNotFoundError
 from ib_cgt.ingest import IngestResult, ingest_statement
@@ -56,6 +66,9 @@ from ib_cgt.rules import (
     FutureResult,
     FutureRuleEngine,
     InconsistentTradeError,
+    MatchingResult,
+    StockRuleEngine,
+    UnmatchedDisposalError,
     WrongAssetClassError,
 )
 
@@ -873,6 +886,368 @@ def _format_fx_rate(rate: Decimal) -> str:
     separators are unhelpful for figures this small.
     """
     return f"{rate:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# `match stocks`
+# ---------------------------------------------------------------------------
+
+
+@match_app.command("stocks")
+def match_stocks(
+    symbol: Annotated[
+        str | None,
+        typer.Option(
+            "--symbol",
+            "-s",
+            help="Filter to one stock symbol (e.g. 'AAPL').",
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Inclusive lower bound on trade_date (YYYY-MM-DD). "
+                "Caveat: matching is sensitive to date clipping; for "
+                "production output omit this. Use only to construct "
+                "edge-case scenarios for debugging — clipping mid-"
+                "history breaks S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "Inclusive upper bound on trade_date (YYYY-MM-DD). "
+                "Same caveat as --since: clipping mid-history breaks "
+                "S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Dry-run the stock rule engine against ingested trades.
+
+    Walks every stock instrument that matches the filters, runs
+    `StockRuleEngine.compute` against its trade history (across all
+    accounts — UK CGT pools span every account belonging to the
+    taxpayer) using the real `FXService`, and prints the resulting
+    matched-disposal chunks, pool residuals, and final-pool
+    aggregates. Nothing is written to the database — this command
+    is a read-only audit tool.
+
+    Note that there is intentionally no ``--account`` flag: filtering
+    by account would silently break the matching invariants for
+    instruments with cross-account histories (S.104 pools span
+    accounts per `docs/architecture.md §Scope — Accounts`).
+    """
+    since_date = _parse_iso_date(since, "--since")
+    until_date = _parse_iso_date(until, "--until")
+
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        # Defensive — same as `ingest`. A fresh DB file would otherwise
+        # surface as a confusing "no such table" error.
+        apply_migrations(conn)
+        fx_service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        engine = StockRuleEngine(fx_service)
+        instruments = InstrumentRepo(conn).list_stocks(symbol=symbol)
+        results = _run_match_stocks(
+            conn=conn,
+            engine=engine,
+            instruments=instruments,
+            since=since_date,
+            until=until_date,
+        )
+    finally:
+        conn.close()
+
+    if not instruments:
+        _console.print("[yellow]No stock instruments match the given filters.[/]")
+        return
+
+    _render_match_stocks(results, db_path)
+
+
+# A per-instrument outcome — either a successful `MatchingResult`,
+# the trade-id → trade-date map needed by the renderer for direct-
+# match basis dates, or the exception the engine raised. The CLI
+# walks instruments rather than aborting on the first failure, so
+# error isolation is the point of carrying all three through one
+# channel.
+_MatchStocksRow = tuple[
+    StockInstrument,
+    MatchingResult | None,
+    dict[int, date],
+    Exception | None,
+]
+
+
+def _run_match_stocks(
+    *,
+    conn: sqlite3.Connection,
+    engine: StockRuleEngine,
+    instruments: list[tuple[int, StockInstrument]],
+    since: date | None,
+    until: date | None,
+) -> list[_MatchStocksRow]:
+    """Run the stock engine per-instrument with per-instrument error capture.
+
+    Builds a `{trade_id: trade_date}` map per instrument so the
+    renderer can show the basis acquisition's date alongside its
+    trade id (which makes short round-trips readable: the row pairs
+    the sell-short Disp Date with the buy-to-cover Acq Date).
+    """
+    trade_repo = TradeRepo(conn)
+    out: list[_MatchStocksRow] = []
+    for instrument_id, instrument in instruments:
+        # Cross-account: account_id=None pulls every trade for this
+        # instrument across every account. Per the module docstring,
+        # filtering by account here would break the S.104 pool.
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id,
+            account_id=None,
+            since=since,
+            until=until,
+        )
+        # Trade-id → trade-date map for the renderer's "Acq Date"
+        # column (cheap; the trades are already in memory).
+        date_map = {trade_id: trade.trade_date for trade_id, trade in trades}
+        try:
+            result = engine.compute(instrument, trades)
+        except (
+            WrongAssetClassError,
+            InconsistentTradeError,
+            UnmatchedDisposalError,
+            RateNotFoundError,
+        ) as exc:
+            out.append((instrument, None, date_map, exc))
+            continue
+        out.append((instrument, result, date_map, None))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers — `match stocks`
+# ---------------------------------------------------------------------------
+
+
+def _render_match_stocks(rows: list[_MatchStocksRow], db_path: Path) -> None:
+    """Render matched-disposals, residuals, final-pool, summary, errors."""
+    _render_match_stocks_disposals(rows)
+    _render_match_stocks_residuals(rows)
+    _render_match_stocks_final_pools(rows)
+    _render_match_stocks_summary(rows, db_path)
+    _render_match_stocks_errors(rows)
+
+
+def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
+    """Per-instrument section: bold header then a Rich matched-disposals table.
+
+    Columns: Disp ID, Disp Date, Rule, Qty, Acq ID / Basis, Acq
+    Date, Proceeds (GBP), Cost (GBP), Gain (GBP). The Acq Date
+    column is what makes a short round-trip auditable at a glance —
+    a `LATER_ACQUISITION` row pairs the sell-short Disp Date with
+    the buy-to-cover Acq Date directly.
+    """
+    _console.print("[bold]Stock matched disposals (dry-run)[/]")
+    for instrument, result, date_map, error in rows:
+        if error is not None:
+            # Errors land in the trailing block — same pattern as
+            # `match futures`.
+            continue
+        assert result is not None  # mypy — error/result are mutually exclusive
+        divider = _stock_divider(instrument)
+        _console.print(f"\n[bold cyan]{divider}[/]")
+        if not result.matched_disposals:
+            _console.print("  [dim](no matched disposals)[/]")
+            continue
+        table = Table(header_style="bold", show_lines=False)
+        table.add_column("Disp ID", justify="right")
+        table.add_column("Disp Date")
+        table.add_column("Rule")
+        table.add_column("Qty", justify="right")
+        table.add_column("Acq ID / Basis")
+        table.add_column("Acq Date")
+        table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Cost (GBP)", justify="right")
+        table.add_column("Gain (GBP)", justify="right")
+        for md in result.matched_disposals:
+            table.add_row(*_matched_disposal_to_cells(md, date_map))
+        _console.print(table)
+
+
+def _render_match_stocks_residuals(rows: list[_MatchStocksRow]) -> None:
+    """One flat table of every UnmatchedAcquisition across all instruments."""
+    residuals: list[tuple[StockInstrument, UnmatchedAcquisition]] = [
+        (instrument, ua)
+        for instrument, result, _, error in rows
+        if error is None and result is not None
+        for ua in result.unmatched_acquisitions
+    ]
+    if not residuals:
+        _console.print("[dim]No pool residuals after matching.[/]")
+        return
+
+    table = Table(
+        title="Pool residuals at end of input",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("Acq ID", justify="right")
+    table.add_column("Acq Date")
+    table.add_column("Qty Remaining", justify="right")
+    table.add_column("Cost Remaining (GBP)", justify="right")
+    for instrument, ua in residuals:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            str(ua.trade_id),
+            ua.acquisition_date.isoformat(),
+            f"{ua.quantity_remaining}",
+            _format_money_2dp(ua.cost_remaining_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_stocks_final_pools(rows: list[_MatchStocksRow]) -> None:
+    """Per-instrument final-pool aggregate — one flat table.
+
+    Skips instruments whose pool is empty (the typical post-match
+    state for an instrument that fully closed every position).
+    """
+    pools: list[tuple[StockInstrument, TaxLot]] = [
+        (instrument, result.final_pool)
+        for instrument, result, _, error in rows
+        if error is None and result is not None and result.final_pool.quantity > 0
+    ]
+    if not pools:
+        return
+
+    table = Table(
+        title="Final S.104 pools",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("Pool Qty", justify="right")
+    table.add_column("Pool Cost (GBP)", justify="right")
+    table.add_column("Avg Cost (GBP)", justify="right")
+    for instrument, pool in pools:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            f"{pool.quantity}",
+            _format_money_2dp(pool.total_cost_gbp),
+            _format_money_2dp(pool.average_cost_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_stocks_summary(rows: list[_MatchStocksRow], db_path: Path) -> None:
+    """Small summary: counts and total realised gain across all instruments."""
+    error_count = sum(1 for _, _, _, error in rows if error is not None)
+    md_count = sum(
+        len(result.matched_disposals)
+        for _, result, _, error in rows
+        if error is None and result is not None
+    )
+    total_gain = Money.gbp(Decimal("0"))
+    for _, result, _, error in rows:
+        if error is not None or result is None:
+            continue
+        for md in result.matched_disposals:
+            total_gain = total_gain + md.gain_gbp
+
+    table = Table(
+        title="Summary",
+        caption=f"[dim]{db_path}[/]",
+        header_style="bold",
+    )
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("…with errors", str(error_count))
+    table.add_row("Matched disposal chunks", str(md_count))
+    gain_style = "green" if total_gain.amount >= 0 else "red"
+    table.add_row(
+        "Total realised gain (GBP)",
+        f"[{gain_style}]{_format_money_2dp(total_gain)}[/]",
+    )
+    _console.print(table)
+
+
+def _render_match_stocks_errors(rows: list[_MatchStocksRow]) -> None:
+    """Print every per-instrument error in one block at the end."""
+    error_rows = [(instrument, error) for instrument, _, _, error in rows if error is not None]
+    if not error_rows:
+        return
+    _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
+    for instrument, error in error_rows:
+        _console.print(f"  [bold cyan]{_stock_divider(instrument)}[/] [red]→ {error}[/]")
+
+
+def _stock_divider(instrument: StockInstrument) -> str:
+    """Stable label used in section dividers and error rows."""
+    return f"{instrument.symbol} ({instrument.currency})"
+
+
+def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -> tuple[str, ...]:
+    """Project a `MatchedDisposal` into the 9 columns of the disposals table.
+
+    `Acq ID / Basis` and `Acq Date` are basis-aware:
+    - `DirectAcquisition` (SAME_DAY / BED_AND_BREAKFAST /
+      LATER_ACQUISITION) → `acq #N` and the acquisition's
+      `trade_date` looked up via `date_map`.
+    - `TaxLotSnapshot` (SECTION_104) → `S.104 pool: qty=Q, avg=£X`
+      and an em-dash for the date (the pool has no single
+      acquisition date).
+    """
+    proceeds = md.matched_proceeds_gbp
+    proceeds_style = "green" if proceeds.amount >= 0 else "red"
+    gain = md.gain_gbp
+    gain_style = "green" if gain.amount >= 0 else "red"
+    basis_text, acq_date_text = _basis_cells(md.basis, date_map)
+    return (
+        str(md.disposal_trade_id),
+        md.disposal_date.isoformat(),
+        md.match_rule.value,
+        f"{md.matched_quantity}",
+        basis_text,
+        acq_date_text,
+        f"[{proceeds_style}]{_format_money_2dp(proceeds)}[/]",
+        _format_money_2dp(md.matched_cost_gbp),
+        f"[{gain_style}]{_format_money_2dp(gain)}[/]",
+    )
+
+
+def _basis_cells(
+    basis: DirectAcquisition | TaxLotSnapshot, date_map: dict[int, date]
+) -> tuple[str, str]:
+    """Return `(basis_text, acq_date_text)` for the two basis-aware columns."""
+    if isinstance(basis, DirectAcquisition):
+        acq_date = date_map.get(basis.acquisition_trade_id)
+        # `acq_date` should always be present for any acquisition the
+        # engine matched against — but we render an em-dash defensively
+        # if a future calculator-orchestrator path ever feeds a basis
+        # whose trade_id isn't in the per-instrument map.
+        date_text = acq_date.isoformat() if acq_date is not None else "—"
+        return f"acq #{basis.acquisition_trade_id}", date_text
+    # SECTION_104 — TaxLotSnapshot. Show the pool's pre-draw size
+    # and average cost so the auditor can reconstruct the basis.
+    pool_text = (
+        f"S.104 pool: qty={basis.quantity_before}, avg=£{_format_money_2dp(basis.average_cost_gbp)}"
+    )
+    return pool_text, "—"
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

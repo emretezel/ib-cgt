@@ -27,6 +27,7 @@ def test_match_rule_values() -> None:
     assert MatchRule.SAME_DAY.value == "same_day"
     assert MatchRule.BED_AND_BREAKFAST.value == "bed_and_breakfast"
     assert MatchRule.SECTION_104.value == "section_104"
+    assert MatchRule.LATER_ACQUISITION.value == "later_acquisition"
 
 
 def test_trade_action_values() -> None:
@@ -45,4 +46,5 @@ def test_enum_membership_is_closed() -> None:
         "same_day",
         "bed_and_breakfast",
         "section_104",
+        "later_acquisition",
     }

@@ -111,6 +111,44 @@ def test_per_child_currency_indexes_exist(db: sqlite3.Connection) -> None:
     assert found == expected
 
 
+def test_list_stocks_returns_inserted_rows(db: sqlite3.Connection) -> None:
+    """`list_stocks` returns every inserted stock as `(id, StockInstrument)`."""
+    repo = InstrumentRepo(db)
+    aapl = StockInstrument(symbol="AAPL", currency="USD", isin="US0378331005")
+    isf = StockInstrument(symbol="ISF", currency="GBP")
+    aapl_id = repo.upsert(aapl)
+    isf_id = repo.upsert(isf)
+
+    rows = repo.list_stocks()
+    # Order is (symbol, currency) — ASCII sort puts AAPL before ISF.
+    assert rows == [(aapl_id, aapl), (isf_id, isf)]
+
+
+def test_list_stocks_filters_by_symbol(db: sqlite3.Connection) -> None:
+    """`symbol=` narrows to that exact symbol; non-matches are excluded."""
+    repo = InstrumentRepo(db)
+    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    isf = StockInstrument(symbol="ISF", currency="GBP")
+    repo.upsert(aapl)
+    repo.upsert(isf)
+
+    rows = repo.list_stocks(symbol="AAPL")
+    assert [inst.symbol for _, inst in rows] == ["AAPL"]
+
+
+def test_list_stocks_excludes_other_asset_classes(db: sqlite3.Connection) -> None:
+    """A bond/future/fx with the same symbol must not appear in `list_stocks`."""
+    repo = InstrumentRepo(db)
+    stock = StockInstrument(symbol="ABC", currency="USD")
+    bond = BondInstrument(symbol="ABC", currency="USD")
+    repo.upsert(stock)
+    repo.upsert(bond)
+
+    rows = repo.list_stocks()
+    assert len(rows) == 1
+    assert rows[0][1] == stock
+
+
 def test_duplicate_future_does_not_create_duplicate_row(
     db: sqlite3.Connection,
 ) -> None:

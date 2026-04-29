@@ -1,4 +1,4 @@
-"""UK CGT share-matching engine — same-day / 30-day / S.104.
+"""UK CGT share-matching engine — same-day / 30-day / S.104 / S.105(2).
 
 This module implements the generic matching algorithm shared by the
 Stock, Bond, and FX rule engines (per `docs/architecture.md
@@ -9,9 +9,16 @@ their own engine-specific FX path, then hand those records here.
 Algorithmic notes
 -----------------
 
-UK CGT applies three matching rules in a strict precedence order:
+UK CGT applies four matching rules in a strict precedence order:
 
-    same-day (TCGA s.105)  >  30-day forward / B&B (s.106A)  >  pool (s.104)
+    same-day (s.105(1)(b))  >  30-day forward / B&B (s.106A)
+        >  pool (s.104)  >  later acquisition (s.105(2))
+
+The fourth rule — TCGA92/S105(2) — is the catch-all that matches a
+disposal's residual against any acquisition made *after* the 30-day
+window, taking the **earliest** such acquisition first. It is what
+covers a sell-short followed by a buy-to-cover more than 30 days
+later, and any disposal that runs past an under-sized S.104 pool.
 
 The precedence matters across disposals as well as within a single
 disposal. Consider:
@@ -21,19 +28,27 @@ disposal. Consider:
     Jan 20:  sell 10 of XYZ
 
 The Jan-20 sell **must** match same-day against the Jan-20 buy, leaving
-the Jan-15 sell to fall through to the pool (or raise as un-covered).
-A naive per-disposal-chronological algorithm would 30-day-match the
-Jan-15 sell against the Jan-20 buy first and starve the same-day
-match — the wrong outcome.
+the Jan-15 sell to fall through to the pool (or to a later
+acquisition under s.105(2)). A naive per-disposal-chronological
+algorithm would 30-day-match the Jan-15 sell against the Jan-20 buy
+first and starve the same-day match — the wrong outcome.
 
-The implementation therefore runs in **three passes** over the data:
+The implementation therefore runs in **four passes** over the data:
 
     Pass 1: every same-day match (across all disposals).
     Pass 2: every 30-day forward match (across remaining residuals).
-    Pass 3: every S.104 pool draw (across remaining residuals).
+    Pass 3: every S.104 pool draw (across remaining residuals,
+            partial coverage allowed — the pool draws what it has
+            and Pass 4 picks up the rest).
+    Pass 4: every later-acquisition match — acquisitions strictly
+            after the 30-day window, earliest acquisition first.
 
 Within each pass, lots and disposals are visited in chronological order
 (date, then trade id) so the FIFO behaviour is deterministic.
+
+After all four passes, any disposal still carrying residual quantity
+is reported as `UnmatchedDisposalError` — the trade history is
+incomplete and a partial match would silently distort the tax report.
 
 S.104 pool attribution
 ----------------------
@@ -165,11 +180,13 @@ class _Match:
 
 
 # Ordering used when composing final emit order: per disposal,
-# same-day chunks before 30-day chunks before pool chunks.
+# same-day chunks before 30-day chunks before pool chunks before
+# later-acquisition (s.105(2)) chunks.
 _RULE_PRIORITY: Final[dict[MatchRule, int]] = {
     MatchRule.SAME_DAY: 0,
     MatchRule.BED_AND_BREAKFAST: 1,
     MatchRule.SECTION_104: 2,
+    MatchRule.LATER_ACQUISITION: 3,
 }
 
 
@@ -238,12 +255,20 @@ class MatchingEngine:
         lots = self._build_lots(acquisitions)
         disp_state = self._build_disp_state(disposals)
 
-        # Three-pass match. See module docstring for why ordering matters.
+        # Four-pass match. See module docstring for why ordering matters.
         pending: list[_Match] = []
         emit_counter = [0]  # boxed so helper passes can mutate it
         self._pass_same_day(lots, disp_state, pending, emit_counter)
         self._pass_30_day(lots, disp_state, pending, emit_counter)
-        self._pass_section_104(lots, disp_state, pending, emit_counter, instrument)
+        self._pass_section_104(lots, disp_state, pending, emit_counter)
+        self._pass_later_acquisition(lots, disp_state, pending, emit_counter)
+        # Final residual check: any disposal still carrying residual
+        # quantity after every rule has had its turn means the trade
+        # history is incomplete (e.g. a still-open short with no
+        # buy-to-cover anywhere in the input). Fail loudly so the
+        # tax report is not silently distorted by a half-matched
+        # disposal.
+        self._raise_if_residuals(disp_state, instrument)
 
         # Compose final emit order: per disposal in chronological order,
         # rule-priority within disposal, then emit sequence as tie-break.
@@ -398,7 +423,6 @@ class MatchingEngine:
         disp_state: list[_DispState],
         pending: list[_Match],
         emit_counter: list[int],
-        instrument: AnyInstrument,
     ) -> None:
         """Drain the S.104 pool for any disposals with remaining residuals.
 
@@ -409,6 +433,13 @@ class MatchingEngine:
         average at that moment; the draw is then attributed to lots
         pro-rata so the pool aggregate and the itemised lot view stay
         in lock-step.
+
+        The pool may not be large enough to cover the disposal — in
+        that case we draw whatever is available and let Pass 4
+        (s.105(2)) match the rest against later acquisitions. Pass 3
+        no longer raises `UnmatchedDisposalError`; the final residual
+        sweep after all four passes is the single source of that
+        error.
         """
         for idx, ds in enumerate(disp_state):
             if ds.quantity_remaining <= 0:
@@ -422,18 +453,15 @@ class MatchingEngine:
             pool_qty = sum((lot.quantity_remaining for lot in pool_lots), start=Decimal(0))
             pool_cost = sum((lot.cost_remaining_amount for lot in pool_lots), start=Decimal(0))
 
-            if pool_qty <= 0 or ds.quantity_remaining > pool_qty:
-                # The trade history is incomplete relative to this
-                # disposal — fail loudly rather than silently emit a
-                # partial match.
-                raise UnmatchedDisposalError(
-                    instrument_symbol=instrument.symbol,
-                    disposal_trade_id=ds.disposal.trade_id,
-                    unmatched_quantity=ds.quantity_remaining,
-                )
+            if pool_qty <= 0:
+                # No pool to draw from — fall through to Pass 4.
+                continue
 
+            # Take whatever the pool has, capped at the disposal's
+            # residual. Partial coverage is allowed: any remainder is
+            # left for Pass 4 (s.105(2)).
+            drawn_qty = min(ds.quantity_remaining, pool_qty)
             average_cost = pool_cost / pool_qty
-            drawn_qty = ds.quantity_remaining
             cost_drawn = average_cost * drawn_qty
 
             snapshot = TaxLotSnapshot(
@@ -467,10 +495,82 @@ class MatchingEngine:
                 lot.quantity_remaining -= qty_lost
                 lot.cost_remaining_amount -= cost_lost
 
-            ds.quantity_remaining = Decimal(0)
+            ds.quantity_remaining -= drawn_qty
 
     # ------------------------------------------------------------------
-    # Shared consume helper for direct (same-day / 30-day) matches
+    # Pass 4 — later-acquisition matches (TCGA92/S105(2))
+    # ------------------------------------------------------------------
+
+    def _pass_later_acquisition(
+        self,
+        lots: list[_Lot],
+        disp_state: list[_DispState],
+        pending: list[_Match],
+        emit_counter: list[int],
+    ) -> None:
+        """Apply TCGA92/S105(2): match disposals to later acquisitions.
+
+        For each disposal still carrying residual after passes 1-3,
+        walk the lots chronologically and drain any acquisition whose
+        `acquisition_date` is **strictly after** `disposal_date + 30`
+        (i.e. outside the 30-day Bed & Breakfast window — the
+        statute says "and not already identified under stage 2
+        above"). Within that filter, lots are visited in the
+        already-sorted (date, trade_id) order, so the **earliest**
+        eligible later acquisition is taken first per the statute.
+
+        This is the rule that covers a sell-short followed by a
+        buy-to-cover more than 30 days later. It also covers an
+        ordinary disposal whose quantity outstrips the S.104 pool.
+        """
+        for idx, ds in enumerate(disp_state):
+            if ds.quantity_remaining <= 0:
+                continue
+            window_end = ds.disposal.disposal_date + timedelta(days=_BED_AND_BREAKFAST_DAYS)
+            for lot in lots:
+                if ds.quantity_remaining <= 0:
+                    break
+                if lot.quantity_remaining <= 0:
+                    continue
+                # Acquisitions in the 30-day window were eligible for
+                # Pass 2 — those are excluded from s.105(2) by the
+                # "not already identified under stage 2 above" clause,
+                # whether or not Pass 2 actually fully consumed them.
+                if lot.acquisition_date <= window_end:
+                    continue
+                self._consume(
+                    lot=lot,
+                    ds=ds,
+                    rule=MatchRule.LATER_ACQUISITION,
+                    disposal_index=idx,
+                    pending=pending,
+                    emit_counter=emit_counter,
+                )
+
+    # ------------------------------------------------------------------
+    # Final residual sweep — single source of UnmatchedDisposalError
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _raise_if_residuals(disp_state: list[_DispState], instrument: AnyInstrument) -> None:
+        """Raise `UnmatchedDisposalError` for any disposal still with residual.
+
+        After passes 1-4 every disposal that the engine could match
+        has been matched. Anything still carrying residual quantity
+        is genuinely uncovered — typically a still-open short that
+        has no buy-to-cover anywhere in the input, or a long disposal
+        without enough acquisitions in the input to cover it.
+        """
+        for ds in disp_state:
+            if ds.quantity_remaining > 0:
+                raise UnmatchedDisposalError(
+                    instrument_symbol=instrument.symbol,
+                    disposal_trade_id=ds.disposal.trade_id,
+                    unmatched_quantity=ds.quantity_remaining,
+                )
+
+    # ------------------------------------------------------------------
+    # Shared consume helper for direct (same-day / 30-day / s.105(2)) matches
     # ------------------------------------------------------------------
 
     @staticmethod

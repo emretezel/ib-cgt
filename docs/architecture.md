@@ -31,12 +31,19 @@ Locked in so component responsibilities are unambiguous:
 
 - **Tax year**: 6 April → 5 April.
 - **Share matching order** (TCGA 1992 s.104 / s.105 / s.106A):
-  1. **Same-day** — disposals first matched with acquisitions on the same day.
-  2. **Bed-and-breakfast** — next matched with acquisitions in the next 30 days.
-  3. **Section 104 pool** — remaining matched against the pooled holding
-     (weighted-average cost basis).
-  Applies to stocks, non-exempt bonds, and — per the FX scope decision above —
-  FX holdings per currency pair.
+  1. **Same-day** (s.105(1)(b)) — disposals first matched with
+     acquisitions on the same day.
+  2. **Bed-and-breakfast** (s.106A) — next matched with acquisitions
+     in the next 30 days.
+  3. **Section 104 pool** (s.104) — remaining matched against the
+     pooled holding (weighted-average cost basis).
+  4. **Later acquisitions** (s.105(2)) — final residual matched
+     against acquisitions made *after* the 30-day window, earliest
+     first. Covers a sell-short followed by a buy-to-cover more than
+     30 days later, and any disposal that runs past an under-sized
+     S.104 pool.
+  Applies to stocks, non-exempt bonds, and — per the FX scope
+  decision above — FX holdings per currency pair.
 - **GBP requirement**: every disposal's proceeds and cost must be in GBP,
   converted at the spot rate on the transaction date.
 - **Futures**: individual-investor treatment — gain/loss realised on contract
@@ -76,18 +83,23 @@ where noted.
 
 5. **Asset-class rule engines** — `ib_cgt.rules` — strategy pattern, one
    engine per asset class registered by `AssetClass`:
-   - `StockRuleEngine` — full S.104 matching.
-   - `BondRuleEngine` — S.104 matching; skips QCB/gilt-exempt instruments;
-     attaches purchase/sale accrued interest to cost/proceeds.
+   - `StockRuleEngine` — four-rule UK matching (same-day / 30-day /
+     S.104 / s.105(2)) via the shared matching engine; direction-
+     agnostic so short round-trips fall through to s.105(2) when
+     their cover buy is more than 30 days later.
+   - `BondRuleEngine` — four-rule matching; skips QCB/gilt-exempt
+     instruments; attaches purchase/sale accrued interest to
+     cost/proceeds.
    - `FutureRuleEngine` — per-contract realised-gain on close-out; no
      pooling. Emits a separate `FutureRealisation` shape because UK
      share-matching rules (s.104 / s.105 / s.106A) do not apply to
      individual-investor futures (HMRC HS292) — `MatchedDisposal` and
      `MatchRule` stay strictly for the share-matching engines.
-   - `FXRuleEngine` — S.104-style matching per currency pair vs GBP.
-   A shared `MatchingEngine` implements the generic same-day / 30-day / S.104
-   algorithm reused by Stock, Bond, and FX engines. See
-   [`rules.md`](./rules.md) for the per-engine details.
+   - `FXRuleEngine` — four-rule matching per currency pair vs GBP.
+   A shared `MatchingEngine` implements the generic same-day /
+   30-day / S.104 / s.105(2) algorithm reused by Stock, Bond, and
+   FX engines. See [`rules.md`](./rules.md) for the per-engine
+   details.
 
 6. **CGT calculator / orchestrator** — `ib_cgt.calculator` — entry point
    for a tax-year computation. Loads trades from the DB, routes each to the
@@ -202,13 +214,17 @@ items marked ⬜ are pending.
    See [`fx.md`](./fx.md).
 5. ✅ **Statement ingestion** — HTML parser, canonical mapping, dedup,
    CLI `ingest`.
-6. ✅ **Matching engine** — generic same-day / 30-day / S.104 mechanics
-   in isolation; FX-free; itemised pool residuals via pro-rata
-   attribution. Will be consumed by Stock / Bond / FX engines later.
+6. ✅ **Matching engine** — generic same-day / 30-day / S.104 /
+   s.105(2) mechanics in isolation; FX-free; itemised pool
+   residuals via pro-rata attribution. Consumed by `StockRuleEngine`
+   today; will also be consumed by Bond / FX engines later.
 7. ✅ **FutureRuleEngine** — per-contract close-out model (HMRC HS292),
    FIFO long/short queues, `FutureRealisation` output (separate from
    `MatchedDisposal`).
-8. ⬜ **StockRuleEngine** — full S.104 matching using the matching engine.
+8. ✅ **StockRuleEngine** — four-rule UK matching (same-day / 30-day
+   / S.104 / s.105(2)) using the matching engine. Direction-agnostic
+   so short round-trips fall through to s.105(2) when their cover
+   buy is more than 30 days later.
 9. ⬜ **BondRuleEngine** — add QCB / gilt exempt handling; attach accrued
    interest; reuse the matching engine.
 10. ⬜ **FXRuleEngine** — S.104-style matching per currency pair.
@@ -227,10 +243,10 @@ items marked ⬜ are pending.
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
-| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` + `FutureRuleEngine` done |
+| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` done |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |

@@ -213,6 +213,37 @@ def test_bed_and_breakfast_requires_direct_basis() -> None:
         )
 
 
+def test_later_acquisition_accepts_direct_basis() -> None:
+    # TCGA92/S105(2) matches against a specific later acquisition trade,
+    # so the basis is `DirectAcquisition` — not a pool snapshot.
+    md = MatchedDisposal(
+        disposal_trade_id=2,
+        instrument=_aapl(),
+        disposal_date=date(2024, 9, 1),
+        match_rule=MatchRule.LATER_ACQUISITION,
+        matched_quantity=Decimal("5"),
+        matched_proceeds_gbp=Money.gbp("400"),
+        matched_cost_gbp=Money.gbp("500"),
+        basis=_direct_basis(),
+    )
+    assert md.match_rule is MatchRule.LATER_ACQUISITION
+    assert md.gain_gbp == Money.gbp("-100")
+
+
+def test_later_acquisition_rejects_snapshot_basis() -> None:
+    with pytest.raises(ValueError):
+        MatchedDisposal(
+            disposal_trade_id=2,
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            match_rule=MatchRule.LATER_ACQUISITION,
+            matched_quantity=Decimal("5"),
+            matched_proceeds_gbp=Money.gbp("400"),
+            matched_cost_gbp=Money.gbp("500"),
+            basis=_snapshot_basis(),  # wrong — pool snapshot for direct rule
+        )
+
+
 def test_match_basis_union_is_exhaustive() -> None:
     # Verify the two types really are the full set — guards against someone
     # adding a third subtype later and forgetting to update consumers.

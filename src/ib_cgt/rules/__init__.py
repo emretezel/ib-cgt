@@ -8,10 +8,15 @@ reporting layer.
 
 The package contains:
 
-* `MatchingEngine` — the generic UK same-day / 30-day / S.104
-  matching algorithm. Stateless per call, FX-free (it consumes already-
-  converted `Acquisition`/`Disposal` records). Used by the future
-  Stock, Bond and FX rule engines as their internal matching primitive.
+* `MatchingEngine` — the generic UK four-rule matching algorithm
+  (same-day / 30-day forward / S.104 / s.105(2) later acquisitions).
+  Stateless per call, FX-free (it consumes already-converted
+  `Acquisition`/`Disposal` records). Used by `StockRuleEngine` and
+  by the future Bond and FX rule engines as their internal
+  matching primitive.
+* `StockRuleEngine` — UK CGT four-rule matching for ordinary shares.
+  Projects raw `Trade` rows into GBP `Acquisition`/`Disposal`
+  records via the FX service and delegates to `MatchingEngine`.
 * `FutureRuleEngine` — per-contract close-out treatment for futures
   per HMRC HS292. Does *not* use `MatchingEngine`; futures emit a
   separate `FutureRealisation` shape because UK share-matching rules
@@ -33,6 +38,7 @@ from ib_cgt.rules.errors import (
 )
 from ib_cgt.rules.futures import FutureResult, FutureRuleEngine, FXConverter
 from ib_cgt.rules.matching import MatchingEngine, MatchingResult
+from ib_cgt.rules.stocks import StockRuleEngine
 
 __all__ = [
     "FXConverter",
@@ -42,6 +48,7 @@ __all__ = [
     "MatchingEngine",
     "MatchingResult",
     "RuleEngineError",
+    "StockRuleEngine",
     "UnmatchedDisposalError",
     "WrongAssetClassError",
 ]

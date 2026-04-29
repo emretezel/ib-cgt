@@ -130,6 +130,39 @@ def future_trade(
     )
 
 
+def stock_trade(
+    *,
+    action: TradeAction,
+    on: date,
+    qty: Decimal | int | str,
+    price: Decimal | int | str,
+    fees: Decimal | int | str = Decimal("0"),
+    instrument: StockInstrument | None = None,
+    account_id: str = "U1",
+    seq: int = 0,
+) -> Trade:
+    """Build a stock `Trade`. Mirrors `future_trade` for stocks.
+
+    Default instrument is `aapl()` (USD-denominated AAPL); pass an
+    explicit `instrument=` for GBP / EUR / etc. cases. `seq` is the
+    intra-day minute offset on top of 12:00 UTC, used when a test
+    needs deterministic ordering of multiple same-day trades.
+    """
+    inst = instrument or aapl()
+    dt = datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC) + timedelta(minutes=seq)
+    return Trade(
+        account_id=account_id,
+        instrument=inst,
+        action=action,
+        trade_datetime=dt,
+        trade_date=on,
+        settlement_date=on,
+        quantity=Decimal(qty),
+        price=Money.of(price, inst.currency),
+        fees=Money.of(fees, inst.currency),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stub FX service for futures tests
 # ---------------------------------------------------------------------------

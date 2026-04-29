@@ -11,11 +11,11 @@ reconciliation lists. It depends only on `ib_cgt.domain` and
 UK CGT applies different rules to different asset classes, and the
 rules don't reduce to a common algorithm:
 
-- **Stocks, bonds, FX** — UK share-matching applies (TCGA 1992 s.105 /
-  s.106A / s.104). A disposal can be split across same-day matches,
-  30-day forward matches, and the pooled holding, with a strict
-  precedence order. The shared `MatchingEngine` implements this
-  algorithm once for all three.
+- **Stocks, bonds, FX** — UK share-matching applies (TCGA 1992 s.104
+  / s.105 / s.106A). A disposal can be split across same-day
+  matches, 30-day forward matches, the pooled holding, and any
+  later acquisitions, with a strict precedence order. The shared
+  `MatchingEngine` implements this algorithm once for all three.
 - **Futures** — individual-investor treatment per HMRC HS292: each
   closed contract is its own disposal, paired with the trade that
   opened it. There is no pool, no same-day rule, no 30-day rule. The
@@ -26,28 +26,42 @@ futures multiplier) live in the asset-class engine, not in the matching
 algorithm. The matching engine consumes already-GBP `Acquisition` and
 `Disposal` records — it is FX-free and asset-class-agnostic.
 
-## The three UK matching rules
+## The four UK matching rules
 
 When matching a disposal `D` of N units of an instrument:
 
-1. **Same-day** (TCGA s.105). Match against acquisitions of the same
-   class on the same date as `D`. Cost basis is the actual price paid
-   on those acquisitions, FIFO within the day across multiple buys.
-2. **Bed-and-Breakfast** (TCGA s.106A, the "30-day rule"). Any
+1. **Same-day** (TCGA92/S105(1)(b)). Match against acquisitions of
+   the same class on the same date as `D`. Cost basis is the actual
+   price paid on those acquisitions, FIFO within the day across
+   multiple buys.
+2. **Bed-and-Breakfast** (TCGA92/S106A, the "30-day rule"). Any
    residual matches against acquisitions in the **30 days following**
    `D`'s date, FIFO by acquisition date. The window is `(D, D+30]`
    inclusive of day +30. Designed to neutralise wash-sale style
    schemes that briefly close and re-open a position around a tax
    year-end.
-3. **Section 104 pool**. Any residual after rules 1 and 2 draws from
-   the pool — the running aggregate of every acquisition that was not
-   fully consumed by rules 1 or 2. Cost basis is the pool's
-   weighted-average cost at the moment of the draw.
+3. **Section 104 pool** (TCGA92/S104). Any residual after rules 1
+   and 2 draws from the pool — the running aggregate of every
+   acquisition before `D`'s date that was not fully consumed by
+   rules 1 or 2. Cost basis is the pool's weighted-average cost at
+   the moment of the draw. The pool can partially cover a disposal
+   — the engine takes whatever the pool has and leaves the rest for
+   rule 4.
+4. **Later acquisitions** (TCGA92/S105(2)). Any residual after rules
+   1–3 matches against acquisitions made *after* the 30-day window
+   ("not already identified under stage 2 above"), taking the
+   **earliest** such acquisition first. This is what covers a
+   sell-short followed by a buy-to-cover more than 30 days later
+   (the buy-to-cover IS the acquisition under HMRC's date semantic
+   for shorts: disposal date = sell-short date, acquisition date =
+   buy-to-cover date), and any disposal that runs past an
+   under-sized S.104 pool.
 
 Same-day takes priority **across disposals**, not just within one
 disposal: if two disposals on different dates both want the same
 acquisition, the one that can claim it under the same-day rule gets
-it before the 30-day rule kicks in.
+it before the 30-day rule kicks in. The same cross-disposal
+priority logic applies to rules 2, 3, and 4 in order.
 
 ### Worked example
 
@@ -110,28 +124,43 @@ audit report wants and the order the `matched_disposals` table's
 
 ### Algorithm
 
-The engine runs in three passes over the data:
+The engine runs in four passes over the data:
 
 1. **Pass 1 — same-day, across all disposals.** This pass is what makes
    "same-day takes priority across disposals" work. If we processed
-   disposals chronologically and applied all three rules per
-   disposal, an earlier disposal would 30-day-match an acquisition
-   before a later disposal could same-day-match it.
+   disposals chronologically and applied all rules per disposal, an
+   earlier disposal would 30-day-match an acquisition before a
+   later disposal could same-day-match it.
 2. **Pass 2 — 30-day forward, across all remaining residuals.**
 3. **Pass 3 — S.104 pool draws, across remaining residuals.**
+   Partial coverage is allowed: if the pool has fewer units than
+   the disposal needs, the pool is fully drained for that disposal
+   and Pass 4 is responsible for the rest.
+4. **Pass 4 — later-acquisition (s.105(2)) matches.** For each
+   remaining residual, walk acquisitions strictly after the 30-day
+   window, earliest first. Acquisitions inside the window are
+   excluded from this pass even if Pass 2 only partially consumed
+   them — that's the statutory "not already identified under stage
+   2 above" clause.
 
 Within each pass, lots and disposals are visited in chronological
 order (date, then trade id) so FIFO behaviour is deterministic.
 
+After all four passes, any disposal still carrying residual
+quantity is reported as `UnmatchedDisposalError` — the trade
+history is genuinely incomplete (typically a still-open short with
+no buy-to-cover anywhere in the input).
+
 ### Coverage shortfall
 
-If a disposal has un-matched residual after exhausting all three
-rules — typically because the user loaded an incomplete trade history
-— the engine raises `UnmatchedDisposalError`. The error carries the
-disposal's trade id, the instrument's symbol, and the residual
-quantity at the moment the pool came up short. No partial pool draw
-is performed before the error: this keeps the engine's emit set
-internally consistent and makes the error message accurate.
+If a disposal has un-matched residual after exhausting all four
+rules — typically because the user loaded an incomplete trade
+history (e.g. a still-open short with no buy-to-cover anywhere in
+the input) — the engine raises `UnmatchedDisposalError`. The error
+carries the disposal's trade id, the instrument's symbol, and the
+final residual quantity. The four passes always emit whatever
+matches they can; the residual sweep is a single check after
+Pass 4 that surfaces what could not be covered.
 
 The intent is for the calculator to fail loudly: a half-matched
 disposal would silently distort the tax report.
@@ -187,6 +216,72 @@ Pro-rata attribution drains 25 % of every lot:
 `final_pool` = 150 units / £2,250 (15 average), and the two
 `UnmatchedAcquisition` rows sum to exactly that.
 
+## `StockRuleEngine`
+
+```python
+from ib_cgt.fx import FXService
+from ib_cgt.rules import StockRuleEngine
+
+engine = StockRuleEngine(fx)            # fx implements FXConverter Protocol
+result = engine.compute(instrument, trades)
+```
+
+`StockRuleEngine` is a thin strategy on top of `MatchingEngine`. It
+projects raw `Trade` rows into GBP-denominated `Acquisition` and
+`Disposal` records via the FX service, then delegates the match.
+
+### Per-trade projection
+
+The engine is **direction-agnostic**: every `BUY` becomes an
+`Acquisition` and every `SELL` becomes a `Disposal`, regardless of
+whether the running balance is long or short.
+
+| Action | Native math                            | Domain shape  | Date carried into match shape         |
+|--------|----------------------------------------|---------------|---------------------------------------|
+| `BUY`  | `cost_native = price * qty + fees`     | `Acquisition` | `acquisition_date = trade.trade_date` |
+| `SELL` | `proceeds_native = price * qty - fees` | `Disposal`    | `disposal_date = trade.trade_date`    |
+
+Both legs of a single trade settle on the same date, so a single
+`FXConverter.convert_with_rate(..., on=trade.trade_date)` call
+covers each trade.
+
+### Cross-account history
+
+S.104 pools span every account belonging to the taxpayer (per
+[`docs/architecture.md §Scope — Accounts`](./architecture.md)). The
+engine does not partition by `account_id` — the caller is expected
+to feed in the trade history for an instrument across **all**
+accounts. The persistence layer's `(symbol, currency)` natural-key
+UNIQUE on `stock_instruments` resolves cross-account history to a
+single instrument id automatically.
+
+### Short positions
+
+The four-rule order covers short round-trips for free without any
+short-aware branching:
+
+| Scenario                                   | Rule applied                                                          |
+|--------------------------------------------|------------------------------------------------------------------------|
+| Sell-short and buy-to-cover same date      | `SAME_DAY` — buy-to-cover as the same-day acquisition                  |
+| Sell-short, buy-to-cover within 30 days    | `BED_AND_BREAKFAST` — buy-to-cover as the 30-day forward acquisition    |
+| Sell-short, buy-to-cover after 30 days     | `LATER_ACQUISITION` — buy-to-cover as the s.105(2) later acquisition    |
+| Sell-short with no buy-to-cover            | `UnmatchedDisposalError` — disposal still residual after all four passes |
+
+For shorts, `MatchedDisposal.disposal_date` is the sell-short trade
+date (the date the borrowed shares are disposed of); the basis
+`DirectAcquisition` points to the buy-to-cover trade, whose date
+is rendered separately in the audit output (it is implicit in the
+basis trade id at the domain level).
+
+### Errors
+
+| Exception                | When                                                                                              |
+|--------------------------|---------------------------------------------------------------------------------------------------|
+| `WrongAssetClassError`   | The engine was handed a non-`StockInstrument`.                                                    |
+| `InconsistentTradeError` | A trade carries an action other than `BUY`/`SELL` (defensive — `Trade.__post_init__` rejects this). |
+| `ValueError`             | A trade's `instrument` doesn't match the engine call's `instrument`.                              |
+| `UnmatchedDisposalError` | Propagated from `MatchingEngine` when a disposal can't be covered by all four rules.              |
+
 ## `FutureRuleEngine`
 
 ```python
@@ -208,7 +303,7 @@ converted to GBP at the open-date and close-date spots independently.
 
 To reflect that, the engine emits a separate `FutureRealisation`
 shape rather than `MatchedDisposal`. The match-rule enum
-(`MatchRule`) stays strictly the three UK share-matching values, and
+(`MatchRule`) stays strictly the four UK share-matching values, and
 the per-contract-closeout case is type-distinct.
 
 ### FIFO opens-vs-closes per side
@@ -290,10 +385,11 @@ All four live in `ib_cgt.rules`.
 
 ## What's not implemented yet
 
-`StockRuleEngine`, `BondRuleEngine`, and `FXRuleEngine` are pending
-(see [`architecture.md`](./architecture.md#implementation-order),
-steps 8–10). Each will consume `MatchingEngine` as its internal
-matching primitive, layering on the asset-class quirks (bond accrued
-interest, FX rate-on-rate, etc.) on the way in. The strategy-pattern
-abstract base class will be introduced when the second engine lands —
-having only one concrete engine today doesn't justify the boilerplate.
+`BondRuleEngine` and `FXRuleEngine` are pending (see
+[`architecture.md`](./architecture.md#implementation-order), steps
+9 and 10). Each will consume `MatchingEngine` as its internal
+matching primitive, layering on the asset-class quirks (bond
+accrued interest, FX rate-on-rate, etc.) on the way in. The
+strategy-pattern abstract base class will be introduced when the
+third engine lands — two concrete engines (`StockRuleEngine`,
+`FutureRuleEngine`) don't yet justify the boilerplate.
