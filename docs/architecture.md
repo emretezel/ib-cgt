@@ -74,7 +74,11 @@ where noted.
    (BeautifulSoup / lxml) into canonical `Trade` / `CorporateAction` /
    `Cashflow` records, handles format drift across 2017→2025 statements,
    deduplicates using a composite business key (IB has no per-trade ID).
-   CLI-driven, idempotent.
+   CLI-driven, idempotent. The parser intentionally drops rows in the
+   "Equity and Index Options" section (see
+   `parser._IGNORED_ASSET_CLASSES`): stock options are out of scope for
+   v1 and the OCC-formatted symbols would otherwise be ingested as
+   stocks.
 
 4. **FX rate service** — `ib_cgt.fx` — Frankfurter HTTP client (date-range
    batched), SQLite-backed cache, previous-business-day fallback for

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head><title>U9999997 Activity Statement April 8, 2019 - April 5, 2020</title></head>
+<body>
+
+<!-- Account Information -->
+<div id="tblAccountInfo_U9999997Body">
+<table>
+  <tr><td>Account</td><td>U9999997</td></tr>
+</table>
+</div>
+
+<!-- Trades section: includes a Stocks block, an "Equity and Index
+     Options" block, and a Forex block. The options rows must be
+     dropped by `_IGNORED_ASSET_CLASSES`; the surrounding stock and
+     forex rows must survive intact. -->
+<div id="tblTransactions_U9999997Body">
+<table id="summaryDetailTable">
+<thead>
+<tr>
+<th align="left">Symbol</th>
+<th align="left">Date/Time</th>
+<th align="right">Quantity</th>
+<th align="right">T. Price</th>
+<th align="right">C. Price</th>
+<th align="right">Proceeds</th>
+<th align="right">Comm/Fee</th>
+<th align="right">Basis</th>
+<th align="right">Realized P/L</th>
+<th align="right">Realized P/L %</th>
+<th align="right">MTM P/L</th>
+<th align="right">Code</th>
+</tr>
+</thead>
+
+<!-- STOCKS — must survive -->
+<tbody><tr><td class="header-asset" colspan="12">Stocks</td></tr></tbody>
+<tbody><tr><td class="header-currency" colspan="12">USD</td></tr></tbody>
+<tbody>
+<tr>
+<td>TUR</td>
+<td>2019-05-16, 16:20:00</td>
+<td align="right">-1,500</td>
+<td align="right">22.0000</td>
+<td align="right">20.7800</td>
+<td align="right">33,000.00</td>
+<td align="right">-0.86</td>
+<td align="right">-32,999.14</td>
+<td align="right">0.00</td>
+<td align="right">0.00</td>
+<td align="right">1,830.00</td>
+<td align="right">Ex;O</td>
+</tr>
+</tbody>
+
+<!-- EQUITY AND INDEX OPTIONS — must be dropped -->
+<tbody><tr><td class="header-asset" colspan="12">Equity and Index Options</td></tr></tbody>
+<tbody><tr><td class="header-currency" colspan="12">USD</td></tr></tbody>
+<tbody>
+<tr>
+<td>TUR 17MAY19 22.0 P</td>
+<td>2019-05-16, 16:20:00</td>
+<td align="right">-15</td>
+<td align="right">0.0000</td>
+<td align="right">1.2200</td>
+<td align="right">0.00</td>
+<td align="right">0.00</td>
+<td align="right">-2,775.51</td>
+<td align="right">0.00</td>
+<td align="right">0.00</td>
+<td align="right">-1,830.00</td>
+<td align="right">C;Ex</td>
+</tr>
+</tbody>
+
+<!-- FOREX — must survive after the options block -->
+<tbody><tr><td class="header-asset" colspan="12">Forex</td></tr></tbody>
+<tbody><tr><td class="header-currency" colspan="12">GBP</td></tr></tbody>
+<tbody>
+<tr>
+<td>EUR.GBP</td>
+<td>2019-05-16, 21:41:02</td>
+<td align="right">-3.64</td>
+<td align="right">0.85742</td>
+<td align="right">&nbsp;</td>
+<td align="right">3.12</td>
+<td align="right">0.00</td>
+<td align="right">&nbsp;</td>
+<td align="right">0.00</td>
+<td align="right">&nbsp;</td>
+<td align="right">&nbsp;</td>
+<td align="right">&nbsp;</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<!-- Financial Instrument Information — should contain only stock/future
+     metadata after the parser filter; the Equity and Index Options
+     block in this section must also be dropped. -->
+<div id="tblContractInfoU9999997Body">
+<table>
+<thead>
+<tr>
+<th align="left">Symbol</th>
+<th align="left">Description</th>
+<th align="left">Conid</th>
+<th align="left">Underlying</th>
+<th align="left">Listing Exch</th>
+<th align="left">Multiplier</th>
+<th align="left">Expiry</th>
+<th align="left">Delivery Month</th>
+<th align="left">Code</th>
+</tr>
+</thead>
+<tr><td class="header-asset" colspan="9">Stocks</td></tr>
+<tr>
+<td>TUR</td>
+<td>ISHARES MSCI TURKEY ETF</td>
+<td>123456</td>
+<td>&nbsp;</td>
+<td>NYSEARCA</td>
+<td>&nbsp;</td>
+<td>&nbsp;</td>
+<td>&nbsp;</td>
+<td>&nbsp;</td>
+</tr>
+
+<tr><td class="header-asset" colspan="9">Equity and Index Options</td></tr>
+<tr>
+<td>TUR 17MAY19 22.0 P</td>
+<td>TUR 17MAY19 PUT 22.0</td>
+<td>654321</td>
+<td>TUR</td>
+<td>CBOE</td>
+<td>100</td>
+<td>2019-05-17</td>
+<td>2019-05</td>
+<td>&nbsp;</td>
+</tr>
+</table>
+</div>
+
+</body>
+</html>

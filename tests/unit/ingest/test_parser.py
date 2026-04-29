@@ -102,6 +102,74 @@ def test_parse_title_fallback() -> None:
     assert parsed.instruments == ()
 
 
+def test_parse_skips_equity_and_index_options_trades() -> None:
+    """Rows under "Equity and Index Options" must not become RawTradeRows.
+
+    Stock options are out of scope; ingesting them as stocks would let
+    OCC-formatted symbols (e.g. `TUR 17MAY19 22.0 P`) silently flow into
+    the stocks pipeline. The fixture also carries a Stocks row and a
+    Forex row bracketing the options block — both must survive, which
+    is what proves the filter is a row-level skip rather than a parser
+    abort.
+    """
+    parsed = parse_statement(_load("with_equity_options.htm"))
+    symbols = [row.symbol for row in parsed.trades]
+    assert "TUR 17MAY19 22.0 P" not in symbols
+    # The stock and forex rows on either side of the options block
+    # remain intact.
+    assert "TUR" in symbols
+    assert "EUR.GBP" in symbols
+    # And no row carries the dropped asset class.
+    asset_classes = {row.asset_class for row in parsed.trades}
+    assert "Equity and Index Options" not in asset_classes
+
+
+def test_parse_skips_equity_and_index_options_instruments() -> None:
+    """The Financial Instrument Information section is filtered symmetrically."""
+    parsed = parse_statement(_load("with_equity_options.htm"))
+    info_symbols = [info.symbol for info in parsed.instruments]
+    assert "TUR 17MAY19 22.0 P" not in info_symbols
+    info_classes = {info.asset_class for info in parsed.instruments}
+    assert "Equity and Index Options" not in info_classes
+
+
+def test_parse_skips_options_with_custodian_suffix() -> None:
+    """The legacy custodian-suffixed options header is recognised.
+
+    Older (2017-2018) statements emit the section header as
+    `"Equity and Index Options - Held with Interactive Brokers..."`.
+    `_normalize_asset_class` strips the suffix before the filter
+    lookup, so the row must still be dropped.
+    """
+    legacy_label = (
+        "Equity and Index Options - Held with Interactive Brokers (U.K.) "
+        "Limited carried by Interactive Brokers LLC"
+    )
+    html = f"""<html>
+    <head><title>U5555556 Activity Statement 2018</title></head>
+    <body>
+    <div id="tblAccountInfo_U5555556Body">
+    <table><tr><td>Account</td><td>U5555556</td></tr></table>
+    </div>
+    <div id="tblTransactions_U5555556Body">
+    <table id="summaryDetailTable">
+    <thead><tr>
+    <th>Symbol</th><th>Date/Time</th><th>Quantity</th><th>T. Price</th>
+    <th>C. Price</th><th>Proceeds</th><th>Comm/Fee</th><th>Basis</th>
+    <th>Realized P/L</th><th>Realized P/L %</th><th>MTM P/L</th><th>Code</th>
+    </tr></thead>
+    <tbody><tr><td class="header-asset" colspan="12">{legacy_label}</td></tr></tbody>
+    <tbody><tr><td class="header-currency" colspan="12">USD</td></tr></tbody>
+    <tbody><tr>
+    <td>TUR 17MAY19 22.0 P</td><td>2019-01-03, 10:35:32</td><td>15</td>
+    <td>1.8500</td><td>0</td><td>-2775.00</td><td>-0.51</td>
+    <td>0</td><td>0</td><td>0</td><td>0</td><td>O</td>
+    </tr></tbody>
+    </table></div></body></html>""".encode()
+    parsed = parse_statement(html)
+    assert parsed.trades == ()
+
+
 def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
     """Older (2017-2018) statements prefix the asset class with a custodian
     suffix. The parser should collapse that to the canonical label so the

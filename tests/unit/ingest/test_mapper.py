@@ -402,3 +402,28 @@ def test_unsupported_asset_class_raises() -> None:
     )
     with pytest.raises(MappingError, match="Unsupported asset class"):
         map_rows(_make([row]))
+
+
+def test_equity_options_label_now_raises_mapping_error() -> None:
+    """Defence-in-depth: if the parser filter is ever bypassed and an
+    "Equity and Index Options" row reaches the mapper, it must fail
+    loudly rather than silently classify the option as a stock.
+
+    The parser's `_IGNORED_ASSET_CLASSES` filter is the primary
+    defence (see `tests/unit/ingest/test_parser.py`); this test guards
+    the mapper-level fallback so a future regression cannot
+    re-introduce the silent mis-classification that ingested
+    `TUR 17MAY19 22.0 P` as a stock.
+    """
+    row = RawTradeRow(
+        asset_class="Equity and Index Options",
+        currency="USD",
+        symbol="TUR 17MAY19 22.0 P",
+        datetime_text="2019-01-03, 10:35:32",
+        quantity_text="15",
+        price_text="1.85",
+        fees_text="-0.51",
+        code="O",
+    )
+    with pytest.raises(MappingError, match="Unsupported asset class"):
+        map_rows(_make([row]))

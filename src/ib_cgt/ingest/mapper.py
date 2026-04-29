@@ -77,7 +77,13 @@ class MappingError(ValueError):
 # The asset-class label printed in IB's section header → logical key we
 # branch on. Any label outside this set is currently unsupported; the
 # mapper raises rather than silently dropping rows.
-_STOCK_LABELS: Final[frozenset[str]] = frozenset({"Stocks", "Equity and Index Options"})
+# `"Equity and Index Options"` is *not* listed here: the parser drops
+# rows inside that section before they reach the mapper (see
+# `parser._IGNORED_ASSET_CLASSES`). Excluding the label here is
+# defence-in-depth — if a future parser regression let an option row
+# through, the catch-all `else` below will raise `MappingError`
+# loudly rather than silently treat it as a stock.
+_STOCK_LABELS: Final[frozenset[str]] = frozenset({"Stocks"})
 _BOND_LABELS: Final[frozenset[str]] = frozenset({"Bonds", "Corporate and Municipal Bonds"})
 _FUTURE_LABELS: Final[frozenset[str]] = frozenset({"Futures"})
 _FX_LABELS: Final[frozenset[str]] = frozenset({"Forex"})

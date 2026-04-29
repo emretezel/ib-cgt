@@ -21,6 +21,13 @@ futures/24_25.htm, see `docs/architecture.md` §Component map item 3):
     - `<tr><td class="header-currency">` toggles the current currency.
     - `<tr class="subtotal">` rows are UI-only aggregates and skipped.
     - All other `<tr>` rows inside the outer table are trades.
+    - Sections whose asset-class label is in `_IGNORED_ASSET_CLASSES`
+      (currently `"Equity and Index Options"`) are intentionally
+      dropped here at parse time: stock options are out of scope for
+      this project and the OCC-formatted symbols (`TUR 17MAY19 22.0 P`)
+      would otherwise be silently ingested as stocks. The filter
+      mirrors the equivalent skip in the Financial Instrument
+      Information section.
 * Financial Instrument Information section:
   `<div id="tblContractInfoU…Body">` — maps a symbol (e.g. `6LF5`) to
   its `Multiplier` and `Expiry`. Needed only for futures, but parsed
@@ -128,6 +135,17 @@ _INSTRUMENT_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Expiry": "expiry",
     "Listing Exch": "listing_exch",
 }
+
+# Asset-class section labels we deliberately drop at parse time. Stock
+# options arrive on IB statements under the "Equity and Index Options"
+# header — this project does not handle them, and accepting the rows
+# would let OCC-formatted option symbols
+# (e.g. `"TUR 17MAY19 22.0 P"`) flow into the stocks pipeline. The
+# filter applies to both the Trades section and the Financial
+# Instrument Information section so neither leg of a section can leak
+# through. The label is matched after `_normalize_asset_class` strips
+# the legacy `" - Held with Interactive Brokers..."` custodian suffix.
+_IGNORED_ASSET_CLASSES: Final[frozenset[str]] = frozenset({"Equity and Index Options"})
 
 # Regex to pull `U1234567` out of the `<title>` tag as a fallback account
 # source. IB account codes are always U followed by digits.
@@ -275,6 +293,13 @@ def _parse_one_trades_table(table: Tag) -> list[RawTradeRow]:
             # Orphan row outside an asset-class section — defensive skip.
             continue
 
+        # Skip rows that sit inside an ignored asset-class section
+        # (currently just "Equity and Index Options"). The toggle
+        # already updated `current_asset_class`, so the rows simply
+        # don't get emitted.
+        if current_asset_class in _IGNORED_ASSET_CLASSES:
+            continue
+
         # Pull the columns we care about. Any missing column means this
         # <tr> is not a trade row (e.g. a "Total for" marker without the
         # subtotal class) — skip.
@@ -403,6 +428,12 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
 
         cells = tr.find_all("td")
         if not cells or not current_asset_class:
+            continue
+
+        # Drop instrument-info rows for ignored asset-class sections —
+        # symmetric with the Trades parser so neither side can sneak
+        # an option through.
+        if current_asset_class in _IGNORED_ASSET_CLASSES:
             continue
 
         try:
