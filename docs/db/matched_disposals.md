@@ -14,10 +14,19 @@ The table holds two flavours of basis ("how was the cost computed?")
 discriminated by `basis_kind`:
 
 - `DIRECT` — matched directly against an acquisition trade
-  (same-day or 30-day rule). Populated columns: `acquisition_trade_id`.
+  (same-day, 30-day, or later-acquisition rule). Populated columns:
+  `acquisition_trade_id`.
 - `POOL` — matched against the S.104 pool snapshot at disposal time.
   Populated columns: `pool_quantity_before`, `pool_total_cost_before`,
-  `pool_average_cost`.
+  `pool_average_cost`, `pool_total_fees_before`.
+
+Buy- and sell-side fees are tracked alongside the totals so audit
+reports can render principal vs. fees without re-deriving them from
+the underlying trades. Fee columns are **subset** of the matching
+total: `matched_acquisition_fees_gbp` is the buy-fee portion already
+inside `matched_cost_gbp`, and `matched_disposal_fees_gbp` is the
+sell-fee amount already deducted from `matched_proceeds_gbp`. The
+reported gain remains `matched_proceeds_gbp − matched_cost_gbp`.
 
 ## Columns
 
@@ -30,12 +39,15 @@ discriminated by `basis_kind`:
 | `match_rule` | `TEXT` | No | Domain enum; values are `same_day`, `bed_and_breakfast`, `section_104`, `later_acquisition` (the four UK matching rules — see [`docs/rules.md`](../rules.md)). |
 | `matched_quantity` | `TEXT` | No | Decimal string — size of this matched chunk. |
 | `matched_proceeds_gbp` | `TEXT` | No | Decimal string — proceeds attributed to this chunk, in GBP. |
-| `matched_cost_gbp` | `TEXT` | No | Decimal string — allowable cost attributed to this chunk, in GBP. |
+| `matched_cost_gbp` | `TEXT` | No | Decimal string — allowable cost attributed to this chunk, in GBP. Includes any acquisition fees (subset semantics — see `matched_acquisition_fees_gbp`). |
+| `matched_acquisition_fees_gbp` | `TEXT` | No | Decimal string — buy-side fee component already included in `matched_cost_gbp`. Pro-rated from the originating acquisition (or pool) by the chunk's quantity share. |
+| `matched_disposal_fees_gbp` | `TEXT` | No | Decimal string — sell-side fee component already deducted from `matched_proceeds_gbp`. Pro-rated from the originating disposal by `matched_quantity / disposal.quantity`. |
 | `basis_kind` | `TEXT` | No | Discriminator — `DIRECT` or `POOL`. |
 | `acquisition_trade_id` | `INTEGER` | Yes | Set iff `basis_kind = 'DIRECT'`; the matching acquisition trade's `trades.trade_id`. |
 | `pool_quantity_before` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool size before this disposal. |
 | `pool_total_cost_before` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool total cost (GBP) before this disposal. |
 | `pool_average_cost` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; pool average cost (GBP) at disposal time. |
+| `pool_total_fees_before` | `TEXT` | Yes | Set iff `basis_kind = 'POOL'`; the buy-side fees component of `pool_total_cost_before` (subset). NULL on rows written before migration 007. |
 | `seq` | `INTEGER` | No (PK) | Per-disposal sequence number; preserves the engine's emit order for chunks of the same disposal. |
 
 See [`index.md`](./index.md#encoding-conventions) for decimal, money,

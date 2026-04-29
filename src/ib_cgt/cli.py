@@ -1050,11 +1050,16 @@ def _render_match_stocks(rows: list[_MatchStocksRow], db_path: Path) -> None:
 def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
     """Per-instrument section: bold header then a Rich matched-disposals table.
 
-    Columns: Disp ID, Disp Date, Rule, Qty, Acq ID / Basis, Acq
-    Date, Proceeds (GBP), Cost (GBP), Gain (GBP). The Acq Date
-    column is what makes a short round-trip auditable at a glance —
-    a `LATER_ACQUISITION` row pairs the sell-short Disp Date with
-    the buy-to-cover Acq Date directly.
+    Columns, in display order:
+      Disp ID, Disp Date, Rule, Qty, Acq ID / Basis, Acq Date,
+      Proceeds (GBP), Disp Fees (GBP), Cost (GBP), Acq Fees (GBP),
+      Gain (GBP).
+
+    Each fee column sits next to its parent total — `Disp Fees`
+    pairs with `Proceeds`, `Acq Fees` pairs with `Cost` — so the
+    auditor can read principal vs. fees without scanning across the
+    whole row. Subset semantics: `Disp Fees` is already deducted
+    from `Proceeds`, and `Acq Fees` is already inside `Cost`.
     """
     _console.print("[bold]Stock matched disposals (dry-run)[/]")
     for instrument, result, date_map, error in rows:
@@ -1076,7 +1081,9 @@ def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
         table.add_column("Acq ID / Basis")
         table.add_column("Acq Date")
         table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Disp Fees (GBP)", justify="right")
         table.add_column("Cost (GBP)", justify="right")
+        table.add_column("Acq Fees (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
         for md in result.matched_disposals:
             table.add_row(*_matched_disposal_to_cells(md, date_map))
@@ -1202,7 +1209,7 @@ def _stock_divider(instrument: StockInstrument) -> str:
 
 
 def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -> tuple[str, ...]:
-    """Project a `MatchedDisposal` into the 9 columns of the disposals table.
+    """Project a `MatchedDisposal` into the 11 columns of the disposals table.
 
     `Acq ID / Basis` and `Acq Date` are basis-aware:
     - `DirectAcquisition` (SAME_DAY / BED_AND_BREAKFAST /
@@ -1211,6 +1218,12 @@ def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -
     - `TaxLotSnapshot` (SECTION_104) → `S.104 pool: qty=Q, avg=£X`
       and an em-dash for the date (the pool has no single
       acquisition date).
+
+    The two fee columns (`Disp Fees`, `Acq Fees`) are rendered
+    without colour styling — fees are always non-negative, so a
+    sign-based colour cue would be noise. They sit next to their
+    parent totals in the column ordering set by
+    `_render_match_stocks_disposals`.
     """
     proceeds = md.matched_proceeds_gbp
     proceeds_style = "green" if proceeds.amount >= 0 else "red"
@@ -1225,7 +1238,9 @@ def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -
         basis_text,
         acq_date_text,
         f"[{proceeds_style}]{_format_money_2dp(proceeds)}[/]",
+        _format_money_2dp(md.matched_disposal_fees_gbp),
         _format_money_2dp(md.matched_cost_gbp),
+        _format_money_2dp(md.matched_acquisition_fees_gbp),
         f"[{gain_style}]{_format_money_2dp(gain)}[/]",
     )
 

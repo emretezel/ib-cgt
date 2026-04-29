@@ -640,3 +640,151 @@ def test_truly_unmatched_short_still_errors() -> None:
         )
     assert exc_info.value.disposal_trade_id == 1
     assert exc_info.value.unmatched_quantity == Decimal("10")
+
+
+# ---------------------------------------------------------------------------
+# Fee passthrough — buy-side and sell-side fees are tracked separately
+# ---------------------------------------------------------------------------
+
+
+def test_same_day_passes_fees_through() -> None:
+    """Direct match propagates buy + sell fees onto the chunk."""
+    engine = MatchingEngine()
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[
+            acq(trade_id=1, on=date(2024, 5, 1), qty=10, cost_gbp=1010, fees_gbp=10),
+        ],
+        disposals=[
+            disp(trade_id=2, on=date(2024, 5, 1), qty=10, proceeds_gbp=1495, fees_gbp=5),
+        ],
+    )
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.matched_acquisition_fees_gbp == Money.gbp("10")
+    assert md.matched_disposal_fees_gbp == Money.gbp("5")
+    # cost / proceeds totals unchanged (subset semantics).
+    assert md.matched_cost_gbp == Money.gbp("1010")
+    assert md.matched_proceeds_gbp == Money.gbp("1495")
+
+
+def test_same_day_pro_rates_fees_on_partial_consume() -> None:
+    """Smaller disposal vs. lot: fees pro-rated by matched_quantity / lot_qty."""
+    engine = MatchingEngine()
+    # Acq: 100 units, £20 fees, total cost £1020.
+    # Disposal: 40 units sold (pro-rata fee share = 40/100 * 20 = £8).
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[
+            acq(trade_id=1, on=date(2024, 5, 1), qty=100, cost_gbp=1020, fees_gbp=20),
+        ],
+        disposals=[
+            disp(trade_id=2, on=date(2024, 5, 1), qty=40, proceeds_gbp=596, fees_gbp=4),
+        ],
+    )
+    md = result.matched_disposals[0]
+    assert md.matched_acquisition_fees_gbp == Money.gbp("8")
+    assert md.matched_disposal_fees_gbp == Money.gbp("4")  # full disposal consumed
+    # Residual lot keeps the other £12 of buy-side fees.
+    assert len(result.unmatched_acquisitions) == 1
+    # `UnmatchedAcquisition.cost_remaining_gbp` includes residual fees
+    # (subset semantics) — 1020 - 408 (cost share) = 612.
+    assert result.unmatched_acquisitions[0].cost_remaining_gbp == Money.gbp("612")
+
+
+def test_section_104_aggregates_pool_fees_in_snapshot() -> None:
+    """S.104 snapshot carries the pool's accumulated buy-side fees."""
+    engine = MatchingEngine()
+    # Two pool buys with different fee amounts — pool total fees = 30.
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[
+            acq(trade_id=1, on=date(2024, 1, 1), qty=100, cost_gbp=1010, fees_gbp=10),
+            acq(trade_id=2, on=date(2024, 1, 15), qty=100, cost_gbp=2020, fees_gbp=20),
+        ],
+        disposals=[
+            disp(trade_id=10, on=date(2024, 6, 1), qty=50, proceeds_gbp=895, fees_gbp=5),
+        ],
+    )
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SECTION_104
+    snap = md.basis
+    assert isinstance(snap, TaxLotSnapshot)
+    # Pool fees rolled up into the snapshot.
+    assert snap.total_fees_gbp_before == Money.gbp("30")
+    # Chunk takes 50/200 = 25% of the pool's fees: 7.50.
+    assert md.matched_acquisition_fees_gbp == Money.gbp("7.5")
+    # Whole disposal consumed in one chunk → carries full sell fees.
+    assert md.matched_disposal_fees_gbp == Money.gbp("5")
+
+
+def test_section_104_pro_rates_fees_across_lots() -> None:
+    """Pool draw drains each lot's fees pro-rata, like cost — invariant preserved."""
+    engine = MatchingEngine()
+    # Two lots with different fee structures.
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[
+            acq(trade_id=1, on=date(2024, 1, 1), qty=100, cost_gbp=1010, fees_gbp=10),
+            acq(trade_id=2, on=date(2024, 1, 15), qty=100, cost_gbp=2020, fees_gbp=20),
+        ],
+        disposals=[
+            disp(trade_id=10, on=date(2024, 6, 1), qty=50, proceeds_gbp=900),
+        ],
+    )
+    # Pro-rata: 50/200 = 25% of each lot drawn.
+    # Lot 1: fees 10 - 2.5 = 7.5 remaining; cost 1010 - 252.5 = 757.5.
+    # Lot 2: fees 20 - 5 = 15 remaining; cost 2020 - 505 = 1515.
+    by_id = {ua.trade_id: ua for ua in result.unmatched_acquisitions}
+    assert by_id[1].cost_remaining_gbp == Money.gbp("757.5")
+    assert by_id[2].cost_remaining_gbp == Money.gbp("1515")
+    # final_pool aggregate matches the residual sum (fees subset of cost).
+    assert result.final_pool.total_cost_gbp == Money.gbp("2272.5")
+
+
+def test_later_acquisition_passes_fees_through() -> None:
+    """Pass 4 (s.105(2)) carries the late buy's fees onto the matched chunk."""
+    engine = MatchingEngine()
+    sell_date = date(2024, 5, 1)
+    buy_date = sell_date + timedelta(days=60)
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[acq(trade_id=2, on=buy_date, qty=10, cost_gbp=1107, fees_gbp=7)],
+        disposals=[disp(trade_id=1, on=sell_date, qty=10, proceeds_gbp=998, fees_gbp=2)],
+    )
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.LATER_ACQUISITION
+    assert md.matched_acquisition_fees_gbp == Money.gbp("7")
+    assert md.matched_disposal_fees_gbp == Money.gbp("2")
+
+
+def test_split_disposal_distributes_disposal_fees_across_chunks() -> None:
+    """Disposal fees are pro-rated by `matched_quantity / disposal.quantity` per chunk."""
+    engine = MatchingEngine()
+    d_disp = date(2024, 5, 10)
+    pool_acq = acq(trade_id=1, on=date(2024, 1, 1), qty=50, cost_gbp=505, fees_gbp=5)
+    same_day_acq = acq(trade_id=2, on=d_disp, qty=20, cost_gbp=402, fees_gbp=2)
+    # Disposal: 70 units, total sell fees £14 (£0.20/unit).
+    sell = disp(trade_id=10, on=d_disp, qty=70, proceeds_gbp=1386, fees_gbp=14)
+
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[pool_acq, same_day_acq],
+        disposals=[sell],
+    )
+    sd, s104 = result.matched_disposals
+    # Same-day chunk takes 20 units → 20/70 of £14 = £4.
+    assert sd.matched_quantity == Decimal("20")
+    assert sd.matched_disposal_fees_gbp == Money.gbp("4")
+    assert sd.matched_acquisition_fees_gbp == Money.gbp("2")
+    # S.104 chunk takes the remaining 50 units → 50/70 of £14 = £10.
+    assert s104.matched_quantity == Decimal("50")
+    assert s104.matched_disposal_fees_gbp == Money.gbp("10")
+    # Pool fees (5) fully consumed since pool drained to zero.
+    assert s104.matched_acquisition_fees_gbp == Money.gbp("5")
+    # Total disposal fees reconcile to the original.
+    total_disp_fees = sum(
+        (m.matched_disposal_fees_gbp for m in result.matched_disposals[1:]),
+        start=result.matched_disposals[0].matched_disposal_fees_gbp,
+    )
+    assert total_disp_fees == Money.gbp("14")

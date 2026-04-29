@@ -28,7 +28,7 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from typing import Literal
@@ -57,6 +57,13 @@ class Acquisition:
         quantity: The number of units acquired (strictly positive).
         cost_gbp: Total cost in GBP, i.e. (price * quantity + fees) after
             FX conversion at the transaction-date spot rate.
+        fees_gbp: The buy-side fees component of `cost_gbp`, in GBP, at
+            the same trade-date spot rate. **Subset semantics**:
+            `fees_gbp` is *included in* `cost_gbp` (it is not added on
+            top). Surfaced as a separate fact so audit reports can show
+            principal vs. fees without re-deriving them from the raw
+            trade. Defaults to zero so non-fee-aware test fixtures
+            continue to construct the type without changes.
     """
 
     trade_id: int
@@ -65,6 +72,7 @@ class Acquisition:
     acquisition_date: date
     quantity: Decimal
     cost_gbp: Money
+    fees_gbp: Money = field(default_factory=lambda: Money.gbp(Decimal(0)))
 
     def __post_init__(self) -> None:
         """Enforce positivity and GBP denomination."""
@@ -72,6 +80,12 @@ class Acquisition:
             raise ValueError(f"Acquisition.quantity must be > 0, got {self.quantity}")
         if not self.cost_gbp.is_gbp():
             raise ValueError(f"Acquisition.cost_gbp must be GBP, got {self.cost_gbp.currency}")
+        # Fees: same-currency invariant + non-negative. Fees are an
+        # incidental cost of acquisition; they cannot be a rebate.
+        if not self.fees_gbp.is_gbp():
+            raise ValueError(f"Acquisition.fees_gbp must be GBP, got {self.fees_gbp.currency}")
+        if self.fees_gbp.amount < 0:
+            raise ValueError(f"Acquisition.fees_gbp must be >= 0, got {self.fees_gbp.amount}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -87,6 +101,12 @@ class Disposal:
         quantity: The number of units being disposed.
         proceeds_gbp: Total proceeds in GBP after FX conversion, net of
             fees (cost-of-disposal reduces proceeds per CGT rules).
+        fees_gbp: The sell-side fees that have already been deducted
+            from `proceeds_gbp`, in GBP, at the trade-date spot rate.
+            Surfaced as a separate fact so audit reports can show
+            gross proceeds vs. fees alongside the net `proceeds_gbp`.
+            Defaults to zero so non-fee-aware test fixtures continue
+            to construct the type without changes.
     """
 
     trade_id: int
@@ -95,6 +115,7 @@ class Disposal:
     disposal_date: date
     quantity: Decimal
     proceeds_gbp: Money
+    fees_gbp: Money = field(default_factory=lambda: Money.gbp(Decimal(0)))
 
     def __post_init__(self) -> None:
         """Enforce positivity and GBP denomination."""
@@ -102,6 +123,12 @@ class Disposal:
             raise ValueError(f"Disposal.quantity must be > 0, got {self.quantity}")
         if not self.proceeds_gbp.is_gbp():
             raise ValueError(f"Disposal.proceeds_gbp must be GBP, got {self.proceeds_gbp.currency}")
+        # Fees: same-currency invariant + non-negative. Fees are an
+        # incidental cost of disposal; they cannot be a rebate.
+        if not self.fees_gbp.is_gbp():
+            raise ValueError(f"Disposal.fees_gbp must be GBP, got {self.fees_gbp.currency}")
+        if self.fees_gbp.amount < 0:
+            raise ValueError(f"Disposal.fees_gbp must be >= 0, got {self.fees_gbp.amount}")
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +161,17 @@ class TaxLotSnapshot:
         total_cost_gbp_before: Total pooled cost in GBP before the draw.
         average_cost_gbp: Pre-draw weighted-average cost per unit
             (`total_cost_gbp_before / quantity_before`).
+        total_fees_gbp_before: The buy-side fees component of
+            `total_cost_gbp_before`. Subset semantics — already included
+            in the cost figure. Lets an audit row show how much of the
+            pool's average cost is principal vs. fees. Defaults to zero
+            so callers unaware of fees keep working.
     """
 
     quantity_before: Decimal
     total_cost_gbp_before: Money
     average_cost_gbp: Money
+    total_fees_gbp_before: Money = field(default_factory=lambda: Money.gbp(Decimal(0)))
 
     def __post_init__(self) -> None:
         """Enforce GBP denomination and a non-empty pre-draw pool."""
@@ -150,6 +183,13 @@ class TaxLotSnapshot:
             raise ValueError("TaxLotSnapshot.total_cost_gbp_before must be GBP")
         if not self.average_cost_gbp.is_gbp():
             raise ValueError("TaxLotSnapshot.average_cost_gbp must be GBP")
+        if not self.total_fees_gbp_before.is_gbp():
+            raise ValueError("TaxLotSnapshot.total_fees_gbp_before must be GBP")
+        if self.total_fees_gbp_before.amount < 0:
+            raise ValueError(
+                f"TaxLotSnapshot.total_fees_gbp_before must be >= 0, "
+                f"got {self.total_fees_gbp_before.amount}"
+            )
 
 
 # A match is always backed by exactly one of these two shapes — hence the
@@ -180,6 +220,20 @@ class MatchedDisposal:
             disposal's total quantity).
         matched_proceeds_gbp: Proportional GBP proceeds for this chunk.
         matched_cost_gbp: GBP cost allocated against this chunk.
+        matched_acquisition_fees_gbp: The buy-side fees component
+            included in `matched_cost_gbp` for this chunk. Subset
+            semantics — already counted inside `matched_cost_gbp`.
+            For SAME_DAY / BED_AND_BREAKFAST / LATER_ACQUISITION this
+            is the lot's fees pro-rated by `matched_quantity /
+            lot.quantity_at_consume`; for SECTION_104 it is the
+            chunk's pro-rata share of the pool's accumulated buy fees
+            at draw time. Defaults to zero.
+        matched_disposal_fees_gbp: The pro-rated share of the
+            originating disposal's sell fees attributable to this
+            chunk (`matched_quantity / disposal.quantity *
+            disposal.fees_gbp`). Already deducted from
+            `matched_proceeds_gbp` upstream; surfaced separately for
+            audit. Defaults to zero.
         basis: The evidence for *why* `matched_cost_gbp` is what it is.
             A `DirectAcquisition` for SAME_DAY / BED_AND_BREAKFAST; a
             `TaxLotSnapshot` for SECTION_104.
@@ -193,6 +247,8 @@ class MatchedDisposal:
     matched_proceeds_gbp: Money
     matched_cost_gbp: Money
     basis: MatchBasis
+    matched_acquisition_fees_gbp: Money = field(default_factory=lambda: Money.gbp(Decimal(0)))
+    matched_disposal_fees_gbp: Money = field(default_factory=lambda: Money.gbp(Decimal(0)))
 
     def __post_init__(self) -> None:
         """Enforce GBP, positivity, and basis↔rule compatibility."""
@@ -204,6 +260,22 @@ class MatchedDisposal:
             raise ValueError("MatchedDisposal.matched_proceeds_gbp must be GBP")
         if not self.matched_cost_gbp.is_gbp():
             raise ValueError("MatchedDisposal.matched_cost_gbp must be GBP")
+        # Fee subsets: same-currency + non-negative. Fees are
+        # incidental costs and can never be rebates.
+        if not self.matched_acquisition_fees_gbp.is_gbp():
+            raise ValueError("MatchedDisposal.matched_acquisition_fees_gbp must be GBP")
+        if self.matched_acquisition_fees_gbp.amount < 0:
+            raise ValueError(
+                f"MatchedDisposal.matched_acquisition_fees_gbp must be >= 0, "
+                f"got {self.matched_acquisition_fees_gbp.amount}"
+            )
+        if not self.matched_disposal_fees_gbp.is_gbp():
+            raise ValueError("MatchedDisposal.matched_disposal_fees_gbp must be GBP")
+        if self.matched_disposal_fees_gbp.amount < 0:
+            raise ValueError(
+                f"MatchedDisposal.matched_disposal_fees_gbp must be >= 0, "
+                f"got {self.matched_disposal_fees_gbp.amount}"
+            )
         self._check_basis_matches_rule()
 
     def _check_basis_matches_rule(self) -> None:

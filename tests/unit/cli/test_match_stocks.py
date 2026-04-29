@@ -275,22 +275,39 @@ def test_match_stocks_rejects_invalid_since(runner: CliRunner, populated_db: Pat
 def test_match_stocks_renders_match_columns(
     runner: CliRunner, populated_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The matched-disposals columns and ISF same-day figures appear."""
+    """The matched-disposals columns and ISF same-day figures appear.
+
+    Also covers the paired fee columns (`Disp Fees`, `Acq Fees`) and
+    their values for the ISF same-day round-trip.
+    """
     monkeypatch.setenv("COLUMNS", "260")
     result = runner.invoke(app, ["match", "stocks", "-s", "ISF"])
     assert result.exit_code == 0, result.stdout
 
-    # Column headers from `_render_match_stocks_disposals`.
+    # Column headers from `_render_match_stocks_disposals`. Fee
+    # columns sit next to their parent totals.
     assert "Disp Date" in result.stdout
     assert "Acq Date" in result.stdout
     assert "Proceeds (GBP)" in result.stdout
+    assert "Disp Fees (GBP)" in result.stdout
+    assert "Cost (GBP)" in result.stdout
+    assert "Acq Fees (GBP)" in result.stdout
     assert "Gain (GBP)" in result.stdout
 
     # ISF is GBP, identity FX. Same-day round-trip:
-    # cost = 10*100 + 2 = 1002. proceeds = 10*120 - 3 = 1197. gain = 195.
+    # cost = 10*100 + 2 = 1002 (incl. £2 buy fee).
+    # proceeds = 10*120 - 3 = 1197 (after £3 sell fee).
+    # gain = 195. Acq Fees = £2.00; Disp Fees = £3.00.
     assert "1,002.00" in result.stdout
     assert "1,197.00" in result.stdout
     assert "195.00" in result.stdout
+    # Fee values rendered as 2dp money. The values 2.00 / 3.00 are
+    # narrow enough to false-positive on other figures, so anchor
+    # via the column header order: the row should contain the fee
+    # values *after* the proceeds and cost totals already asserted
+    # above. Splitting on multiple spaces gets us the row layout.
+    assert "2.00" in result.stdout
+    assert "3.00" in result.stdout
     # Rule label.
     assert "same_day" in result.stdout
 

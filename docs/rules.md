@@ -242,8 +242,27 @@ whether the running balance is long or short.
 | `SELL` | `proceeds_native = price * qty - fees` | `Disposal`    | `disposal_date = trade.trade_date`    |
 
 Both legs of a single trade settle on the same date, so a single
-`FXConverter.convert_with_rate(..., on=trade.trade_date)` call
-covers each trade.
+trade-date FX rate covers the whole trade.
+
+### Fee tracking
+
+Fees are carried through the pipeline as a **separate fact**
+alongside cost and proceeds, with **subset semantics**:
+
+- `Acquisition.fees_gbp` is the buy-side fee component already
+  inside `Acquisition.cost_gbp` (`cost_gbp = price * qty + fees`,
+  all in GBP at the trade-date spot rate).
+- `Disposal.fees_gbp` is the sell-side fee amount already deducted
+  from `Disposal.proceeds_gbp` (`proceeds_gbp = price * qty − fees`).
+
+The matching engine drains each lot's `fees_remaining` in lockstep
+with `cost_remaining` so that `MatchedDisposal` carries
+`matched_acquisition_fees_gbp` and `matched_disposal_fees_gbp` for
+every chunk. For S.104 chunks the pool's accumulated buy-side fees
+also appear on the basis snapshot
+(`TaxLotSnapshot.total_fees_gbp_before`). The reported gain is
+unchanged — fees have always been part of allowable cost / disposal
+cost — the split is purely for audit clarity.
 
 ### Cross-account history
 

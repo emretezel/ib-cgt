@@ -134,11 +134,17 @@ class MatchingResult:
 class _Lot:
     """Mutable per-acquisition state during matching.
 
-    The matching engine drains `quantity_remaining` and
-    `cost_remaining_amount` as same-day, 30-day, and S.104 matches
-    consume the lot. Storing the cost as a bare `Decimal` rather than
-    a `Money` avoids hot-path object allocation; we re-wrap to GBP
-    only when emitting domain records.
+    The matching engine drains `quantity_remaining`,
+    `cost_remaining_amount`, and `fees_remaining_amount` as same-day,
+    30-day, and S.104 matches consume the lot. Storing the figures as
+    bare `Decimal`s rather than `Money` avoids hot-path object
+    allocation; we re-wrap to GBP only when emitting domain records.
+
+    `fees_remaining_amount` is the buy-side fees component still
+    attributed to this lot — it lives **inside** `cost_remaining_amount`
+    (subset semantics) and drains in lockstep so that lot-local
+    cost-per-unit and fees-per-unit are both preserved during pro-
+    rata pool draws.
     """
 
     trade_id: int
@@ -146,15 +152,24 @@ class _Lot:
     acquisition_date: date
     quantity_remaining: Decimal
     cost_remaining_amount: Decimal
+    fees_remaining_amount: Decimal
 
 
 @dataclass(slots=True)
 class _DispState:
-    """Mutable per-disposal state — original total + drained residual."""
+    """Mutable per-disposal state — original total + drained residual.
+
+    `disposal_fees_per_unit` is computed once at build time and reused
+    as each chunk is matched, mirroring `proceeds_per_unit`. Pro-rata
+    allocation of disposal fees per chunk is `qty *
+    disposal_fees_per_unit`, so total matched disposal fees equals
+    the original `disposal.fees_gbp.amount`.
+    """
 
     disposal: Disposal
     quantity_remaining: Decimal
     proceeds_per_unit: Decimal
+    disposal_fees_per_unit: Decimal
 
 
 @dataclass(slots=True)
@@ -171,6 +186,8 @@ class _Match:
     matched_quantity: Decimal
     matched_proceeds_amount: Decimal
     matched_cost_amount: Decimal
+    matched_acquisition_fees_amount: Decimal  # subset of matched_cost_amount
+    matched_disposal_fees_amount: Decimal  # already netted from matched_proceeds_amount
     basis_acquisition_id: int | None  # set for SAME_DAY / BED_AND_BREAKFAST
     basis_snapshot: TaxLotSnapshot | None  # set for SECTION_104
     # Stable sub-key so two matches under the same rule for the same
@@ -301,6 +318,10 @@ class MatchingEngine:
                 acquisition_date=a.acquisition_date,
                 quantity_remaining=a.quantity,
                 cost_remaining_amount=a.cost_gbp.amount,
+                # Fees are a subset of cost; they drain in lockstep
+                # during pool draws so that fees-per-unit is preserved
+                # alongside cost-per-unit.
+                fees_remaining_amount=a.fees_gbp.amount,
             )
             for a in acquisitions
         ]
@@ -323,11 +344,17 @@ class MatchingEngine:
             # proceeds is `qty * proceeds_per_unit`, so total matched
             # proceeds equals the original disposal proceeds.
             proceeds_per_unit = d.proceeds_gbp.amount / d.quantity
+            # Same trick for the disposal fee component — the chunked
+            # share of `disposal.fees_gbp` is just `qty * fees_per_unit`,
+            # which keeps the per-chunk arithmetic in step with the
+            # proceeds computation.
+            disposal_fees_per_unit = d.fees_gbp.amount / d.quantity
             state.append(
                 _DispState(
                     disposal=d,
                     quantity_remaining=d.quantity,
                     proceeds_per_unit=proceeds_per_unit,
+                    disposal_fees_per_unit=disposal_fees_per_unit,
                 )
             )
         return state
@@ -452,6 +479,10 @@ class MatchingEngine:
             ]
             pool_qty = sum((lot.quantity_remaining for lot in pool_lots), start=Decimal(0))
             pool_cost = sum((lot.cost_remaining_amount for lot in pool_lots), start=Decimal(0))
+            # Pool buy-side fees roll up the same way as pool cost; the
+            # snapshot carries this so an audit row can show how much
+            # of the average cost is principal vs. fees.
+            pool_fees = sum((lot.fees_remaining_amount for lot in pool_lots), start=Decimal(0))
 
             if pool_qty <= 0:
                 # No pool to draw from — fall through to Pass 4.
@@ -463,11 +494,16 @@ class MatchingEngine:
             drawn_qty = min(ds.quantity_remaining, pool_qty)
             average_cost = pool_cost / pool_qty
             cost_drawn = average_cost * drawn_qty
+            # Chunk's fee share scales by the same draw ratio — keeps
+            # `Σ matched_acquisition_fees == buy-side fees consumed`.
+            ratio = drawn_qty / pool_qty
+            fees_drawn = pool_fees * ratio
 
             snapshot = TaxLotSnapshot(
                 quantity_before=pool_qty,
                 total_cost_gbp_before=Money.gbp(pool_cost),
                 average_cost_gbp=Money.gbp(average_cost),
+                total_fees_gbp_before=Money.gbp(pool_fees),
             )
 
             emit_counter[0] += 1
@@ -478,6 +514,8 @@ class MatchingEngine:
                     matched_quantity=drawn_qty,
                     matched_proceeds_amount=ds.proceeds_per_unit * drawn_qty,
                     matched_cost_amount=cost_drawn,
+                    matched_acquisition_fees_amount=fees_drawn,
+                    matched_disposal_fees_amount=ds.disposal_fees_per_unit * drawn_qty,
                     basis_acquisition_id=None,
                     basis_snapshot=snapshot,
                     emit_seq=emit_counter[0],
@@ -485,15 +523,16 @@ class MatchingEngine:
             )
 
             # Pro-rata attribution: every pool lot loses the same
-            # fraction of its quantity and cost. Preserves lot-local
-            # cost-per-unit and keeps the residual sum equal to the
-            # post-draw pool aggregate.
-            ratio = drawn_qty / pool_qty
+            # fraction of its quantity, cost, and fees. Preserves lot-
+            # local cost-per-unit and fees-per-unit and keeps the
+            # residual sums equal to the post-draw pool aggregate.
             for lot in pool_lots:
                 qty_lost = lot.quantity_remaining * ratio
                 cost_lost = lot.cost_remaining_amount * ratio
+                fees_lost = lot.fees_remaining_amount * ratio
                 lot.quantity_remaining -= qty_lost
                 lot.cost_remaining_amount -= cost_lost
+                lot.fees_remaining_amount -= fees_lost
 
             ds.quantity_remaining -= drawn_qty
 
@@ -590,6 +629,14 @@ class MatchingEngine:
         qty = min(ds.quantity_remaining, lot.quantity_remaining)
         cost_per_unit = lot.cost_remaining_amount / lot.quantity_remaining
         cost = cost_per_unit * qty
+        # Buy-side fees ride alongside cost — same per-unit treatment.
+        # Subset semantics: `acq_fees` is already part of `cost`.
+        fees_per_unit = lot.fees_remaining_amount / lot.quantity_remaining
+        acq_fees = fees_per_unit * qty
+        # Disposal-side fees are pro-rated from the originating
+        # disposal at chunk time; already netted out of
+        # `matched_proceeds_amount` upstream.
+        disp_fees = ds.disposal_fees_per_unit * qty
 
         emit_counter[0] += 1
         pending.append(
@@ -599,6 +646,8 @@ class MatchingEngine:
                 matched_quantity=qty,
                 matched_proceeds_amount=ds.proceeds_per_unit * qty,
                 matched_cost_amount=cost,
+                matched_acquisition_fees_amount=acq_fees,
+                matched_disposal_fees_amount=disp_fees,
                 basis_acquisition_id=lot.trade_id,
                 basis_snapshot=None,
                 emit_seq=emit_counter[0],
@@ -607,6 +656,7 @@ class MatchingEngine:
 
         lot.quantity_remaining -= qty
         lot.cost_remaining_amount -= cost
+        lot.fees_remaining_amount -= acq_fees
         ds.quantity_remaining -= qty
 
     # ------------------------------------------------------------------
@@ -634,6 +684,8 @@ class MatchingEngine:
             matched_quantity=m.matched_quantity,
             matched_proceeds_gbp=Money.gbp(m.matched_proceeds_amount),
             matched_cost_gbp=Money.gbp(m.matched_cost_amount),
+            matched_acquisition_fees_gbp=Money.gbp(m.matched_acquisition_fees_amount),
+            matched_disposal_fees_gbp=Money.gbp(m.matched_disposal_fees_amount),
             basis=basis,
         )
 

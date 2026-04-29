@@ -103,6 +103,112 @@ def test_disposal_rejects_non_gbp_proceeds() -> None:
         )
 
 
+def test_acquisition_fees_default_zero() -> None:
+    """`fees_gbp` is omitted ⇒ defaults to zero GBP for non-fee-aware fixtures."""
+    a = Acquisition(
+        trade_id=1,
+        account_id="U1",
+        instrument=_aapl(),
+        acquisition_date=date(2024, 5, 1),
+        quantity=Decimal("10"),
+        cost_gbp=Money.gbp("1000"),
+    )
+    assert a.fees_gbp == Money.gbp("0")
+
+
+def test_acquisition_carries_explicit_fees() -> None:
+    """`fees_gbp` round-trips when set, with subset semantics on `cost_gbp`."""
+    a = Acquisition(
+        trade_id=1,
+        account_id="U1",
+        instrument=_aapl(),
+        acquisition_date=date(2024, 5, 1),
+        quantity=Decimal("10"),
+        cost_gbp=Money.gbp("1010"),
+        fees_gbp=Money.gbp("10"),
+    )
+    assert a.fees_gbp == Money.gbp("10")
+    # Subset semantics: cost includes fees, not added on top.
+    assert a.cost_gbp == Money.gbp("1010")
+
+
+def test_acquisition_rejects_non_gbp_fees() -> None:
+    with pytest.raises(ValueError, match="fees_gbp"):
+        Acquisition(
+            trade_id=1,
+            account_id="U1",
+            instrument=_aapl(),
+            acquisition_date=date(2024, 5, 1),
+            quantity=Decimal("10"),
+            cost_gbp=Money.gbp("1000"),
+            fees_gbp=Money.of("10", "USD"),
+        )
+
+
+def test_acquisition_rejects_negative_fees() -> None:
+    with pytest.raises(ValueError, match="fees_gbp"):
+        Acquisition(
+            trade_id=1,
+            account_id="U1",
+            instrument=_aapl(),
+            acquisition_date=date(2024, 5, 1),
+            quantity=Decimal("10"),
+            cost_gbp=Money.gbp("1000"),
+            fees_gbp=Money.gbp("-1"),
+        )
+
+
+def test_disposal_fees_default_zero() -> None:
+    d = Disposal(
+        trade_id=2,
+        account_id="U1",
+        instrument=_aapl(),
+        disposal_date=date(2024, 9, 1),
+        quantity=Decimal("5"),
+        proceeds_gbp=Money.gbp("750"),
+    )
+    assert d.fees_gbp == Money.gbp("0")
+
+
+def test_disposal_carries_explicit_fees() -> None:
+    d = Disposal(
+        trade_id=2,
+        account_id="U1",
+        instrument=_aapl(),
+        disposal_date=date(2024, 9, 1),
+        quantity=Decimal("5"),
+        proceeds_gbp=Money.gbp("740"),
+        fees_gbp=Money.gbp("10"),
+    )
+    assert d.fees_gbp == Money.gbp("10")
+
+
+def test_disposal_rejects_non_gbp_fees() -> None:
+    with pytest.raises(ValueError, match="fees_gbp"):
+        Disposal(
+            trade_id=2,
+            account_id="U1",
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            quantity=Decimal("5"),
+            proceeds_gbp=Money.gbp("750"),
+            fees_gbp=Money.of("10", "USD"),
+        )
+
+
+def test_disposal_rejects_negative_fees() -> None:
+    with pytest.raises(ValueError, match="fees_gbp"):
+        Disposal(
+            trade_id=2,
+            account_id="U1",
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            quantity=Decimal("5"),
+            proceeds_gbp=Money.gbp("750"),
+            fees_gbp=Money.gbp("-1"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # TaxLotSnapshot
 # ---------------------------------------------------------------------------
@@ -123,6 +229,45 @@ def test_tax_lot_snapshot_rejects_empty_pool() -> None:
             quantity_before=Decimal("0"),
             total_cost_gbp_before=Money.gbp("0"),
             average_cost_gbp=Money.gbp("0"),
+        )
+
+
+def test_tax_lot_snapshot_fees_default_zero() -> None:
+    snap = TaxLotSnapshot(
+        quantity_before=Decimal("100"),
+        total_cost_gbp_before=Money.gbp("1000"),
+        average_cost_gbp=Money.gbp("10"),
+    )
+    assert snap.total_fees_gbp_before == Money.gbp("0")
+
+
+def test_tax_lot_snapshot_carries_explicit_fees() -> None:
+    snap = TaxLotSnapshot(
+        quantity_before=Decimal("100"),
+        total_cost_gbp_before=Money.gbp("1000"),
+        average_cost_gbp=Money.gbp("10"),
+        total_fees_gbp_before=Money.gbp("12.34"),
+    )
+    assert snap.total_fees_gbp_before == Money.gbp("12.34")
+
+
+def test_tax_lot_snapshot_rejects_negative_fees() -> None:
+    with pytest.raises(ValueError, match="total_fees_gbp_before"):
+        TaxLotSnapshot(
+            quantity_before=Decimal("100"),
+            total_cost_gbp_before=Money.gbp("1000"),
+            average_cost_gbp=Money.gbp("10"),
+            total_fees_gbp_before=Money.gbp("-1"),
+        )
+
+
+def test_tax_lot_snapshot_rejects_non_gbp_fees() -> None:
+    with pytest.raises(ValueError, match="total_fees_gbp_before"):
+        TaxLotSnapshot(
+            quantity_before=Decimal("100"),
+            total_cost_gbp_before=Money.gbp("1000"),
+            average_cost_gbp=Money.gbp("10"),
+            total_fees_gbp_before=Money.of("12.34", "USD"),
         )
 
 
@@ -241,6 +386,104 @@ def test_later_acquisition_rejects_snapshot_basis() -> None:
             matched_proceeds_gbp=Money.gbp("400"),
             matched_cost_gbp=Money.gbp("500"),
             basis=_snapshot_basis(),  # wrong — pool snapshot for direct rule
+        )
+
+
+def test_matched_disposal_fees_default_zero() -> None:
+    """Fee fields default to zero when not specified — gain unaffected."""
+    md = MatchedDisposal(
+        disposal_trade_id=2,
+        instrument=_aapl(),
+        disposal_date=date(2024, 9, 1),
+        match_rule=MatchRule.SAME_DAY,
+        matched_quantity=Decimal("5"),
+        matched_proceeds_gbp=Money.gbp("750"),
+        matched_cost_gbp=Money.gbp("500"),
+        basis=_direct_basis(),
+    )
+    assert md.matched_acquisition_fees_gbp == Money.gbp("0")
+    assert md.matched_disposal_fees_gbp == Money.gbp("0")
+    # Subset semantics: fees do not enter the gain formula directly —
+    # they are already inside cost / already deducted from proceeds.
+    assert md.gain_gbp == Money.gbp("250")
+
+
+def test_matched_disposal_carries_fees() -> None:
+    md = MatchedDisposal(
+        disposal_trade_id=2,
+        instrument=_aapl(),
+        disposal_date=date(2024, 9, 1),
+        match_rule=MatchRule.SAME_DAY,
+        matched_quantity=Decimal("5"),
+        matched_proceeds_gbp=Money.gbp("740"),
+        matched_cost_gbp=Money.gbp("510"),
+        basis=_direct_basis(),
+        matched_acquisition_fees_gbp=Money.gbp("10"),
+        matched_disposal_fees_gbp=Money.gbp("10"),
+    )
+    assert md.matched_acquisition_fees_gbp == Money.gbp("10")
+    assert md.matched_disposal_fees_gbp == Money.gbp("10")
+    # Gain still derived from the totals — fees already baked in.
+    assert md.gain_gbp == Money.gbp("230")
+
+
+def test_matched_disposal_rejects_non_gbp_acquisition_fees() -> None:
+    with pytest.raises(ValueError, match="matched_acquisition_fees_gbp"):
+        MatchedDisposal(
+            disposal_trade_id=2,
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            match_rule=MatchRule.SAME_DAY,
+            matched_quantity=Decimal("5"),
+            matched_proceeds_gbp=Money.gbp("750"),
+            matched_cost_gbp=Money.gbp("500"),
+            basis=_direct_basis(),
+            matched_acquisition_fees_gbp=Money.of("10", "USD"),
+        )
+
+
+def test_matched_disposal_rejects_negative_acquisition_fees() -> None:
+    with pytest.raises(ValueError, match="matched_acquisition_fees_gbp"):
+        MatchedDisposal(
+            disposal_trade_id=2,
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            match_rule=MatchRule.SAME_DAY,
+            matched_quantity=Decimal("5"),
+            matched_proceeds_gbp=Money.gbp("750"),
+            matched_cost_gbp=Money.gbp("500"),
+            basis=_direct_basis(),
+            matched_acquisition_fees_gbp=Money.gbp("-1"),
+        )
+
+
+def test_matched_disposal_rejects_non_gbp_disposal_fees() -> None:
+    with pytest.raises(ValueError, match="matched_disposal_fees_gbp"):
+        MatchedDisposal(
+            disposal_trade_id=2,
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            match_rule=MatchRule.SAME_DAY,
+            matched_quantity=Decimal("5"),
+            matched_proceeds_gbp=Money.gbp("750"),
+            matched_cost_gbp=Money.gbp("500"),
+            basis=_direct_basis(),
+            matched_disposal_fees_gbp=Money.of("10", "USD"),
+        )
+
+
+def test_matched_disposal_rejects_negative_disposal_fees() -> None:
+    with pytest.raises(ValueError, match="matched_disposal_fees_gbp"):
+        MatchedDisposal(
+            disposal_trade_id=2,
+            instrument=_aapl(),
+            disposal_date=date(2024, 9, 1),
+            match_rule=MatchRule.SAME_DAY,
+            matched_quantity=Decimal("5"),
+            matched_proceeds_gbp=Money.gbp("750"),
+            matched_cost_gbp=Money.gbp("500"),
+            basis=_direct_basis(),
+            matched_disposal_fees_gbp=Money.gbp("-1"),
         )
 
 

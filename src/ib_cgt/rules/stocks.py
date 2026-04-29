@@ -167,13 +167,21 @@ class StockRuleEngine:
         Cost basis: ``price * qty + fees`` in the instrument's
         native currency, converted to GBP at the trade-date spot
         rate. Both the principal and the commission are quoted on
-        the same date, so a single FX call covers the whole trade.
+        the same date, so a single FX rate covers the whole trade —
+        we re-use it for the standalone fees conversion so that
+        ``acquisition.cost_gbp == principal_gbp + fees_gbp`` holds
+        exactly (subset semantics on `Acquisition.fees_gbp`).
         """
         cost_native = Money(
             trade.price.amount * trade.quantity + trade.fees.amount,
             trade.price.currency,
         )
         cost_gbp, _rate = self._fx.convert_with_rate(cost_native, target="GBP", on=trade.trade_date)
+        # Convert the fees on their own at the same trade-date rate so
+        # `Acquisition.fees_gbp` is exactly the GBP image of the IB-
+        # reported native commission. The cache makes the second call
+        # free (same date, same currency pair).
+        fees_gbp, _ = self._fx.convert_with_rate(trade.fees, target="GBP", on=trade.trade_date)
         return Acquisition(
             trade_id=trade_id,
             account_id=trade.account_id,
@@ -181,6 +189,7 @@ class StockRuleEngine:
             acquisition_date=trade.trade_date,
             quantity=trade.quantity,
             cost_gbp=cost_gbp,
+            fees_gbp=fees_gbp,
         )
 
     def _build_disposal(self, trade_id: int, trade: Trade, instrument: StockInstrument) -> Disposal:
@@ -189,7 +198,9 @@ class StockRuleEngine:
         Proceeds: ``price * qty - fees`` in the instrument's native
         currency, converted to GBP at the trade-date spot rate. Sell
         fees reduce proceeds (the standard "consideration net of
-        incidental costs" treatment per HMRC CG14241).
+        incidental costs" treatment per HMRC CG14241), and the
+        deducted fee amount is also surfaced separately on the
+        `Disposal` for audit.
         """
         proceeds_native = Money(
             trade.price.amount * trade.quantity - trade.fees.amount,
@@ -198,6 +209,9 @@ class StockRuleEngine:
         proceeds_gbp, _rate = self._fx.convert_with_rate(
             proceeds_native, target="GBP", on=trade.trade_date
         )
+        # Same trade-date rate as the proceeds — keeps the relation
+        # `proceeds_gbp == gross_principal_gbp - fees_gbp` exact.
+        fees_gbp, _ = self._fx.convert_with_rate(trade.fees, target="GBP", on=trade.trade_date)
         return Disposal(
             trade_id=trade_id,
             account_id=trade.account_id,
@@ -205,4 +219,5 @@ class StockRuleEngine:
             disposal_date=trade.trade_date,
             quantity=trade.quantity,
             proceeds_gbp=proceeds_gbp,
+            fees_gbp=fees_gbp,
         )

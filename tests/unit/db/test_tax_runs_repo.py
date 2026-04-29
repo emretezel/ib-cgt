@@ -160,3 +160,56 @@ def test_multiple_chunks_same_disposal_preserve_order(db: sqlite3.Connection) ->
 
 def test_latest_for_missing_year_returns_none(db: sqlite3.Connection) -> None:
     assert TaxRunRepo(db).latest_for(TaxYear(2099)) is None
+
+
+def test_matched_disposal_direct_round_trip_with_fees(db: sqlite3.Connection) -> None:
+    """Direct match round-trips both the buy and sell fee components."""
+    runs = TaxRunRepo(db)
+    matches = MatchedDisposalRepo(db)
+    run_id = runs.create(TaxYear(2024), Money.gbp("0"))
+
+    m = MatchedDisposal(
+        disposal_trade_id=101,
+        instrument=_aapl(),
+        disposal_date=date(2024, 5, 1),
+        match_rule=MatchRule.SAME_DAY,
+        matched_quantity=Decimal("5"),
+        matched_proceeds_gbp=Money.gbp("495"),
+        matched_cost_gbp=Money.gbp("410"),
+        basis=DirectAcquisition(acquisition_trade_id=201),
+        matched_acquisition_fees_gbp=Money.gbp("10"),
+        matched_disposal_fees_gbp=Money.gbp("5"),
+    )
+    matches.insert_many(run_id, [m])
+
+    loaded = matches.for_run(run_id)
+    assert loaded == [m]
+
+
+def test_matched_disposal_pool_round_trip_with_fees(db: sqlite3.Connection) -> None:
+    """SECTION_104 round-trips `pool_total_fees_before` from the snapshot."""
+    runs = TaxRunRepo(db)
+    matches = MatchedDisposalRepo(db)
+    run_id = runs.create(TaxYear(2024), Money.gbp("0"))
+
+    m = MatchedDisposal(
+        disposal_trade_id=102,
+        instrument=_aapl(),
+        disposal_date=date(2024, 5, 2),
+        match_rule=MatchRule.SECTION_104,
+        matched_quantity=Decimal("3"),
+        matched_proceeds_gbp=Money.gbp("295"),
+        matched_cost_gbp=Money.gbp("251"),
+        basis=TaxLotSnapshot(
+            quantity_before=Decimal("10"),
+            total_cost_gbp_before=Money.gbp("810"),
+            average_cost_gbp=Money.gbp("81"),
+            total_fees_gbp_before=Money.gbp("12"),
+        ),
+        matched_acquisition_fees_gbp=Money.gbp("3.6"),
+        matched_disposal_fees_gbp=Money.gbp("5"),
+    )
+    matches.insert_many(run_id, [m])
+
+    loaded = matches.for_run(run_id)
+    assert loaded == [m]

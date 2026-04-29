@@ -59,10 +59,16 @@ def acq(
     on: date,
     qty: Decimal | int | str,
     cost_gbp: Decimal | int | str,
+    fees_gbp: Decimal | int | str = 0,
     instrument: StockInstrument | None = None,
     account_id: str = "U1",
 ) -> Acquisition:
-    """Build an `Acquisition` with terse keyword args."""
+    """Build an `Acquisition` with terse keyword args.
+
+    `fees_gbp` is **subset of** `cost_gbp` — the helper does not add
+    it on top. Defaults to zero, matching the engine's input shape
+    for fee-free test cases.
+    """
     return Acquisition(
         trade_id=trade_id,
         account_id=account_id,
@@ -70,6 +76,7 @@ def acq(
         acquisition_date=on,
         quantity=Decimal(qty),
         cost_gbp=Money.gbp(cost_gbp),
+        fees_gbp=Money.gbp(fees_gbp),
     )
 
 
@@ -79,10 +86,15 @@ def disp(
     on: date,
     qty: Decimal | int | str,
     proceeds_gbp: Decimal | int | str,
+    fees_gbp: Decimal | int | str = 0,
     instrument: StockInstrument | None = None,
     account_id: str = "U1",
 ) -> Disposal:
-    """Build a `Disposal` with terse keyword args."""
+    """Build a `Disposal` with terse keyword args.
+
+    `proceeds_gbp` is the **net** figure (already net of fees).
+    `fees_gbp` is what was deducted; defaults to zero.
+    """
     return Disposal(
         trade_id=trade_id,
         account_id=account_id,
@@ -90,6 +102,7 @@ def disp(
         disposal_date=on,
         quantity=Decimal(qty),
         proceeds_gbp=Money.gbp(proceeds_gbp),
+        fees_gbp=Money.gbp(fees_gbp),
     )
 
 

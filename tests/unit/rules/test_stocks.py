@@ -105,6 +105,33 @@ def test_usd_buy_at_one_rate_sell_at_another() -> None:
     assert md.matched_cost_gbp == Money.gbp("801.60")
     # sell native proceeds = 10*120 - 3 = 1197 USD → 1197 * 0.75 = 897.75 GBP.
     assert md.matched_proceeds_gbp == Money.gbp("897.75")
+    # Fees converted at the matching trade-date rate:
+    #   buy fees: 2 USD * 0.80 = 1.60 GBP (subset of cost_gbp).
+    #   sell fees: 3 USD * 0.75 = 2.25 GBP (already deducted from proceeds).
+    assert md.matched_acquisition_fees_gbp == Money.gbp("1.60")
+    assert md.matched_disposal_fees_gbp == Money.gbp("2.25")
+
+
+def test_gbp_stock_carries_fees_through_to_chunk() -> None:
+    """GBP path: identity FX, but fees still surface on the matched chunk."""
+    fx = StubFXService({})
+    engine = StockRuleEngine(fx)
+    inst = _gbp_stock()
+    d = date(2024, 5, 1)
+    trades = [
+        (1, stock_trade(action=TradeAction.BUY, on=d, qty=10, price=100, fees=2, instrument=inst)),
+        (
+            2,
+            stock_trade(
+                action=TradeAction.SELL, on=d, qty=10, price=120, fees=3, instrument=inst, seq=1
+            ),
+        ),
+    ]
+    result = engine.compute(inst, trades)
+    md = result.matched_disposals[0]
+    # GBP path → fees pass through identity unchanged.
+    assert md.matched_acquisition_fees_gbp == Money.gbp("2")
+    assert md.matched_disposal_fees_gbp == Money.gbp("3")
 
 
 # ---------------------------------------------------------------------------

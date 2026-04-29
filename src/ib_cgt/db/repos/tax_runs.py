@@ -135,7 +135,7 @@ class MatchedDisposalRepo:
             per_disposal_seq[m.disposal_trade_id] = seq + 1
 
             instrument_id = self._instruments.upsert(m.instrument)
-            basis_kind, acq_id, pool_qty, pool_cost, pool_avg = _encode_basis(m)
+            basis_kind, acq_id, pool_qty, pool_cost, pool_avg, pool_fees = _encode_basis(m)
             rows.append(
                 (
                     run_id,
@@ -146,11 +146,14 @@ class MatchedDisposalRepo:
                     dec_to_text(m.matched_quantity),
                     dec_to_text(m.matched_proceeds_gbp.amount),
                     dec_to_text(m.matched_cost_gbp.amount),
+                    dec_to_text(m.matched_acquisition_fees_gbp.amount),
+                    dec_to_text(m.matched_disposal_fees_gbp.amount),
                     basis_kind,
                     acq_id,
                     pool_qty,
                     pool_cost,
                     pool_avg,
+                    pool_fees,
                     seq,
                 )
             )
@@ -161,9 +164,10 @@ class MatchedDisposalRepo:
             "INSERT INTO matched_disposals ("
             "run_id, disposal_trade_id, instrument_id, disposal_date, "
             "match_rule, matched_quantity, matched_proceeds_gbp, matched_cost_gbp, "
+            "matched_acquisition_fees_gbp, matched_disposal_fees_gbp, "
             "basis_kind, acquisition_trade_id, pool_quantity_before, "
-            "pool_total_cost_before, pool_average_cost, seq"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "pool_total_cost_before, pool_average_cost, pool_total_fees_before, seq"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         return len(rows)
@@ -189,6 +193,10 @@ class MatchedDisposalRepo:
             matched_quantity=text_to_dec(row["matched_quantity"]),
             matched_proceeds_gbp=Money(text_to_dec(row["matched_proceeds_gbp"]), "GBP"),
             matched_cost_gbp=Money(text_to_dec(row["matched_cost_gbp"]), "GBP"),
+            matched_acquisition_fees_gbp=Money(
+                text_to_dec(row["matched_acquisition_fees_gbp"]), "GBP"
+            ),
+            matched_disposal_fees_gbp=Money(text_to_dec(row["matched_disposal_fees_gbp"]), "GBP"),
             basis=basis,
         )
 
@@ -200,8 +208,8 @@ class MatchedDisposalRepo:
 
 def _encode_basis(
     m: MatchedDisposal,
-) -> tuple[str, int | None, str | None, str | None, str | None]:
-    """Return `(basis_kind, acq_id, pool_qty, pool_cost, pool_avg)` columns.
+) -> tuple[str, int | None, str | None, str | None, str | None, str | None]:
+    """Return `(basis_kind, acq_id, pool_qty, pool_cost, pool_avg, pool_fees)`.
 
     Exactly one branch populates the pool-* columns and the other
     populates `acquisition_trade_id`, matching the CHECK constraint on
@@ -210,7 +218,7 @@ def _encode_basis(
     """
     basis = m.basis
     if isinstance(basis, DirectAcquisition):
-        return (_BASIS_DIRECT, basis.acquisition_trade_id, None, None, None)
+        return (_BASIS_DIRECT, basis.acquisition_trade_id, None, None, None, None)
     # `MatchBasis` is a two-variant union, so the else branch is a TaxLotSnapshot.
     snapshot: TaxLotSnapshot = basis
     return (
@@ -219,6 +227,7 @@ def _encode_basis(
         dec_to_text(snapshot.quantity_before),
         dec_to_text(snapshot.total_cost_gbp_before.amount),
         dec_to_text(snapshot.average_cost_gbp.amount),
+        dec_to_text(snapshot.total_fees_gbp_before.amount),
     )
 
 
@@ -236,9 +245,17 @@ def _decode_basis(row: sqlite3.Row) -> DirectAcquisition | TaxLotSnapshot:
         avg = row["pool_average_cost"]
         if qty is None or cost is None or avg is None:
             raise RuntimeError("POOL basis row missing pool_* columns")
+        # `pool_total_fees_before` was added in migration 007 and is
+        # NULL on any row written before that migration ran. Treat
+        # NULL as zero so a pre-007 audit row still round-trips
+        # cleanly — the domain's `TaxLotSnapshot` defaults the field
+        # to zero anyway.
+        fees_text = row["pool_total_fees_before"]
+        fees = Money(text_to_dec(fees_text), "GBP") if fees_text is not None else Money.gbp(0)
         return TaxLotSnapshot(
             quantity_before=text_to_dec(qty),
             total_cost_gbp_before=Money(text_to_dec(cost), "GBP"),
             average_cost_gbp=Money(text_to_dec(avg), "GBP"),
+            total_fees_gbp_before=fees,
         )
     raise RuntimeError(f"unknown matched_disposals.basis_kind: {kind!r}")
