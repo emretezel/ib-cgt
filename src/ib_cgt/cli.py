@@ -271,7 +271,17 @@ def ingest(
         # SQLite will create empty files on `connect`, so the missing
         # schema manifests as a foreign-key failure deep in the ingestor.
         apply_migrations(conn)
-        result = ingest_statement(path, conn, replace=replace)
+        # The same FXService wiring used by `match` / `compute`. Needed
+        # so cross-currency cash-merger Corporate Actions can be
+        # synthesized into SELL trades at ingest time. If FX rates
+        # haven't been synced for the merger's date+currencies, the
+        # synthesis raises `RateNotFoundError`; the operator runs
+        # `ib-cgt fx sync` to populate the cache and retries.
+        fx_service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        result = ingest_statement(path, conn, replace=replace, fx_service=fx_service)
     finally:
         conn.close()
 
@@ -289,11 +299,15 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
         return
 
     verb = "Replaced" if result.replaced else "Imported"
-    _console.print(
+    summary = (
         f"[green]{verb}[/] [bold]{source.name}[/] "
         f"for account [bold]{result.account_id}[/]: "
-        f"{result.inserted_count} new / {result.trade_count} parsed."
+        f"{result.inserted_count} new / {result.trade_count} parsed"
     )
+    if result.merger_trade_count:
+        plural = "" if result.merger_trade_count == 1 else "s"
+        summary += f" (incl. {result.merger_trade_count} corporate-action disposal{plural})"
+    _console.print(summary + ".")
 
 
 # ---------------------------------------------------------------------------

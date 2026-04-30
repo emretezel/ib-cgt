@@ -78,7 +78,15 @@ where noted.
    "Equity and Index Options" section (see
    `parser._IGNORED_ASSET_CLASSES`): stock options are out of scope for
    v1 and the OCC-formatted symbols would otherwise be ingested as
-   stocks.
+   stocks. The parser also walks `tblCorporateActions_*Body` divs;
+   `ingest/corporate_actions.py` materialises only cash-for-shares
+   mergers under the Stocks asset class
+   (`Merged(Acquisition) for <CCY> <PRICE> per Share`) into synthesized
+   `SELL` trades, with cross-currency proceeds FX-converted to the
+   stock's listing currency at the disposal-date spot rate. Bond
+   maturities, dividends-as-corporate-action, splits, spin-offs,
+   share-for-share mergers, and tendered-to-other-stock rows are
+   silently ignored.
 
 4. **FX rate service** — `ib_cgt.fx` — Frankfurter HTTP client (date-range
    batched), SQLite-backed cache, previous-business-day fallback for

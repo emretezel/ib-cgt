@@ -43,6 +43,7 @@ def _make(
         account_id="U9999999",
         trades=tuple(trades),
         instruments=tuple(instruments or []),
+        corporate_actions=(),
     )
 
 

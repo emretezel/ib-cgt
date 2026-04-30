@@ -11,6 +11,16 @@ that scan cheap. Trades are stored in the source currency they
 executed in; FX conversion to GBP is applied later, from the
 [`fx_rates`](./fx_rates.md) cache.
 
+A small minority of `sell` rows are synthesized at ingest time from
+cash-for-shares Corporate Actions (`Merged(Acquisition) for <CCY>
+<PRICE> per Share` — see `ingest/corporate_actions.py`). These rows
+carry `fees_amount = '0'` (mergers have no commission) and live at
+`statement_row_index` strictly after every regular-trade row from
+the same statement; their `(source_statement_hash,
+statement_row_index)` still points back to the source HTML for
+audit purposes. Downstream they are indistinguishable from ordinary
+sells.
+
 ## Columns
 
 | Column | Type | Nullable | Notes |

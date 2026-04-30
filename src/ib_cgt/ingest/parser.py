@@ -33,6 +33,14 @@ futures/24_25.htm, see `docs/architecture.md` §Component map item 3):
   its `Multiplier` and `Expiry`. Needed only for futures, but parsed
   for every statement because the presence of the section is the cheap
   way to detect "this statement has futures".
+* Corporate Actions section: `<div id="tblCorporateActions_<acct>Body">`
+  containing one `<table>` whose `<thead>` carries the column labels
+  `Report Date | Date/Time | Description | Quantity | Proceeds | Value
+  | Realized P/L | Code`. Same `header-asset` / `header-currency`
+  toggle and `subtotal` / `total` skip semantics as the Trades section.
+  The downstream consumer (`ingest/corporate_actions.py`) materialises
+  cash-for-shares mergers into synthesized SELL trades; the parser is
+  scope-blind and emits every action row verbatim.
 
 Author: Emre Tezel
 """
@@ -103,12 +111,53 @@ class RawInstrumentInfo:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawCorporateActionRow:
+    """One row of the Corporate Actions section, still as raw text.
+
+    Cash-for-shares mergers (the only action type currently materialised
+    downstream) appear as TWO rows sharing the same `Date/Time` and
+    `description`: a row in the stock's listing currency carrying the
+    disposed quantity (proceeds=0) and a row in the cash currency
+    carrying the cash proceeds (quantity=0). Same-currency mergers
+    collapse to a single row with both fields populated. The parser
+    emits every row verbatim and lets the corporate-actions mapper
+    pair them up by `(datetime_text, description)`.
+
+    The `Value`, `Realized P/L`, and `Code` columns are intentionally
+    discarded — none are needed for a UK CGT disposal: HMRC computes
+    realized P/L from acquisition cost vs. proceeds itself.
+
+    Attributes:
+        asset_class: The section-header label (`"Stocks"`, `"Bonds"`, …),
+            with any legacy custodian suffix stripped.
+        currency: The sub-section currency header for this row.
+        report_date_text: IB's settlement-style report date.
+        datetime_text: Event timestamp, `"YYYY-MM-DD, HH:MM:SS"`.
+        description: Free-text action description; the prefix
+            `"<TICKER>(<ISIN>) Merged(Acquisition) for <CCY> <PRICE>
+            per Share"` is the gate the mapper uses to identify cash
+            mergers.
+        quantity_text: Signed quantity as printed (`"-824"`, `"0"`).
+        proceeds_text: Cash proceeds as printed (`"14,425.52"`, `"0.00"`).
+    """
+
+    asset_class: str
+    currency: str
+    report_date_text: str
+    datetime_text: str
+    description: str
+    quantity_text: str
+    proceeds_text: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ParsedStatement:
     """The parsed statement: account + trade rows + instrument metadata."""
 
     account_id: str
     trades: tuple[RawTradeRow, ...]
     instruments: tuple[RawInstrumentInfo, ...]
+    corporate_actions: tuple[RawCorporateActionRow, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +183,17 @@ _INSTRUMENT_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Multiplier": "multiplier",
     "Expiry": "expiry",
     "Listing Exch": "listing_exch",
+}
+
+# Corporate Actions column headers we keep. Value, Realized P/L and Code
+# are present in the HTML but unused — the downstream mapper computes
+# its own GBP figures and HMRC doesn't care about IB's realisation.
+_CORPORATE_ACTION_COLUMN_ALIASES: Final[dict[str, str]] = {
+    "Report Date": "report_date",
+    "Date/Time": "datetime",
+    "Description": "description",
+    "Quantity": "quantity",
+    "Proceeds": "proceeds",
 }
 
 # Asset-class section labels we deliberately drop at parse time. Stock
@@ -181,11 +241,13 @@ def parse_statement(source_bytes: bytes) -> ParsedStatement:
     account_id = _extract_account_id(soup)
     trades = tuple(_parse_trades_section(soup))
     instruments = tuple(_parse_instruments_section(soup))
+    corporate_actions = tuple(_parse_corporate_actions_section(soup))
 
     return ParsedStatement(
         account_id=account_id,
         trades=trades,
         instruments=instruments,
+        corporate_actions=corporate_actions,
     )
 
 
@@ -503,6 +565,139 @@ def _resolve_instrument_columns(table: Tag) -> dict[str, int] | None:
 
 
 # ---------------------------------------------------------------------------
+# Corporate Actions section
+# ---------------------------------------------------------------------------
+
+
+def _parse_corporate_actions_section(soup: BeautifulSoup) -> list[RawCorporateActionRow]:
+    """Yield every Corporate Actions row across all sections.
+
+    Mirrors `_parse_trades_section`: IB emits one
+    `tblCorporateActions_<acct>Body` div per account on consolidated
+    statements; we walk every `<table>` inside every such div and
+    concatenate. Statements with no corporate actions simply yield an
+    empty list — the section is optional.
+    """
+    tables = _find_corporate_actions_tables(soup)
+    if not tables:
+        return []
+
+    rows: list[RawCorporateActionRow] = []
+    for table in tables:
+        rows.extend(_parse_one_corporate_actions_table(table))
+    return rows
+
+
+def _parse_one_corporate_actions_table(table: Tag) -> list[RawCorporateActionRow]:
+    """Parse a single Corporate Actions `<table>`."""
+    column_map = _resolve_corporate_action_columns(table)
+    if column_map is None:
+        return []
+
+    rows: list[RawCorporateActionRow] = []
+    current_asset_class = ""
+    current_currency = ""
+
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+
+        if _row_has_cell_class(tr, "header-asset"):
+            current_asset_class = _normalize_asset_class(_row_first_cell_text(tr))
+            continue
+        if _row_has_cell_class(tr, "header-currency"):
+            current_currency = _row_first_cell_text(tr)
+            continue
+        # Both `subtotal` (per-currency aggregate) and `total`
+        # (cross-currency `Total in <FUNCTIONAL CCY>`) rows are
+        # display-only and must be skipped — they share the same
+        # column count as data rows so they'd otherwise sneak through.
+        row_classes = tr.get("class") or []
+        if "subtotal" in row_classes or "total" in row_classes:
+            continue
+        if tr.find("th") is not None:
+            continue
+
+        cells = tr.find_all("td")
+        if not cells or not current_asset_class or not current_currency:
+            continue
+
+        # Honour the same asset-class skip list as the Trades parser
+        # (`Equity and Index Options` etc.) — defensive symmetry; the
+        # corporate-actions mapper would discard these regardless.
+        if current_asset_class in _IGNORED_ASSET_CLASSES:
+            continue
+
+        try:
+            report_date_text = cells[column_map["report_date"]].get_text(strip=True)
+            datetime_text = cells[column_map["datetime"]].get_text(strip=True)
+            description = cells[column_map["description"]].get_text(strip=True)
+            quantity_text = cells[column_map["quantity"]].get_text(strip=True)
+            proceeds_text = cells[column_map["proceeds"]].get_text(strip=True)
+        except IndexError:
+            continue
+
+        # Like trades, a blank Date/Time cell signals an aggregate row
+        # IB occasionally emits without the `subtotal` / `total` class.
+        if not datetime_text or datetime_text == "\xa0":
+            continue
+
+        rows.append(
+            RawCorporateActionRow(
+                asset_class=current_asset_class,
+                currency=current_currency,
+                report_date_text=report_date_text,
+                datetime_text=datetime_text,
+                description=description,
+                quantity_text=quantity_text,
+                proceeds_text=proceeds_text,
+            )
+        )
+
+    return rows
+
+
+def _find_corporate_actions_tables(soup: BeautifulSoup) -> list[Tag]:
+    """Return every `<table>` element inside a Corporate Actions div."""
+    tables: list[Tag] = []
+    for div in soup.find_all("div", id=True):
+        if not isinstance(div, Tag):
+            continue
+        div_id = str(div.get("id", ""))
+        if div_id.startswith("tblCorporateActions_") and div_id.endswith("Body"):
+            for table in div.find_all("table"):
+                if isinstance(table, Tag):
+                    tables.append(table)
+    return tables
+
+
+def _resolve_corporate_action_columns(table: Tag) -> dict[str, int] | None:
+    """Map Corporate Actions header labels to indices.
+
+    Required: `report_date`, `datetime`, `description`, `quantity`,
+    `proceeds`. Returns None if any required column is missing — the
+    table is then skipped, matching how the trades resolver handles
+    unrecognisable layouts.
+    """
+    required = set(_CORPORATE_ACTION_COLUMN_ALIASES.values())
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+        headers = tr.find_all("th")
+        if not headers:
+            continue
+        candidate: dict[str, int] = {}
+        for idx, th in enumerate(headers):
+            label = th.get_text(strip=True)
+            logical = _CORPORATE_ACTION_COLUMN_ALIASES.get(label)
+            if logical is not None:
+                candidate[logical] = idx
+        if required.issubset(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
 
@@ -558,6 +753,7 @@ def _optional_cell(cells: list[Tag], column_map: dict[str, int], logical: str) -
 
 __all__ = [
     "ParsedStatement",
+    "RawCorporateActionRow",
     "RawInstrumentInfo",
     "RawTradeRow",
     "StatementParseError",

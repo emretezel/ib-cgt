@@ -170,6 +170,86 @@ def test_parse_skips_options_with_custodian_suffix() -> None:
     assert parsed.trades == ()
 
 
+def test_parse_extracts_corporate_action_rows() -> None:
+    """The cash-merger fixture surfaces both currency rows of the IEMI event.
+
+    The fixture mirrors the live `statements/stocks/25_26.htm` layout: a
+    GBP-block row with the disposed quantity and a USD-block row with the
+    cash proceeds. Both must appear in `parsed.corporate_actions`, in
+    source order, with their currencies preserved so the downstream
+    synthesizer can pair them by `(datetime, description)`.
+    """
+    parsed = parse_statement(_load("with_cash_merger.htm"))
+    assert len(parsed.corporate_actions) == 2
+    gbp_row, usd_row = parsed.corporate_actions
+    assert gbp_row.asset_class == "Stocks"
+    assert gbp_row.currency == "GBP"
+    assert gbp_row.quantity_text == "-824"
+    assert gbp_row.proceeds_text == "0.00"
+    assert "Merged(Acquisition)" in gbp_row.description
+    assert usd_row.currency == "USD"
+    assert usd_row.quantity_text == "0"
+    assert usd_row.proceeds_text == "14,425.52"
+    # Same Date/Time and Description so the mapper can pair the rows.
+    assert gbp_row.datetime_text == usd_row.datetime_text == "2025-08-15, 20:25:00"
+    assert gbp_row.description == usd_row.description
+
+
+def test_parse_skips_corporate_action_subtotals_and_totals() -> None:
+    """`<tr class="subtotal">` and `<tr class="total">` rows must not appear.
+
+    The fixture carries one per-currency `subtotal` row and a final
+    cross-currency `Total in GBP` row. Skipping both is what keeps the
+    synthesizer from over-counting cash-merger events.
+    """
+    parsed = parse_statement(_load("with_cash_merger.htm"))
+    # Only the two real data rows; the three aggregate rows (2 subtotal +
+    # 1 total) are dropped at parse time.
+    assert len(parsed.corporate_actions) == 2
+
+
+def test_parse_corporate_actions_normalises_asset_class() -> None:
+    """Legacy custodian suffix on the asset header is collapsed.
+
+    Older statements emit `"Stocks - Held with Interactive Brokers (U.K.)
+    Limited carried by Interactive Brokers LLC"`. After
+    `_normalize_asset_class` strips the suffix, the row should be
+    visible as a `Stocks` corporate action — same logic as the trades
+    section.
+    """
+    legacy_label = (
+        "Stocks - Held with Interactive Brokers (U.K.) Limited carried by Interactive Brokers LLC"
+    )
+    description = (
+        "FOO(US0000004444) Merged(Acquisition) for USD 5.00 per Share (FOO, FOO INC, US0000004444)"
+    )
+    html = f"""<html>
+    <head><title>U5555557 Activity Statement 2018</title></head>
+    <body>
+    <div id="tblAccountInfo_U5555557Body">
+    <table><tr><td>Account</td><td>U5555557</td></tr></table>
+    </div>
+    <div id="tblCorporateActions_U5555557Body">
+    <table>
+    <thead><tr>
+    <th>Report Date</th><th>Date/Time</th><th>Description</th>
+    <th>Quantity</th><th>Proceeds</th><th>Value</th>
+    <th>Realized P/L</th><th>Code</th>
+    </tr></thead>
+    <tr><td class="header-asset" colspan="8">{legacy_label}</td></tr>
+    <tr><td class="header-currency" colspan="8">USD</td></tr>
+    <tr>
+    <td>2018-10-22</td><td>2018-10-15, 20:25:00</td>
+    <td>{description}</td>
+    <td>-200</td><td>1,000.00</td><td>0.00</td><td>0.00</td><td>&nbsp;</td>
+    </tr>
+    </table></div></body></html>""".encode()
+    parsed = parse_statement(html)
+    assert len(parsed.corporate_actions) == 1
+    assert parsed.corporate_actions[0].asset_class == "Stocks"
+    assert "FOO" in parsed.corporate_actions[0].description
+
+
 def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
     """Older (2017-2018) statements prefix the asset class with a custodian
     suffix. The parser should collapse that to the canonical label so the

@@ -8,12 +8,36 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from ib_cgt.db import TradeRepo
+from ib_cgt.domain import Money
 from ib_cgt.ingest.ingestor import ingest_statement
+
+
+@dataclass
+class _FXStub:
+    """Minimal FX stub for the merger ingest test.
+
+    The synthesizer only ever calls `convert`. Returning a fixed rate
+    is enough to exercise the end-to-end persistence path without
+    pulling Frankfurter or seeding the rate cache.
+    """
+
+    rate: Decimal
+    calls: list[tuple[Money, str, date]] = field(default_factory=list)
+
+    def convert(self, amount: Money, *, target: str, on: date) -> Money:
+        self.calls.append((amount, target, on))
+        if amount.currency == target:
+            return amount
+        return Money.of(amount.amount * self.rate, target)
+
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
 
@@ -128,3 +152,83 @@ def test_replace_on_unseen_statement_behaves_like_normal_ingest(
     assert result.replaced is False
     assert result.already_imported is False
     assert result.inserted_count == result.trade_count > 0
+
+
+def test_ingest_persists_synthesized_merger_trade(db: sqlite3.Connection) -> None:
+    """End-to-end: cash-merger fixture lands as a SELL trade in the DB.
+
+    The fixture has 1 regular buy + 1 cross-currency cash merger.
+    With FXService injected, the synthesizer produces a SELL with
+    `fees=0` and a `statement_row_index` strictly after the buy's.
+    Without FXService injected, only the buy lands.
+    """
+    fixture = _FIXTURES / "with_cash_merger.htm"
+    fx = _FXStub(rate=Decimal("0.74"))
+
+    result = ingest_statement(fixture, db, fx_service=fx)
+
+    assert result.trade_count == 2
+    assert result.merger_trade_count == 1
+    assert result.inserted_count == 2
+
+    rows = db.execute(
+        "SELECT action, fees_amount, fees_currency, statement_row_index "
+        "FROM trades ORDER BY statement_row_index"
+    ).fetchall()
+    assert len(rows) == 2
+    buy, sell = rows
+    assert buy["action"] == "buy"
+    assert sell["action"] == "sell"
+    # The synthesized SELL carries no fees.
+    assert sell["fees_amount"] == "0"
+    assert sell["fees_currency"] == "GBP"
+    # And lives at a row_index strictly past the regular trade.
+    assert sell["statement_row_index"] > buy["statement_row_index"]
+
+
+def test_ingest_without_fx_service_skips_merger(db: sqlite3.Connection) -> None:
+    """Without an FXService, Corporate Actions rows are silently skipped.
+
+    Pre-existing tests / call sites that don't pass `fx_service=` keep
+    working — the corporate-action synthesizer is opt-in.
+    """
+    fixture = _FIXTURES / "with_cash_merger.htm"
+
+    result = ingest_statement(fixture, db)
+
+    assert result.trade_count == 1
+    assert result.merger_trade_count == 0
+    assert result.inserted_count == 1
+
+
+def test_reingest_with_replace_replays_merger_trade(db: sqlite3.Connection) -> None:
+    """`--replace` re-runs CA synthesis at the same statement_row_index.
+
+    Identity stability matters: the audit trail
+    `(source_statement_hash, statement_row_index)` must continue to
+    point at the same logical event after a replace.
+    """
+    fixture = _FIXTURES / "with_cash_merger.htm"
+    fx = _FXStub(rate=Decimal("0.74"))
+
+    first = ingest_statement(fixture, db, fx_service=fx)
+    first_indices = sorted(
+        int(r["statement_row_index"])
+        for r in db.execute(
+            "SELECT statement_row_index FROM trades WHERE source_statement_hash = ?",
+            (first.statement_hash,),
+        )
+    )
+
+    second = ingest_statement(fixture, db, replace=True, fx_service=fx)
+
+    assert second.replaced is True
+    assert second.merger_trade_count == first.merger_trade_count == 1
+    second_indices = sorted(
+        int(r["statement_row_index"])
+        for r in db.execute(
+            "SELECT statement_row_index FROM trades WHERE source_statement_hash = ?",
+            (first.statement_hash,),
+        )
+    )
+    assert second_indices == first_indices

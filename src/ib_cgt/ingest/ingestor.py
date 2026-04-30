@@ -30,6 +30,7 @@ from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
 from ib_cgt.domain import Account
+from ib_cgt.ingest.corporate_actions import FXConverter, map_corporate_actions
 from ib_cgt.ingest.hashing import compute_statement_hash
 from ib_cgt.ingest.mapper import map_rows
 from ib_cgt.ingest.parser import parse_statement
@@ -42,8 +43,13 @@ class IngestResult:
     Attributes:
         statement_hash: The SHA-256 of the source file (hex).
         account_id: Account the statement belonged to.
-        trade_count: Number of trades the parser produced. Zero is a
-            legal outcome for a statement with no activity.
+        trade_count: Number of trades the parser produced (regular +
+            synthesized). Zero is a legal outcome for a statement with
+            no activity.
+        merger_trade_count: Subset of `trade_count` originating from
+            cash-for-shares Corporate Actions rows ("Merged(Acquisition)").
+            Reported separately so the CLI can surface them; matching
+            treats them identically to ordinary sells.
         inserted_count: How many of those were new rows. On a repeat
             ingest of a modified statement this can be less than
             `trade_count` if some trades were already present from a
@@ -62,6 +68,7 @@ class IngestResult:
     trade_count: int
     inserted_count: int
     already_imported: bool
+    merger_trade_count: int = 0
     replaced: bool = False
 
 
@@ -70,6 +77,7 @@ def ingest_statement(
     conn: sqlite3.Connection,
     *,
     replace: bool = False,
+    fx_service: FXConverter | None = None,
 ) -> IngestResult:
     """Parse the file at `path` and persist its trades via `conn`.
 
@@ -83,6 +91,12 @@ def ingest_statement(
             `False` preserves the historical short-circuit behaviour
             — a repeat ingest of an already-imported statement is a
             constant-time no-op.
+        fx_service: Optional FX service for synthesizing `SELL` trades
+            from cash-for-shares Corporate Actions rows. When omitted,
+            corporate-action rows are silently ignored — the CLI's
+            `ingest` command always passes one, so production runs
+            cover the IEMI-shaped case; tests opt in by injecting a
+            mock or seeded service.
 
     Returns:
         `IngestResult` — see docstring for field semantics.
@@ -118,7 +132,19 @@ def ingest_statement(
         )
 
     parsed = parse_statement(source_bytes)
-    trades = map_rows(parsed)
+    regular_trades = map_rows(parsed)
+
+    # Synthesize SELL trades from cash-for-shares Corporate Actions rows
+    # (e.g. the IEMI fund-merger that pays cash for the entire position).
+    # The synthesized trades are appended *after* the regular ones so
+    # `enumerate(...)` in TradeRepo.insert_many gives them statement_row_index
+    # values strictly greater than any real-trade index. This keeps re-ingest
+    # identities stable as long as the parser's emission order is stable.
+    if fx_service is not None:
+        merger_trades = map_corporate_actions(parsed, fx_service=fx_service)
+    else:
+        merger_trades = []
+    trades = regular_trades + merger_trades
 
     accounts = AccountRepo(conn)
     trade_repo = TradeRepo(conn)
@@ -154,6 +180,7 @@ def ingest_statement(
         statement_hash=statement_hash,
         account_id=parsed.account_id,
         trade_count=len(trades),
+        merger_trade_count=len(merger_trades),
         inserted_count=inserted,
         already_imported=False,
         replaced=prior_existed and replace,
