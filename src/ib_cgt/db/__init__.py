@@ -26,9 +26,9 @@ from ib_cgt.db.migrator import apply_migrations
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.fx_rates import FXRate, FXRateRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
-from ib_cgt.db.repos.statements import StatementRepo
+from ib_cgt.db.repos.statements import StatementRepo, StatementRow
 from ib_cgt.db.repos.tax_runs import MatchedDisposalRepo, TaxRun, TaxRunRepo
-from ib_cgt.db.repos.trades import TradeRepo
+from ib_cgt.db.repos.trades import StoredTrade, TradeRepo
 
 __all__ = [
     "AccountRepo",
@@ -37,6 +37,8 @@ __all__ = [
     "InstrumentRepo",
     "MatchedDisposalRepo",
     "StatementRepo",
+    "StatementRow",
+    "StoredTrade",
     "TaxRun",
     "TaxRunRepo",
     "TradeRepo",

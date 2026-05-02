@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import date
 
 from ib_cgt.db.codecs import (
@@ -30,6 +31,24 @@ from ib_cgt.db.codecs import (
 )
 from ib_cgt.db.repos.instruments import InstrumentRepo
 from ib_cgt.domain import AssetClass, TaxYear, Trade, TradeAction
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StoredTrade:
+    """A single trade plus the persistence-layer metadata audit needs.
+
+    `Trade` itself is purely the domain shape — it doesn't know its
+    own surrogate id, the instrument's id, or which statement row it
+    came from. The audit commands (`show trade`, `show realisation`)
+    need all of that, so this small DTO bundles them without
+    polluting the domain layer.
+    """
+
+    trade_id: int
+    instrument_id: int
+    trade: Trade
+    statement_hash: str
+    statement_row_index: int
 
 
 class TradeRepo:
@@ -180,6 +199,28 @@ class TradeRepo:
         sql = "SELECT * FROM trades WHERE " + " AND ".join(clauses) + " ORDER BY trade_datetime ASC"
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
+
+    def get(self, trade_id: int) -> StoredTrade | None:
+        """Return the trade with this surrogate id (and its provenance), or `None`.
+
+        Drives every `ib-cgt show *` audit command. Returns `None`
+        rather than raising on a missing id so the CLI can render a
+        clean error message instead of a stack trace; the caller is
+        expected to surface that to the user.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM trades WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredTrade(
+            trade_id=int(row["trade_id"]),
+            instrument_id=int(row["instrument_id"]),
+            trade=self._row_to_trade(row),
+            statement_hash=str(row["source_statement_hash"]),
+            statement_row_index=int(row["statement_row_index"]),
+        )
 
     def for_asset_class(
         self,

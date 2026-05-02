@@ -268,7 +268,7 @@ items marked ⬜ are pending.
 | 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `FXRuleEngine` done; `BondRuleEngine` pending |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` / `match fx` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` / `match fx` / `show trade` / `show realisation` / `show match` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |
