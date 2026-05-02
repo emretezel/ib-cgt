@@ -239,7 +239,11 @@ items marked ⬜ are pending.
    buy is more than 30 days later.
 9. ⬜ **BondRuleEngine** — add QCB / gilt exempt handling; attach accrued
    interest; reuse the matching engine.
-10. ⬜ **FXRuleEngine** — S.104-style matching per currency pair.
+10. ✅ **FXRuleEngine** — four-rule UK matching per non-GBP currency
+    pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
+    shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
+    feeds two pools at once with independent per-leg GBP conversion.
+    Per-currency CLI: `ib-cgt match fx [--currency CCY]`.
 11. ⬜ **Calculator orchestrator** — wire engines together, tax-year
     filtering, persist `tax_run` and `future_realisations`.
 12. ⬜ **Reporting** — console + CSV + JSON renderers.
@@ -255,10 +259,10 @@ items marked ⬜ are pending.
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
-| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` done |
+| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `FXRuleEngine` done; `BondRuleEngine` pending |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` / `match fx` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |

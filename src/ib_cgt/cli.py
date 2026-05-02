@@ -19,6 +19,10 @@ Commands:
   runs the four-rule UK matching engine against ingested stock
   trades. Cross-account by design (S.104 pools span every account
   belonging to the taxpayer). Persists nothing.
+* ``ib-cgt match fx [filters]`` — read-only debug command that runs
+  the four-rule UK matching engine per non-GBP currency pool. A
+  cross-currency trade (e.g. ``EUR.USD``) feeds two pools at once.
+  Cross-account by design. Persists nothing.
 
 The command surface and help text are deliberately terse; we'll flesh
 them out when the calculator and reporting commands land in their own
@@ -48,9 +52,11 @@ from ib_cgt.db import (
     open_connection,
 )
 from ib_cgt.domain import (
+    AssetClass,
     DirectAcquisition,
     FutureInstrument,
     FutureRealisation,
+    FXInstrument,
     MatchedDisposal,
     Money,
     OpenPosition,
@@ -65,6 +71,7 @@ from ib_cgt.ingest import IngestResult, ingest_statement
 from ib_cgt.rules import (
     FutureResult,
     FutureRuleEngine,
+    FXRuleEngine,
     InconsistentTradeError,
     MatchingResult,
     StockRuleEngine,
@@ -1277,6 +1284,340 @@ def _basis_cells(
         f"S.104 pool: qty={basis.quantity_before}, avg=£{_format_money_2dp(basis.average_cost_gbp)}"
     )
     return pool_text, "—"
+
+
+# ---------------------------------------------------------------------------
+# `match fx` — UK CGT matching per non-GBP currency pool
+# ---------------------------------------------------------------------------
+
+
+@match_app.command("fx")
+def match_fx(
+    currency: Annotated[
+        str | None,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Filter to one non-GBP currency pool (e.g. 'USD').",
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Inclusive lower bound on trade_date (YYYY-MM-DD). "
+                "Caveat: matching is sensitive to date clipping; for "
+                "production output omit this. Use only to construct "
+                "edge-case scenarios for debugging — clipping mid-"
+                "history breaks S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "Inclusive upper bound on trade_date (YYYY-MM-DD). "
+                "Same caveat as --since: clipping mid-history breaks "
+                "S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Dry-run the FX rule engine per non-GBP currency pool.
+
+    Loads every ingested forex trade once, derives the set of
+    non-GBP currencies that appear (as either base or quote), and
+    runs `FXRuleEngine.compute(ccy, all_forex_trades)` per
+    currency. A cross-currency trade like ``EUR.USD`` therefore
+    contributes one acquisition / disposal leg to *each* of the
+    two non-GBP pools it touches, with independent FX rates per
+    leg. Nothing is written to the database — this command is a
+    read-only audit tool.
+
+    Note that there is intentionally no ``--account`` flag:
+    filtering by account would silently break the matching
+    invariants for currencies with cross-account histories
+    (S.104 pools span accounts per
+    ``docs/architecture.md §Scope — Accounts``).
+    """
+    since_date = _parse_iso_date(since, "--since")
+    until_date = _parse_iso_date(until, "--until")
+    if currency is not None:
+        # Normalise here so both the engine and the renderer agree on
+        # the casing — ISO-4217 codes are upper-case.
+        currency = currency.upper()
+
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        # Defensive — same as `ingest`. A fresh DB file would otherwise
+        # surface as a confusing "no such table" error.
+        apply_migrations(conn)
+        fx_service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        engine = FXRuleEngine(fx_service)
+        forex_trades = TradeRepo(conn).for_asset_class(
+            AssetClass.FX,
+            since=since_date,
+            until=until_date,
+        )
+        currencies = _resolve_fx_pool_currencies(forex_trades, requested=currency)
+        results = _run_match_fx(
+            engine=engine,
+            forex_trades=forex_trades,
+            currencies=currencies,
+        )
+    finally:
+        conn.close()
+
+    if not currencies:
+        if currency is not None:
+            _console.print(
+                f"[yellow]Currency '{currency}' has no forex trades in the date range.[/]"
+            )
+        else:
+            _console.print("[yellow]No forex trades found — nothing to match.[/]")
+        return
+
+    _render_match_fx(results, db_path)
+
+
+# Per-currency outcome — either a successful `MatchingResult`, the
+# trade-id → trade-date map needed by the renderer for direct-match
+# basis dates, or the exception the engine raised. Mirrors the
+# `_MatchStocksRow` shape so the rendering helpers can stay parallel.
+_MatchFxRow = tuple[
+    str,
+    MatchingResult | None,
+    dict[int, date],
+    Exception | None,
+]
+
+
+def _resolve_fx_pool_currencies(
+    forex_trades: list[tuple[int, Trade]],
+    *,
+    requested: str | None,
+) -> list[str]:
+    """Return the list of non-GBP currency pools to render, in stable order.
+
+    When the user passes ``--currency``, we honour that single pool
+    (validated against the trade set so the renderer doesn't run an
+    engine call that's guaranteed to be empty). Otherwise we walk
+    every trade and collect the union of `base` and `quote` ISO codes,
+    minus GBP — sorted alphabetically so the output is stable
+    run-to-run.
+    """
+    seen: set[str] = set()
+    for _trade_id, trade in forex_trades:
+        # Only forex trades reach this loop (TradeRepo filtered by
+        # asset class) so the access on .currency_pair is safe — but
+        # we guard with isinstance to keep mypy honest under strict.
+        instrument = trade.instrument
+        if not isinstance(instrument, FXInstrument):
+            continue
+        seen.add(instrument.currency_pair.base)
+        seen.add(instrument.currency_pair.quote)
+    seen.discard("GBP")
+    if requested is None:
+        return sorted(seen)
+    if requested not in seen:
+        return []
+    return [requested]
+
+
+def _run_match_fx(
+    *,
+    engine: FXRuleEngine,
+    forex_trades: list[tuple[int, Trade]],
+    currencies: list[str],
+) -> list[_MatchFxRow]:
+    """Run the FX engine per currency with per-currency error capture.
+
+    Builds a `{trade_id: trade_date}` map shared across pools (the
+    map is keyed by trade id, which is unique across the whole forex
+    set). The renderer uses it to show a basis acquisition's date
+    alongside its trade id.
+    """
+    date_map = {trade_id: trade.trade_date for trade_id, trade in forex_trades}
+    out: list[_MatchFxRow] = []
+    for ccy in currencies:
+        try:
+            result = engine.compute(ccy, forex_trades)
+        except (
+            WrongAssetClassError,
+            InconsistentTradeError,
+            UnmatchedDisposalError,
+            RateNotFoundError,
+            ValueError,
+        ) as exc:
+            out.append((ccy, None, date_map, exc))
+            continue
+        out.append((ccy, result, date_map, None))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers — `match fx`
+# ---------------------------------------------------------------------------
+
+
+def _render_match_fx(rows: list[_MatchFxRow], db_path: Path) -> None:
+    """Render matched-disposals, residuals, final-pool, summary, errors."""
+    _render_match_fx_disposals(rows)
+    _render_match_fx_residuals(rows)
+    _render_match_fx_final_pools(rows)
+    _render_match_fx_summary(rows, db_path)
+    _render_match_fx_errors(rows)
+
+
+def _render_match_fx_disposals(rows: list[_MatchFxRow]) -> None:
+    """Per-currency section: bold header then a Rich matched-disposals table.
+
+    Columns mirror `match stocks` exactly — same fee-pairing /
+    subset-semantics conventions — so the auditor's eye doesn't have
+    to retrain across asset classes.
+    """
+    _console.print("[bold]FX matched disposals (dry-run)[/]")
+    for currency, result, date_map, error in rows:
+        if error is not None:
+            continue
+        assert result is not None  # mypy — error/result are mutually exclusive
+        divider = _fx_divider(currency)
+        _console.print(f"\n[bold cyan]{divider}[/]")
+        if not result.matched_disposals:
+            _console.print("  [dim](no matched disposals)[/]")
+            continue
+        table = Table(header_style="bold", show_lines=False)
+        table.add_column("Disp ID", justify="right")
+        table.add_column("Disp Date")
+        table.add_column("Rule")
+        table.add_column("Qty", justify="right")
+        table.add_column("Acq ID / Basis")
+        table.add_column("Acq Date")
+        table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Disp Fees (GBP)", justify="right")
+        table.add_column("Cost (GBP)", justify="right")
+        table.add_column("Acq Fees (GBP)", justify="right")
+        table.add_column("Gain (GBP)", justify="right")
+        for md in result.matched_disposals:
+            table.add_row(*_matched_disposal_to_cells(md, date_map))
+        _console.print(table)
+
+
+def _render_match_fx_residuals(rows: list[_MatchFxRow]) -> None:
+    """One flat table of every UnmatchedAcquisition across all currency pools."""
+    residuals: list[tuple[str, UnmatchedAcquisition]] = [
+        (currency, ua)
+        for currency, result, _, error in rows
+        if error is None and result is not None
+        for ua in result.unmatched_acquisitions
+    ]
+    if not residuals:
+        _console.print("[dim]No pool residuals after matching.[/]")
+        return
+
+    table = Table(
+        title="Pool residuals at end of input",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Currency")
+    table.add_column("Acq ID", justify="right")
+    table.add_column("Acq Date")
+    table.add_column("Qty Remaining", justify="right")
+    table.add_column("Cost Remaining (GBP)", justify="right")
+    for currency, ua in residuals:
+        table.add_row(
+            currency,
+            str(ua.trade_id),
+            ua.acquisition_date.isoformat(),
+            f"{ua.quantity_remaining}",
+            _format_money_2dp(ua.cost_remaining_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_fx_final_pools(rows: list[_MatchFxRow]) -> None:
+    """Per-currency final-pool aggregate. Skips empty pools."""
+    pools: list[tuple[str, TaxLot]] = [
+        (currency, result.final_pool)
+        for currency, result, _, error in rows
+        if error is None and result is not None and result.final_pool.quantity > 0
+    ]
+    if not pools:
+        return
+
+    table = Table(
+        title="Final S.104 pools",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Currency")
+    table.add_column("Pool Qty", justify="right")
+    table.add_column("Pool Cost (GBP)", justify="right")
+    table.add_column("Avg Cost (GBP)", justify="right")
+    for currency, pool in pools:
+        table.add_row(
+            currency,
+            f"{pool.quantity}",
+            _format_money_2dp(pool.total_cost_gbp),
+            _format_money_2dp(pool.average_cost_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_fx_summary(rows: list[_MatchFxRow], db_path: Path) -> None:
+    """Small summary: counts and total realised gain across all pools."""
+    error_count = sum(1 for _, _, _, error in rows if error is not None)
+    md_count = sum(
+        len(result.matched_disposals)
+        for _, result, _, error in rows
+        if error is None and result is not None
+    )
+    total_gain = Money.gbp(Decimal("0"))
+    for _, result, _, error in rows:
+        if error is not None or result is None:
+            continue
+        for md in result.matched_disposals:
+            total_gain = total_gain + md.gain_gbp
+
+    table = Table(
+        title="Summary",
+        caption=f"[dim]{db_path}[/]",
+        header_style="bold",
+    )
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Currencies processed", str(len(rows)))
+    table.add_row("…with errors", str(error_count))
+    table.add_row("Matched disposal chunks", str(md_count))
+    gain_style = "green" if total_gain.amount >= 0 else "red"
+    table.add_row(
+        "Total realised gain (GBP)",
+        f"[{gain_style}]{_format_money_2dp(total_gain)}[/]",
+    )
+    _console.print(table)
+
+
+def _render_match_fx_errors(rows: list[_MatchFxRow]) -> None:
+    """Print every per-currency error in one block at the end."""
+    error_rows = [(currency, error) for currency, _, _, error in rows if error is not None]
+    if not error_rows:
+        return
+    _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
+    for currency, error in error_rows:
+        _console.print(f"  [bold cyan]{_fx_divider(currency)}[/] [red]→ {error}[/]")
+
+
+def _fx_divider(currency: str) -> str:
+    """Stable label used in section dividers and error rows."""
+    return f"{currency} vs GBP"
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

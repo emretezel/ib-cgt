@@ -29,7 +29,7 @@ from ib_cgt.db.codecs import (
     text_to_dt,
 )
 from ib_cgt.db.repos.instruments import InstrumentRepo
-from ib_cgt.domain import TaxYear, Trade, TradeAction
+from ib_cgt.domain import AssetClass, TaxYear, Trade, TradeAction
 
 
 class TradeRepo:
@@ -178,6 +178,58 @@ class TradeRepo:
             params.append(date_to_text(until))
 
         sql = "SELECT * FROM trades WHERE " + " AND ".join(clauses) + " ORDER BY trade_datetime ASC"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
+
+    def for_asset_class(
+        self,
+        asset_class: AssetClass,
+        *,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> list[tuple[int, Trade]]:
+        """Return `(trade_id, Trade)` pairs across every instrument in `asset_class`.
+
+        Drives the FX rule engine's CLI and orchestrator path: the
+        UK-CGT FX pool is per-currency-vs-GBP, so a single forex trade
+        for `EUR.USD` may need to feed the EUR pool *and* the USD
+        pool. The cleanest way to thread that is to load the full
+        forex trade list once and let the engine project per-pool legs
+        — this method materialises that list.
+        Joins the `instruments` parent table to filter by the
+        discriminator column. The covering index on
+        `(instrument_id, trade_datetime)` keeps the per-instrument
+        chronology cheap once the join narrows by asset class.
+
+        Args:
+            asset_class: The asset-class discriminator to filter on.
+                Per-class repo helpers (`list_stocks`, `list_futures`,
+                etc.) typically drive the per-instrument loop, so this
+                method exists primarily for the FX case where the
+                pool is not 1-to-1 with the instrument.
+            since: Inclusive lower bound on `trade_date`. `None` means
+                no lower bound.
+            until: Inclusive upper bound on `trade_date`. `None` means
+                no upper bound.
+
+        Returns:
+            A list of `(trade_id, Trade)` pairs ordered by
+            `trade_datetime` ascending — same order the rule engines
+            consume.
+        """
+        clauses: list[str] = ["i.asset_class = ?"]
+        params: list[object] = [asset_class.value]
+        if since is not None:
+            clauses.append("t.trade_date >= ?")
+            params.append(date_to_text(since))
+        if until is not None:
+            clauses.append("t.trade_date <= ?")
+            params.append(date_to_text(until))
+        sql = (
+            "SELECT t.* FROM trades t "
+            "JOIN instruments i ON i.instrument_id = t.instrument_id "
+            "WHERE " + " AND ".join(clauses) + " ORDER BY t.trade_datetime ASC"
+        )
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
 

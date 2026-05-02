@@ -15,8 +15,10 @@ from decimal import Decimal
 
 from ib_cgt.domain import (
     Acquisition,
+    CurrencyPair,
     Disposal,
     FutureInstrument,
+    FXInstrument,
     Money,
     StockInstrument,
     Trade,
@@ -45,6 +47,20 @@ def es_future(
         currency=currency,
         contract_multiplier=multiplier,
         expiry_date=expiry,
+    )
+
+
+def fx_pair(base: str, quote: str) -> FXInstrument:
+    """FX-pair instrument as the ingestion mapper produces it.
+
+    Symbol is `BASE.QUOTE`; `currency = base` (the domain invariant).
+    Used for FX-engine tests that feed raw IB-shaped trades through
+    the engine's per-currency projection.
+    """
+    return FXInstrument(
+        symbol=f"{base}.{quote}",
+        currency=base,
+        currency_pair=CurrencyPair(base=base, quote=quote),
     )
 
 
@@ -173,6 +189,39 @@ def stock_trade(
         quantity=Decimal(qty),
         price=Money.of(price, inst.currency),
         fees=Money.of(fees, inst.currency),
+    )
+
+
+def fx_trade(
+    *,
+    action: TradeAction,
+    on: date,
+    qty: Decimal | int | str,
+    price: Decimal | int | str,
+    fees: Decimal | int | str = Decimal("0"),
+    instrument: FXInstrument,
+    account_id: str = "U1",
+    seq: int = 0,
+) -> Trade:
+    """Build a forex `Trade` shaped exactly as the ingestion mapper produces.
+
+    Mirrors `stock_trade` but takes a mandatory FX `instrument`. The
+    mapper tags `price.currency` and `fees.currency` with the pair's
+    base currency (= `instrument.currency`); the price *amount* is
+    quote-per-base, so `qty * price.amount` is the quote-currency
+    total. The FX rule engine reconstructs the GBP figures from there.
+    """
+    dt = datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC) + timedelta(minutes=seq)
+    return Trade(
+        account_id=account_id,
+        instrument=instrument,
+        action=action,
+        trade_datetime=dt,
+        trade_date=on,
+        settlement_date=on,
+        quantity=Decimal(qty),
+        price=Money.of(price, instrument.currency),
+        fees=Money.of(fees, instrument.currency),
     )
 
 

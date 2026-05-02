@@ -17,6 +17,10 @@ The package contains:
 * `StockRuleEngine` — UK CGT four-rule matching for ordinary shares.
   Projects raw `Trade` rows into GBP `Acquisition`/`Disposal`
   records via the FX service and delegates to `MatchingEngine`.
+* `FXRuleEngine` — UK CGT four-rule matching for non-GBP currency
+  holdings, pooled per single currency vs GBP. A single forex trade
+  may feed one or two pools; the engine projects per-pool legs and
+  delegates to `MatchingEngine`.
 * `FutureRuleEngine` — per-contract close-out treatment for futures
   per HMRC HS292. Does *not* use `MatchingEngine`; futures emit a
   separate `FutureRealisation` shape because UK share-matching rules
@@ -37,11 +41,13 @@ from ib_cgt.rules.errors import (
     WrongAssetClassError,
 )
 from ib_cgt.rules.futures import FutureResult, FutureRuleEngine, FXConverter
+from ib_cgt.rules.fx import FXRuleEngine
 from ib_cgt.rules.matching import MatchingEngine, MatchingResult
 from ib_cgt.rules.stocks import StockRuleEngine
 
 __all__ = [
     "FXConverter",
+    "FXRuleEngine",
     "FutureResult",
     "FutureRuleEngine",
     "InconsistentTradeError",

@@ -402,13 +402,139 @@ deferred until the reporting layer needs them across runs.
 
 All four live in `ib_cgt.rules`.
 
+## `FXRuleEngine`
+
+```python
+from ib_cgt.fx import FXService
+from ib_cgt.rules import FXRuleEngine
+
+engine = FXRuleEngine(fx)            # fx implements FXConverter Protocol
+result = engine.compute("USD", trades)
+```
+
+`FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
+projects raw forex `Trade` rows into GBP-denominated `Acquisition`
+and `Disposal` records via the FX service, then delegates the match.
+Unlike the stock engine its API is **per-currency** rather than
+per-instrument, because UK CGT pools FX per single non-GBP currency
+vs GBP — and a single `EUR.USD` trade therefore touches *two* pools
+(one EUR, one USD).
+
+### Per-currency pool model
+
+The CGT pool for a UK taxpayer is per single non-GBP currency vs
+GBP — there is one USD pool, one EUR pool, etc. — irrespective of
+which counter-currency the trade was struck against. To match
+`MatchingEngine`'s instrument-identity contract the engine
+synthesises an `FXInstrument(symbol=<ccy>, currency=<ccy>,
+currency_pair=(<ccy>, GBP))` once per `compute()` call and stamps
+it onto every projected event. The persisted `FXInstrument` rows in
+`fx_instruments` stay keyed by traded pair (`EUR.USD`, `USD.GBP`,
+…) — that's the ingestion shape, distinct from the matching shape.
+
+The CLI / orchestrator passes the **full** forex-trade list per
+call; the engine projects only the legs that touch the requested
+pool currency and silently skips the rest. That keeps the IO
+model simple — load forex trades once — while still letting the
+engine decide per-trade which pools each fill belongs to.
+
+### Per-trade projection
+
+For an FX `Trade` whose pair is `BASE.QUOTE` and whose target pool
+is `C`:
+
+| Trade            | `target == BASE`                                      | `target == QUOTE`                                       |
+|------------------|-------------------------------------------------------|---------------------------------------------------------|
+| `BUY BASE.QUOTE` | acquire `qty` of C (paid `qty*price` of QUOTE)        | dispose `qty*price` of C (received `qty` of BASE)       |
+| `SELL BASE.QUOTE`| dispose `qty` of C (received `qty*price` of QUOTE)    | acquire `qty*price` of C (paid `qty` of BASE)           |
+
+Trades whose pair touches neither `target` nor GBP-pivoted-to-target
+are skipped without an FX call.
+
+The mapper (`ingest/mapper.py`) tags `Trade.price.currency` with
+the pair's *base* currency (the domain invariant), even though the
+printed amount represents quote-per-base. Multiplying
+`qty * price.amount` therefore always yields the quote-currency
+total.
+
+### GBP conversion — independent per leg
+
+The OTHER-leg amount (in OTHER currency) becomes the GBP cost or
+proceeds via `FXService.convert_with_rate(amount, target=GBP,
+on=trade_date)`. When OTHER is GBP the value is already in GBP and
+the engine short-circuits without touching the FX cache.
+
+A cross-currency trade (both legs non-GBP) produces TWO events under
+TWO pools, **independently** GBP-converted using each leg's own spot
+rate — those are different rates and the two GBP figures will not
+reconcile to a single trade-value GBP figure. That is correct under
+HMRC: each leg is an independent tax event and uses its own spot
+(CG78310 — Bentley v Pike, Capcount Trading v Evans).
+
+Worked examples (all converted at the trade-date spot):
+
+| Trade                     | Pool | Event       | Units | GBP value                                      |
+|---------------------------|------|-------------|-------|------------------------------------------------|
+| `BUY USD.GBP 100 @0.79`   | USD  | acquire     | 100   | 79 GBP (no FX call)                            |
+| `SELL USD.GBP 100 @0.79`  | USD  | dispose     | 100   | 79 GBP (no FX call)                            |
+| `BUY GBP.EUR 100 @0.85`   | EUR  | dispose     | 85    | 100 GBP (no FX call — GBP is base here)        |
+| `SELL GBP.EUR 100 @0.85`  | EUR  | acquire     | 85    | 100 GBP (no FX call)                           |
+| `BUY EUR.USD 100 @1.10`   | EUR  | acquire     | 100   | `(100*1.10) USD → GBP` at trade-date USD/GBP   |
+| `BUY EUR.USD 100 @1.10`   | USD  | dispose     | 110   | `100 EUR → GBP` at trade-date EUR/GBP          |
+| `SELL EUR.USD 100 @1.10`  | EUR  | dispose     | 100   | `(100*1.10) USD → GBP` at trade-date USD/GBP   |
+| `SELL EUR.USD 100 @1.10`  | USD  | acquire     | 110   | `100 EUR → GBP` at trade-date EUR/GBP          |
+
+### Fees — subset semantics, single-event allocation
+
+Fees are tracked as a **separate fact** alongside cost / proceeds
+with subset semantics, mirroring `StockRuleEngine`:
+
+- `Acquisition.fees_gbp` is the buy-side fee component already
+  inside `Acquisition.cost_gbp`.
+- `Disposal.fees_gbp` is the sell-side fee amount already deducted
+  from `Disposal.proceeds_gbp`.
+
+The mapper tags `Trade.fees.currency` with the pair's base
+currency; the engine converts whatever the tag says at the
+trade-date spot.
+
+A **single-leg** trade (one side of the pair is GBP, only one event
+is generated) attaches fees to that single event in the usual way.
+A **cross-currency** trade splits into two events but is one fee
+charge — the engine attaches it entirely to the **acquisition leg**
+(`fees_gbp = 0` on the disposal leg). Allocating a single fee
+charge to exactly one event keeps the audit reconciliation honest;
+HMRC treats fees as incidental costs of acquisition, which makes
+the acquisition leg the right home.
+
+### Cross-account history
+
+S.104 pools span every account belonging to the taxpayer (per
+[`docs/architecture.md §Scope — Accounts`](./architecture.md)), and
+the same applies to FX pools. The CLI's `match fx` command does not
+expose an `--account` flag for the same reason `match stocks`
+doesn't.
+
+### Errors
+
+| Exception                | When                                                                                          |
+|--------------------------|-----------------------------------------------------------------------------------------------|
+| `WrongAssetClassError`   | A trade's instrument is not an `FXInstrument`.                                                |
+| `InconsistentTradeError` | A forex trade carries an action other than `BUY`/`SELL`.                                       |
+| `ValueError`             | `currency` is `"GBP"`, empty, or not an ISO-4217 code.                                        |
+| `UnmatchedDisposalError` | Propagated from `MatchingEngine` when a disposal still has residual after all four passes.     |
+| `RateNotFoundError`      | Propagated from `FXService` when no spot rate is available within the cache fallback window.   |
+
 ## What's not implemented yet
 
-`BondRuleEngine` and `FXRuleEngine` are pending (see
-[`architecture.md`](./architecture.md#implementation-order), steps
-9 and 10). Each will consume `MatchingEngine` as its internal
-matching primitive, layering on the asset-class quirks (bond
-accrued interest, FX rate-on-rate, etc.) on the way in. The
-strategy-pattern abstract base class will be introduced when the
-third engine lands — two concrete engines (`StockRuleEngine`,
-`FutureRuleEngine`) don't yet justify the boilerplate.
+`BondRuleEngine` is pending (see
+[`architecture.md`](./architecture.md#implementation-order), step
+9). It will consume `MatchingEngine` as its internal matching
+primitive, layering on bond-specific quirks (QCB / gilt exemption,
+purchase / sale accrued interest) on the way in. The strategy-pattern
+abstract base class will be revisited then — three concrete engines
+(`StockRuleEngine`, `FXRuleEngine`, `FutureRuleEngine`) start to
+justify the boilerplate, but the per-engine APIs are not yet
+identical (FX is per-currency, the others per-instrument), so the
+shape of any base class is best designed against four real
+implementations rather than three.
