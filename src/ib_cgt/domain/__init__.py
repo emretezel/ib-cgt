@@ -26,6 +26,7 @@ from ib_cgt.domain.disposal import (
     TaxLot,
     TaxLotSnapshot,
     UnmatchedAcquisition,
+    UnmatchedDisposalChunk,
 )
 from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
 from ib_cgt.domain.money import (
@@ -80,5 +81,6 @@ __all__ = [
     "Trade",
     "TradeAction",
     "UnmatchedAcquisition",
+    "UnmatchedDisposalChunk",
     "validate_currency_code",
 ]

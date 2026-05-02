@@ -397,6 +397,58 @@ class UnmatchedAcquisition:
 
 
 # ---------------------------------------------------------------------------
+# UnmatchedDisposalChunk — partial-result residual under soft-residual mode
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UnmatchedDisposalChunk:
+    """A disposal portion left un-covered after all four matching passes.
+
+    `MatchingEngine` normally raises `UnmatchedDisposalError` when a
+    disposal still has residual quantity after the four-rule sweep.
+    Under the opt-in `soft_residuals` mode (FX cashflow integration —
+    HMRC CG78315 — where opening balances may pre-date the IB-statement
+    history), the engine collects these instead so callers can render a
+    partial result with an explicit warning rather than blanking the
+    whole pool.
+
+    Attributes:
+        disposal_trade_id: Surrogate id of the originating raw `Trade`
+            row whose residual this chunk records.
+        instrument: The instrument the disposal targets — typically the
+            synthetic FX-pool `FXInstrument(<ccy> vs GBP)`.
+        disposal_date: UK-local disposal date.
+        quantity_remaining: Units that remain un-covered after the
+            four-rule sweep (strictly positive — zero residuals are
+            never emitted).
+        proceeds_remaining_gbp: Pro-rata GBP proceeds attributable to
+            the un-covered quantity (`quantity_remaining * proceeds_per_unit`).
+            Lets the renderer surface the GBP value of the missing
+            cover without re-deriving it.
+    """
+
+    disposal_trade_id: int
+    instrument: AnyInstrument
+    disposal_date: date
+    quantity_remaining: Decimal
+    proceeds_remaining_gbp: Money
+
+    def __post_init__(self) -> None:
+        """Enforce positivity and GBP denomination."""
+        if self.quantity_remaining <= 0:
+            raise ValueError(
+                f"UnmatchedDisposalChunk.quantity_remaining must be > 0, "
+                f"got {self.quantity_remaining}"
+            )
+        if not self.proceeds_remaining_gbp.is_gbp():
+            raise ValueError(
+                "UnmatchedDisposalChunk.proceeds_remaining_gbp must be GBP, "
+                f"got {self.proceeds_remaining_gbp.currency}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # FutureRealisation — closed-out futures contract (HMRC HS292)
 # ---------------------------------------------------------------------------
 

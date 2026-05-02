@@ -29,16 +29,17 @@ import pytest
 
 from ib_cgt.domain import (
     DirectAcquisition,
+    FutureRealisation,
     MatchRule,
     Money,
     StockInstrument,
     Trade,
     TradeAction,
 )
-from ib_cgt.rules.errors import UnmatchedDisposalError, WrongAssetClassError
+from ib_cgt.rules.errors import WrongAssetClassError
 from ib_cgt.rules.fx import FXRuleEngine
 
-from .conftest import fx_pair, fx_trade, stock_trade
+from .conftest import aapl, es_future, future_trade, fx_pair, fx_trade, stock_trade
 
 # ---------------------------------------------------------------------------
 # Multi-currency FX stub
@@ -234,12 +235,15 @@ def test_buy_eur_usd_splits_into_two_pools_with_independent_rates() -> None:
 
     # USD pool: disposed 110 USD, received 100 EUR → 100*0.90 = 90 GBP
     # principal. Fees do NOT attach (cross-currency disposal leg). The
-    # disposal needs cover — there's none in this single trade, so we
-    # expect an UnmatchedDisposalError when the USD pool is queried in
-    # isolation.
-    with pytest.raises(UnmatchedDisposalError) as exc_info:
-        engine.compute("USD", trades)
-    assert exc_info.value.unmatched_quantity == Decimal("110")
+    # disposal needs cover — there's none in this single trade, so the
+    # FX engine's soft-residual mode emits one UnmatchedDisposalChunk
+    # rather than raising.
+    usd_result = engine.compute("USD", trades)
+    assert usd_result.matched_disposals == ()
+    assert len(usd_result.unmatched_disposals) == 1
+    chunk = usd_result.unmatched_disposals[0]
+    assert chunk.quantity_remaining == Decimal("110")
+    assert chunk.proceeds_remaining_gbp == Money.gbp("90")
 
 
 def test_sell_eur_usd_mirrors_buy() -> None:
@@ -535,8 +539,13 @@ def test_non_fx_trade_raises_wrong_asset_class() -> None:
         engine.compute("USD", trades)
 
 
-def test_open_short_raises_unmatched_disposal_error() -> None:
-    """A solo `SELL USD.GBP` with no cover anywhere → UnmatchedDisposalError."""
+def test_open_short_surfaces_as_unmatched_disposal_chunk() -> None:
+    """A solo `SELL USD.GBP` with no cover anywhere → soft-residual chunk.
+
+    The FX engine opts into `MatchingEngine`'s soft-residual mode so an
+    opening-balance shortfall doesn't blank the audit output. Stocks /
+    futures keep the strict default; this contract is FX-specific.
+    """
     engine = FXRuleEngine(MultiCcyStubFXService({}))
     inst = fx_pair("USD", "GBP")
     trades = [
@@ -547,10 +556,13 @@ def test_open_short_raises_unmatched_disposal_error() -> None:
             ),
         ),
     ]
-    with pytest.raises(UnmatchedDisposalError) as exc_info:
-        engine.compute("USD", trades)
-    assert exc_info.value.disposal_trade_id == 1
-    assert exc_info.value.unmatched_quantity == Decimal("100")
+    result = engine.compute("USD", trades)
+    assert result.matched_disposals == ()
+    assert len(result.unmatched_disposals) == 1
+    chunk = result.unmatched_disposals[0]
+    assert chunk.disposal_trade_id == 1
+    assert chunk.quantity_remaining == Decimal("100")
+    assert chunk.proceeds_remaining_gbp == Money.gbp("79")
 
 
 def test_trades_not_touching_target_currency_are_skipped() -> None:
@@ -572,3 +584,154 @@ def test_trades_not_touching_target_currency_are_skipped() -> None:
     result = engine.compute("USD", trades)
     assert len(result.matched_disposals) == 0
     assert result.final_pool.quantity == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# Cashflow integration — stocks, futures fees, futures realisations
+# ---------------------------------------------------------------------------
+
+
+def test_compute_combines_forex_and_stock_cashflows() -> None:
+    """A stock SELL acquisition matches against a same-day forex SELL.
+
+    Same-day rule is direction-agnostic at the engine level, so a
+    USD acquisition (stock SELL bringing cash in) and a USD disposal
+    (forex SELL taking cash out) on the same date pair up via
+    SAME_DAY.
+    """
+    d = date(2024, 5, 1)
+    fx = MultiCcyStubFXService({("USD", d): Decimal("0.80")})
+    engine = FXRuleEngine(fx)
+    aapl_inst = aapl()
+    usd_gbp = fx_pair("USD", "GBP")
+
+    # Stock SELL: 10 AAPL @ $100 with $1 fees → 999 USD acquisition.
+    # Cash GBP value: 999 * 0.80 = 799.20 GBP.
+    stock_sell = stock_trade(
+        action=TradeAction.SELL, on=d, qty=10, price=100, fees=1, instrument=aapl_inst
+    )
+    # Forex SELL USD.GBP: dispose 500 USD @ 0.79 → 395 GBP proceeds.
+    forex_sell = fx_trade(
+        action=TradeAction.SELL,
+        on=d,
+        qty=500,
+        price="0.79",
+        instrument=usd_gbp,
+        seq=1,  # later in the day so order is deterministic
+    )
+    result = engine.compute(
+        "USD",
+        forex_trades=[(2, forex_sell)],
+        stock_trades=[(1, stock_sell)],
+    )
+    # SAME_DAY chunk for the 500 USD that overlaps. Cost basis from
+    # the stock acquisition's GBP value, pro-rated by quantity:
+    # 500/999 of 799.20 ≈ 400.0000 GBP.
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SAME_DAY
+    assert md.matched_quantity == Decimal("500")
+    assert md.matched_proceeds_gbp == Money.gbp("395")
+    # Pool residual: 999 - 500 = 499 USD with proportional cost basis.
+    assert result.final_pool.quantity == Decimal("499")
+
+
+def test_compute_uses_future_realisation_pnl_to_cover_forex_disposal() -> None:
+    """A winning USD futures realisation feeds the USD pool, covering a
+    later forex disposal."""
+    close_date = date(2024, 4, 10)
+    forex_date = date(2024, 5, 1)
+    fx = MultiCcyStubFXService(
+        {
+            ("USD", close_date): Decimal("0.80"),  # P&L conversion
+            # forex_date conversion is identity (USD.GBP is GBP-quote).
+        }
+    )
+    engine = FXRuleEngine(fx)
+    usd_gbp = fx_pair("USD", "GBP")
+
+    realisation = FutureRealisation(
+        open_trade_id=1,
+        close_trade_id=2,
+        instrument=es_future(),
+        side="LONG",
+        open_date=date(2024, 4, 1),
+        close_date=close_date,
+        quantity=Decimal("1"),
+        gross_pnl_native=Money.of("500", "USD"),
+        open_fee_native=Money.of("0", "USD"),
+        close_fee_native=Money.of("0", "USD"),
+        open_fx_rate=Decimal(1),
+        close_fx_rate=Decimal(1),
+        proceeds_gbp=Money.gbp("400"),
+        cost_gbp=Money.gbp("0"),
+    )
+    forex_disp = fx_trade(
+        action=TradeAction.SELL,
+        on=forex_date,
+        qty=300,
+        price="0.79",
+        instrument=usd_gbp,
+    )
+    result = engine.compute(
+        "USD",
+        forex_trades=[(99, forex_disp)],
+        future_realisations=[(10**12, realisation, "U1")],
+    )
+    # The realisation lives at close_date (Apr 10) — well outside the
+    # 30-day window after the forex disposal (May 1). But it's BEFORE
+    # the disposal, so it's an ordinary S.104-eligible acquisition.
+    # Pool draws at avg cost.
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("300")
+    # Pool: 500 USD, cost 400 GBP, avg 0.80. Drawn 300 USD * 0.80 = 240 GBP.
+    assert md.matched_cost_gbp == Money.gbp("240")
+    # Forex disposal proceeds: 300 * 0.79 = 237 GBP.
+    assert md.matched_proceeds_gbp == Money.gbp("237")
+    # Residual pool: 200 USD, proportional cost 160 GBP.
+    assert result.final_pool.quantity == Decimal("200")
+    assert result.final_pool.total_cost_gbp == Money.gbp("160")
+
+
+def test_compute_treats_future_trade_fees_as_disposals() -> None:
+    """Futures trade fees flow out of the pool at trade_date as disposals."""
+    fee_date = date(2024, 4, 5)
+    seed_date = date(2024, 1, 1)
+    fx = MultiCcyStubFXService(
+        {
+            ("USD", fee_date): Decimal("0.80"),
+            ("USD", seed_date): Decimal("0.78"),
+        }
+    )
+    engine = FXRuleEngine(fx)
+    # Seed the USD pool via a forex BUY so the fee disposal has cover.
+    seed = fx_trade(
+        action=TradeAction.BUY,
+        on=seed_date,
+        qty=100,
+        price="0.78",
+        instrument=fx_pair("USD", "GBP"),
+    )
+    fee_trade_event = future_trade(
+        action=TradeAction.OPEN_LONG,
+        on=fee_date,
+        qty=1,
+        price=5000,
+        fees="4.50",
+    )
+    result = engine.compute(
+        "USD",
+        forex_trades=[(1, seed)],
+        future_trades=[(2, fee_trade_event)],
+    )
+    # Fee disposal: 4.50 USD @ 0.80 = 3.60 GBP. Drawn from S.104 pool.
+    # Pool: 100 USD @ 0.78 GBP/USD = 78 GBP. Avg 0.78.
+    # 4.50 USD drawn at avg 0.78 → 3.51 GBP cost.
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("4.50")
+    assert md.matched_cost_gbp == Money.gbp("3.51")
+    assert md.matched_proceeds_gbp == Money.gbp("3.60")

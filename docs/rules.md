@@ -409,16 +409,45 @@ from ib_cgt.fx import FXService
 from ib_cgt.rules import FXRuleEngine
 
 engine = FXRuleEngine(fx)            # fx implements FXConverter Protocol
-result = engine.compute("USD", trades)
+result = engine.compute(
+    "USD",
+    forex_trades=forex_trades,
+    stock_trades=non_gbp_stock_trades,
+    future_trades=non_gbp_future_trades,
+    future_realisations=realisations,  # from FutureRuleEngine
+)
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects raw forex `Trade` rows into GBP-denominated `Acquisition`
-and `Disposal` records via the FX service, then delegates the match.
-Unlike the stock engine its API is **per-currency** rather than
-per-instrument, because UK CGT pools FX per single non-GBP currency
-vs GBP — and a single `EUR.USD` trade therefore touches *two* pools
-(one EUR, one USD).
+projects events from **four sources** into GBP-denominated
+`Acquisition` and `Disposal` records via the FX service, then
+delegates the match. Unlike the stock engine its API is
+**per-currency** rather than per-instrument, because UK CGT pools FX
+per single non-GBP currency vs GBP — and a single `EUR.USD` trade
+therefore touches *two* pools (one EUR, one USD).
+
+The four cashflow sources implement HMRC CG78315 — "foreign currency
+arising from any source" — so the per-currency pool reflects every
+foreign-cash movement IB reports:
+
+1. **Forex trades** — explicit `Forex` rows. Same projection as
+   the v1 engine.
+2. **Non-GBP stock trades** — a USD-listed stock BUY spends USD
+   from the pool (a disposal of `(price*qty + fees)` USD); a SELL
+   brings USD in (an acquisition of `(price*qty − fees)` USD). GBP
+   value is the cash amount converted at trade-date spot.
+3. **Non-GBP futures trade fees** — every OPEN/CLOSE leg pays a
+   commission in the contract's native currency at trade_date,
+   regardless of whether the position eventually realises a gain
+   or loss. Always a disposal.
+4. **Futures realisations** — gross P&L on closed contracts settles
+   in the contract's native currency at close_date. Winning trades
+   emit acquisitions; losing trades emit disposals. The orchestrator
+   runs `FutureRuleEngine` first to produce the realisation list.
+
+The cashflow projection helpers live in
+[`src/ib_cgt/rules/fx_cashflow.py`](../src/ib_cgt/rules/fx_cashflow.py).
+Each is a pure function returning `Acquisition | Disposal | None`.
 
 ### Per-currency pool model
 
@@ -515,15 +544,37 @@ the same applies to FX pools. The CLI's `match fx` command does not
 expose an `--account` flag for the same reason `match stocks`
 doesn't.
 
+### Soft-residual mode
+
+The FX engine calls
+`MatchingEngine.match(..., soft_residuals=True)`. Long-running IB
+accounts may carry a foreign-currency opening balance that
+pre-dates the ingested statements (a wire-in, prior-statement
+activity, etc.). Under strict matching that surfaces as
+`UnmatchedDisposalError` for the whole pool, blanking the audit
+output — not useful when most of the pool *is* matched.
+
+Soft mode collects the residual into
+`MatchingResult.unmatched_disposals` (a tuple of
+`UnmatchedDisposalChunk`) so the renderer can show every matched
+chunk plus a clearly-flagged warning for the un-covered remainder.
+The CLI's `match fx` command surfaces this as a yellow "Unmatched
+disposals" section. Stock and futures matching keep the strict
+default — their inputs are self-contained and a residual genuinely
+indicates bad data.
+
 ### Errors
 
 | Exception                | When                                                                                          |
 |--------------------------|-----------------------------------------------------------------------------------------------|
-| `WrongAssetClassError`   | A trade's instrument is not an `FXInstrument`.                                                |
-| `InconsistentTradeError` | A forex trade carries an action other than `BUY`/`SELL`.                                       |
+| `WrongAssetClassError`   | An input trade's instrument is not the expected asset class for its source list.              |
+| `InconsistentTradeError` | A forex / stock trade carries an action other than `BUY`/`SELL`.                              |
 | `ValueError`             | `currency` is `"GBP"`, empty, or not an ISO-4217 code.                                        |
-| `UnmatchedDisposalError` | Propagated from `MatchingEngine` when a disposal still has residual after all four passes.     |
-| `RateNotFoundError`      | Propagated from `FXService` when no spot rate is available within the cache fallback window.   |
+| `RateNotFoundError`      | Propagated from `FXService` when no spot rate is available within the cache fallback window.  |
+
+`UnmatchedDisposalError` is **not** raised from the FX engine;
+residuals surface in `MatchingResult.unmatched_disposals` instead
+(soft-residual mode).
 
 ## What's not implemented yet
 

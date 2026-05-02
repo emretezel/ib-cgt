@@ -88,6 +88,7 @@ from ib_cgt.domain import (
     TaxLot,
     TaxLotSnapshot,
     UnmatchedAcquisition,
+    UnmatchedDisposalChunk,
 )
 from ib_cgt.rules.errors import UnmatchedDisposalError
 
@@ -118,11 +119,20 @@ class MatchingResult:
             reports read naturally. Empty if the pool is empty.
         final_pool: Aggregate pool state at end of run. Always present
             (zero-quantity if the pool is empty).
+        unmatched_disposals: One row per disposal still carrying
+            residual quantity after all four passes. Always empty
+            under the default strict mode (the engine raises
+            `UnmatchedDisposalError` instead). Populated only when
+            the caller passes `soft_residuals=True` to `match()` —
+            the FX cashflow-integration path uses this so an
+            opening-balance shortfall surfaces as a partial result
+            rather than blanking the whole pool.
     """
 
     matched_disposals: tuple[MatchedDisposal, ...]
     unmatched_acquisitions: tuple[UnmatchedAcquisition, ...]
     final_pool: TaxLot
+    unmatched_disposals: tuple[UnmatchedDisposalChunk, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +236,8 @@ class MatchingEngine:
         instrument: AnyInstrument,
         acquisitions: list[Acquisition] | tuple[Acquisition, ...],
         disposals: list[Disposal] | tuple[Disposal, ...],
+        *,
+        soft_residuals: bool = False,
     ) -> MatchingResult:
         """Match `disposals` against `acquisitions` and return the result.
 
@@ -238,16 +250,28 @@ class MatchingEngine:
                 history (not just the target tax year). Order is not
                 required — the engine sorts internally.
             disposals: Every disposal to match. Order is not required.
+            soft_residuals: When False (default), a disposal that
+                still has residual quantity after the four-rule sweep
+                raises `UnmatchedDisposalError`. When True, residuals
+                are collected into `MatchingResult.unmatched_disposals`
+                and the engine returns normally. The FX cashflow-
+                integration path opts in because pre-history opening
+                balances are a known incomplete-data scenario for
+                long-running IB accounts (HMRC CG78315). Stocks /
+                bonds / futures should keep the strict default — their
+                inputs are self-contained.
 
         Returns:
             A `MatchingResult` with matched disposals (in (chronological,
-            rule-priority) order), itemised pool residuals, and the
-            aggregate `final_pool` `TaxLot`.
+            rule-priority) order), itemised pool residuals, the
+            aggregate `final_pool` `TaxLot`, and (under soft mode)
+            the per-disposal residual list.
 
         Raises:
             UnmatchedDisposalError: If a disposal still has residual
                 quantity after exhausting same-day, 30-day, and pool
-                matches (i.e. the trade history is incomplete).
+                matches (i.e. the trade history is incomplete) and
+                `soft_residuals` is False.
             ValueError: If any input acquisition or disposal references
                 a different instrument than `instrument`.
         """
@@ -282,10 +306,14 @@ class MatchingEngine:
         # Final residual check: any disposal still carrying residual
         # quantity after every rule has had its turn means the trade
         # history is incomplete (e.g. a still-open short with no
-        # buy-to-cover anywhere in the input). Fail loudly so the
-        # tax report is not silently distorted by a half-matched
-        # disposal.
-        self._raise_if_residuals(disp_state, instrument)
+        # buy-to-cover anywhere in the input). Strict mode fails
+        # loudly; soft mode collects the residuals so the caller can
+        # render a partial result with an explicit warning.
+        if soft_residuals:
+            unmatched_disp = self._collect_residuals(disp_state, instrument)
+        else:
+            self._raise_if_residuals(disp_state, instrument)
+            unmatched_disp = ()
 
         # Compose final emit order: per disposal in chronological order,
         # rule-priority within disposal, then emit sequence as tie-break.
@@ -302,6 +330,7 @@ class MatchingEngine:
             matched_disposals=matched,
             unmatched_acquisitions=unmatched_acqs,
             final_pool=final_pool,
+            unmatched_disposals=unmatched_disp,
         )
 
     # ------------------------------------------------------------------
@@ -607,6 +636,34 @@ class MatchingEngine:
                     disposal_trade_id=ds.disposal.trade_id,
                     unmatched_quantity=ds.quantity_remaining,
                 )
+
+    @staticmethod
+    def _collect_residuals(
+        disp_state: list[_DispState], instrument: AnyInstrument
+    ) -> tuple[UnmatchedDisposalChunk, ...]:
+        """Soft-mode counterpart of `_raise_if_residuals`.
+
+        Walks `disp_state` in the same chronological order the
+        passes used and emits one `UnmatchedDisposalChunk` per
+        disposal that still has residual quantity. The chunk's
+        `proceeds_remaining_gbp` is `proceeds_per_unit *
+        quantity_remaining`, so the renderer can show the GBP value
+        of the missing cover without re-deriving it.
+        """
+        chunks: list[UnmatchedDisposalChunk] = []
+        for ds in disp_state:
+            if ds.quantity_remaining <= 0:
+                continue
+            chunks.append(
+                UnmatchedDisposalChunk(
+                    disposal_trade_id=ds.disposal.trade_id,
+                    instrument=instrument,
+                    disposal_date=ds.disposal.disposal_date,
+                    quantity_remaining=ds.quantity_remaining,
+                    proceeds_remaining_gbp=Money.gbp(ds.proceeds_per_unit * ds.quantity_remaining),
+                )
+            )
+        return tuple(chunks)
 
     # ------------------------------------------------------------------
     # Shared consume helper for direct (same-day / 30-day / s.105(2)) matches
