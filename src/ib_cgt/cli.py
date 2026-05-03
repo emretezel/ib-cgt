@@ -2377,12 +2377,17 @@ def show_realisation(
         ) as exc:
             _console.print(f"[red]Could not compute realisations: {exc}[/]")
             raise typer.Exit(code=1) from exc
+
+        matching = [r for r in result.realisations if r.close_trade_id == close]
+        if open_id is not None:
+            matching = [r for r in matching if r.open_trade_id == open_id]
+        # Pre-fetch statement provenance for every trade id we are
+        # about to render, so the auditor can see the source HTML
+        # path inline rather than chasing it via `show trade`.
+        statement_lookup = _build_statement_lookup(conn, matching)
     finally:
         conn.close()
 
-    matching = [r for r in result.realisations if r.close_trade_id == close]
-    if open_id is not None:
-        matching = [r for r in matching if r.open_trade_id == open_id]
     if not matching:
         msg = f"No realisations with close_trade_id={close}"
         if open_id is not None:
@@ -2390,13 +2395,48 @@ def show_realisation(
         _console.print(f"[yellow]{msg}.[/]")
         return
 
-    _render_show_realisation(matching, result.realisations, db_path)
+    _render_show_realisation(matching, result.realisations, db_path, statement_lookup)
+
+
+def _build_statement_lookup(
+    conn: sqlite3.Connection,
+    realisations: list[FutureRealisation],
+) -> dict[int, tuple[StatementRow | None, int]]:
+    """Resolve every open/close trade id to its source-statement metadata.
+
+    Returns a dict keyed by `trade_id` with `(statement_row, row_index)`.
+    `statement_row` is `None` only if the underlying `statements` row
+    is missing — the same defensive branch `show trade` carries
+    (`_render_show_trade`'s "hash not found" path).
+    """
+    trade_ids: set[int] = set()
+    for r in realisations:
+        trade_ids.add(r.open_trade_id)
+        trade_ids.add(r.close_trade_id)
+
+    trade_repo = TradeRepo(conn)
+    statement_repo = StatementRepo(conn)
+    statement_cache: dict[str, StatementRow | None] = {}
+    out: dict[int, tuple[StatementRow | None, int]] = {}
+    for trade_id in trade_ids:
+        stored_t = trade_repo.get(trade_id)
+        if stored_t is None:
+            # Realisations always reference real trade ids — if this
+            # ever fires, something has corrupted the run; skip the
+            # row rather than raising mid-render.
+            continue
+        statement_hash = stored_t.statement_hash
+        if statement_hash not in statement_cache:
+            statement_cache[statement_hash] = statement_repo.get(statement_hash)
+        out[trade_id] = (statement_cache[statement_hash], stored_t.statement_row_index)
+    return out
 
 
 def _render_show_realisation(
     matching: list[FutureRealisation],
     all_realisations_for_close: tuple[FutureRealisation, ...],
     db_path: Path,
+    statement_lookup: dict[int, tuple[StatementRow | None, int]],
 ) -> None:
     """Render one panel per realisation with the slice index notation."""
     # Build slice-index map matching the FX renderer's convention:
@@ -2417,10 +2457,15 @@ def _render_show_realisation(
         if (r.open_trade_id, r.close_trade_id) in slice_index:
             suffix = f"[{slice_index[(r.open_trade_id, r.close_trade_id)]}]"
         title = f"P&L #{r.open_trade_id}→#{r.close_trade_id}{suffix}"
-        _render_one_realisation(title, r, db_path)
+        _render_one_realisation(title, r, db_path, statement_lookup)
 
 
-def _render_one_realisation(title: str, r: FutureRealisation, db_path: Path) -> None:
+def _render_one_realisation(
+    title: str,
+    r: FutureRealisation,
+    db_path: Path,
+    statement_lookup: dict[int, tuple[StatementRow | None, int]],
+) -> None:
     """Render a single realisation as a Rich panel-style table."""
     table = Table(
         title=title,
@@ -2445,11 +2490,13 @@ def _render_one_realisation(title: str, r: FutureRealisation, db_path: Path) -> 
         f"#{r.open_trade_id}  on {r.open_date.isoformat()}  "
         f"fee={r.open_fee_native.amount} {r.open_fee_native.currency}",
     )
+    _add_statement_row(table, "Open statement", statement_lookup.get(r.open_trade_id))
     table.add_row(
         "Close trade",
         f"#{r.close_trade_id}  on {r.close_date.isoformat()}  "
         f"fee={r.close_fee_native.amount} {r.close_fee_native.currency}",
     )
+    _add_statement_row(table, "Close statement", statement_lookup.get(r.close_trade_id))
     table.add_row("Quantity", f"{r.quantity}")
     table.add_row(
         "gross_pnl_native",
@@ -2468,6 +2515,25 @@ def _render_one_realisation(title: str, r: FutureRealisation, db_path: Path) -> 
     gain_style = "green" if r.gain_gbp.amount >= 0 else "red"
     table.add_row("gain_gbp", f"[{gain_style}]£{r.gain_gbp.amount}[/]")
     _console.print(table)
+
+
+def _add_statement_row(
+    table: Table,
+    label: str,
+    entry: tuple[StatementRow | None, int] | None,
+) -> None:
+    """Render the source-statement provenance for one realisation leg."""
+    if entry is None:
+        # `_build_statement_lookup` skips trade ids it cannot resolve;
+        # mirror `show trade`'s defensive branch so the dossier is
+        # still readable when the underlying statement row is missing.
+        table.add_row(label, "[red]trade row missing[/]")
+        return
+    statement_row, row_idx = entry
+    if statement_row is None:
+        table.add_row(label, "[red]hash not found[/]")
+    else:
+        table.add_row(label, f"{statement_row.source_path}  (row {row_idx})")
 
 
 # ---------------------------------------------------------------------------

@@ -242,6 +242,23 @@ def test_show_realisation_close_emits_pnl_notation(
     assert f"{expected}[" not in result.output
 
 
+def test_show_realisation_includes_statement_provenance(
+    runner: CliRunner, populated_db: tuple[Path, dict[str, int]]
+) -> None:
+    """Each realisation panel shows the open & close source-statement paths."""
+    _db_path, ids = populated_db
+    result = runner.invoke(app, ["show", "realisation", "--close", str(ids["future_close"])])
+    assert result.exit_code == 0
+    # The seeded fixture puts every trade on the same statement, so
+    # the source path appears once for the open leg and once for the
+    # close leg.
+    assert "Open statement" in result.output
+    assert "Close statement" in result.output
+    assert result.output.count("/tmp/U1.html") >= 2
+    # Each statement row carries its in-statement row index.
+    assert result.output.count("(row ") >= 2
+
+
 def test_show_realisation_non_futures_trade_errors(
     runner: CliRunner, populated_db: tuple[Path, dict[str, int]]
 ) -> None:
