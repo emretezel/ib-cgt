@@ -206,10 +206,11 @@ def fx_trade(
     """Build a forex `Trade` shaped exactly as the ingestion mapper produces.
 
     Mirrors `stock_trade` but takes a mandatory FX `instrument`. The
-    mapper tags `price.currency` and `fees.currency` with the pair's
-    base currency (= `instrument.currency`); the price *amount* is
-    quote-per-base, so `qty * price.amount` is the quote-currency
-    total. The FX rule engine reconstructs the GBP figures from there.
+    mapper tags `price.currency` with the pair's base currency
+    (= `instrument.currency`); the price *amount* is quote-per-base,
+    so `qty * price.amount` is the quote-currency total. The fee is
+    GBP-denominated regardless of the pair (IB convention) — the
+    domain enforces this for FX trades.
     """
     dt = datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC) + timedelta(minutes=seq)
     return Trade(
@@ -221,7 +222,7 @@ def fx_trade(
         settlement_date=on,
         quantity=Decimal(qty),
         price=Money.of(price, instrument.currency),
-        fees=Money.of(fees, instrument.currency),
+        fees=Money.gbp(fees),
     )
 
 

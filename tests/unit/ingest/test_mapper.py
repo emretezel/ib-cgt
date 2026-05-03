@@ -265,7 +265,7 @@ def test_forex_trade_mapping() -> None:
         datetime_text="2024-04-05, 21:41:02",
         quantity_text="-3.64",
         price_text="0.85742",
-        fees_text="0",
+        fees_text="-2.50",
         code="",
     )
     trade = map_rows(_make([row]))[0]
@@ -277,6 +277,36 @@ def test_forex_trade_mapping() -> None:
     # Price currency follows the instrument (base). See mapper docstring.
     assert trade.price.currency == "EUR"
     assert trade.price.amount == Decimal("0.85742")
+    # Forex fees are always GBP regardless of pair (IB convention).
+    # The fees-text sign is stripped by the mapper.
+    assert trade.fees.currency == "GBP"
+    assert trade.fees.amount == Decimal("2.50")
+
+
+def test_forex_fee_is_gbp_for_non_gbp_leg_pair() -> None:
+    """Forex fee currency is GBP even when neither leg of the pair is GBP.
+
+    IB denominates the Comm/Fee column in GBP for every Forex row,
+    regardless of the traded pair. This is asserted on a EUR.USD row
+    (no GBP leg) so the test cannot pass by the fee currency happening
+    to coincide with one of the legs.
+    """
+    row = RawTradeRow(
+        asset_class="Forex",
+        currency="USD",
+        symbol="EUR.USD",
+        datetime_text="2024-04-05, 21:41:02",
+        quantity_text="100",
+        price_text="1.10",
+        fees_text="-1.50",
+        code="",
+    )
+    trade = map_rows(_make([row]))[0]
+    assert isinstance(trade.instrument, FXInstrument)
+    assert trade.instrument.currency_pair.base == "EUR"
+    assert trade.instrument.currency_pair.quote == "USD"
+    assert trade.fees.currency == "GBP"
+    assert trade.fees.amount == Decimal("1.50")
 
 
 def test_forex_ep_ca_triad_collapses_to_single_delivery() -> None:

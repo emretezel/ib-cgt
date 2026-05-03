@@ -106,15 +106,17 @@ def test_buy_usd_gbp_produces_usd_acquisition_at_quote_face_value() -> None:
 
 
 def test_sell_usd_gbp_with_fees_deducts_them_from_proceeds() -> None:
-    """`SELL USD.GBP` with USD fees: proceeds GBP-net of fee→GBP-converted."""
+    """`SELL USD.GBP` with GBP fees: proceeds GBP-net of the GBP fee.
+
+    IB always denominates the forex Comm/Fee column in GBP regardless
+    of the pair, so the fee passes through `_money_to_gbp` unchanged.
+    """
     sell_date = date(2024, 5, 1)
     # Pre-feed a tiny acquisition so the disposal has cover.
     buy_date = sell_date - timedelta(days=60)
-    fx = MultiCcyStubFXService(
-        {
-            ("USD", sell_date): Decimal("0.80"),  # fees conversion only
-        }
-    )
+    # No FX rates needed — both legs are GBP-denominated end-to-end
+    # (USD.GBP price quoted in GBP; fee already GBP).
+    fx = MultiCcyStubFXService({})
     engine = FXRuleEngine(fx)
     inst = fx_pair("USD", "GBP")
     trades = [
@@ -138,10 +140,10 @@ def test_sell_usd_gbp_with_fees_deducts_them_from_proceeds() -> None:
     md = result.matched_disposals[0]
     assert md.match_rule is MatchRule.SECTION_104
     # principal_gbp for the disposal: 100 * 0.79 = 79 GBP (no FX call).
-    # fees_gbp: 2 USD @ stored 0.80 → 1.60 GBP.
-    # proceeds_gbp = 79 - 1.60 = 77.40 GBP.
-    assert md.matched_proceeds_gbp == Money.gbp("77.40")
-    assert md.matched_disposal_fees_gbp == Money.gbp("1.60")
+    # fees_gbp: 2 GBP (already GBP, no conversion).
+    # proceeds_gbp = 79 - 2 = 77 GBP.
+    assert md.matched_proceeds_gbp == Money.gbp("77")
+    assert md.matched_disposal_fees_gbp == Money.gbp("2")
     assert md.matched_cost_gbp == Money.gbp("78")
 
 
@@ -218,7 +220,8 @@ def test_buy_eur_usd_splits_into_two_pools_with_independent_rates() -> None:
     )
     engine = FXRuleEngine(fx)
     inst = fx_pair("EUR", "USD")
-    # qty=100 EUR, price=1.10 USD/EUR, fees=1.50 (tagged EUR by the mapper).
+    # qty=100 EUR, price=1.10 USD/EUR, fees=1.50 GBP (IB convention:
+    # forex commissions are always denominated in GBP).
     trades = [
         (
             1,
@@ -229,11 +232,11 @@ def test_buy_eur_usd_splits_into_two_pools_with_independent_rates() -> None:
     ]
 
     # EUR pool: acquired 100 EUR for 110 USD → 110*0.80 = 88 GBP principal.
-    # Fees attach: 1.50 EUR → 1.35 GBP. cost_gbp = 89.35 GBP.
+    # Fees attach: 1.50 GBP (no conversion). cost_gbp = 89.50 GBP.
     eur_result = engine.compute("EUR", trades)
     assert len(eur_result.matched_disposals) == 0
     assert eur_result.final_pool.quantity == Decimal("100")
-    assert eur_result.final_pool.total_cost_gbp == Money.gbp("89.35")
+    assert eur_result.final_pool.total_cost_gbp == Money.gbp("89.50")
 
     # USD pool: disposed 110 USD, received 100 EUR → 100*0.90 = 90 GBP
     # principal. Fees do NOT attach (cross-currency disposal leg). The
@@ -301,12 +304,12 @@ def test_sell_eur_usd_mirrors_buy() -> None:
     assert eur_md.matched_cost_gbp == Money.gbp("95")
 
     # USD pool: acquired 110 USD, paid 100 EUR → 100 * 0.90 = 90 GBP
-    # principal. Fees ATTACH to the USD acquisition leg: 1.50 EUR @ 0.90
-    # = 1.35 GBP. cost_gbp = 91.35 GBP.
+    # principal. Fees ATTACH to the USD acquisition leg: 1.50 GBP
+    # (no conversion). cost_gbp = 91.50 GBP.
     usd_result = engine.compute("USD", trades)
     assert len(usd_result.matched_disposals) == 0
     assert usd_result.final_pool.quantity == Decimal("110")
-    assert usd_result.final_pool.total_cost_gbp == Money.gbp("91.35")
+    assert usd_result.final_pool.total_cost_gbp == Money.gbp("91.50")
 
 
 # ---------------------------------------------------------------------------

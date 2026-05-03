@@ -70,7 +70,8 @@ def _fx_buy(
         settlement_date=on,
         quantity=Decimal(qty),
         price=Money.of(Decimal(price), inst.currency),
-        fees=Money.of(Decimal("0"), inst.currency),
+        # IB denominates forex commissions in GBP regardless of pair.
+        fees=Money.gbp(Decimal("0")),
     )
 
 

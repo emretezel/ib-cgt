@@ -128,7 +128,8 @@ def test_good_fx_trade() -> None:
         settlement_date=dt.date(),
         quantity=Decimal("10000"),
         price=Money.of("0.85", "EUR"),
-        fees=Money.zero("EUR"),
+        # IB denominates forex commissions in GBP regardless of pair.
+        fees=Money.gbp("0"),
     )
     assert t.instrument.currency == "EUR"
 
@@ -236,6 +237,62 @@ def test_reject_price_currency_mismatch() -> None:
             price=Money.gbp("180.50"),  # wrong currency
             fees=t.fees,
         )
+
+
+def test_reject_stock_fees_currency_mismatch() -> None:
+    """Stock / bond / futures fees must share the trade's native currency."""
+    t = _good_trade()  # USD-denominated AAPL stock
+    with pytest.raises(InvalidTradeError, match=r"Trade\.fees currency"):
+        Trade(
+            account_id=t.account_id,
+            instrument=t.instrument,
+            action=t.action,
+            trade_datetime=t.trade_datetime,
+            trade_date=t.trade_date,
+            settlement_date=t.settlement_date,
+            quantity=t.quantity,
+            price=t.price,
+            fees=Money.gbp("1.00"),  # GBP on a USD stock — must reject
+        )
+
+
+def test_reject_fx_fees_in_non_gbp_currency() -> None:
+    """FX trade fees must be GBP — IB always denominates forex commissions in GBP."""
+    dt = datetime(2024, 11, 1, 9, 0, tzinfo=_UK)
+    with pytest.raises(InvalidTradeError, match="forex commissions"):
+        Trade(
+            account_id="U1234567",
+            instrument=_eur_gbp_fx(),
+            action=TradeAction.BUY,
+            trade_datetime=dt,
+            trade_date=dt.date(),
+            settlement_date=dt.date(),
+            quantity=Decimal("10000"),
+            price=Money.of("0.85", "EUR"),
+            fees=Money.of("1", "EUR"),  # EUR fee on FX trade — must reject
+        )
+
+
+def test_accepts_fx_fees_in_gbp_for_non_gbp_leg_pair() -> None:
+    """A EUR.USD FX trade with a GBP fee is valid (no leg is GBP)."""
+    dt = datetime(2024, 11, 1, 9, 0, tzinfo=_UK)
+    eur_usd = FXInstrument(
+        symbol="EUR.USD",
+        currency="EUR",
+        currency_pair=CurrencyPair(base="EUR", quote="USD"),
+    )
+    t = Trade(
+        account_id="U1234567",
+        instrument=eur_usd,
+        action=TradeAction.BUY,
+        trade_datetime=dt,
+        trade_date=dt.date(),
+        settlement_date=dt.date(),
+        quantity=Decimal("100"),
+        price=Money.of("1.10", "EUR"),
+        fees=Money.gbp("1.50"),
+    )
+    assert t.fees == Money.gbp("1.50")
 
 
 def test_reject_negative_fees() -> None:

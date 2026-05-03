@@ -309,19 +309,32 @@ class Trade:
             )
 
     def _check_monetary_currencies(self) -> None:
-        """`price` and `fees` currencies must agree with the instrument's.
+        """`price` and `fees` currencies must agree with the IB convention.
 
-        The `instrument.currency` is the trading currency. Price and fees
-        are quoted in that currency on every IB statement we care about.
-        FX trades are handled the same way — the instrument's own
-        `currency` is the base currency of the pair.
+        `price.currency` always matches `instrument.currency` — IB quotes
+        the per-unit price in the trade's native currency for every asset
+        class (for FX, that is the pair's base, which `FXInstrument`
+        already forces to equal `currency`).
+
+        `fees.currency` follows the asset class. IB denominates the
+        Comm/Fee column in the trade's native currency for stocks, bonds,
+        and futures; for **forex** rows it is **always GBP**, regardless
+        of the pair traded. The branching here encodes that convention as
+        a typed invariant.
         """
         if self.price.currency != self.instrument.currency:
             raise InvalidTradeError(
                 f"Trade.price currency ({self.price.currency}) must match "
                 f"instrument currency ({self.instrument.currency})"
             )
-        if self.fees.currency != self.instrument.currency:
+        if isinstance(self.instrument, FXInstrument):
+            if self.fees.currency != "GBP":
+                raise InvalidTradeError(
+                    f"Trade.fees currency ({self.fees.currency}) for an FX "
+                    "trade must be GBP (IB denominates forex commissions in "
+                    "GBP regardless of the pair)"
+                )
+        elif self.fees.currency != self.instrument.currency:
             raise InvalidTradeError(
                 f"Trade.fees currency ({self.fees.currency}) must match "
                 f"instrument currency ({self.instrument.currency})"

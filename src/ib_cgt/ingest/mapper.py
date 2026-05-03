@@ -222,6 +222,11 @@ def _map_one(
     # reduces proceeds, not the other way round).
     fees_magnitude = abs(fees)
 
+    # IB denominates the Comm/Fee column in GBP for every Forex row,
+    # regardless of the pair traded (EUR.GBP, USD.JPY, CHF.USD, ...).
+    # For non-FX rows the fee shares the trade's native currency.
+    fee_currency = "GBP" if isinstance(instrument, FXInstrument) else instrument.currency
+
     # On a single-event row fees attach in full to that event. On a split
     # reversal row we allocate pro-rata by quantity, assigning any rounding
     # residual to the last leg so the sum equals `fees_magnitude` exactly.
@@ -244,7 +249,7 @@ def _map_one(
                 settlement_date=settlement_date,
                 quantity=qty,
                 price=Money.of(price, instrument.currency),
-                fees=Money.of(leg_fees, instrument.currency),
+                fees=Money.of(leg_fees, fee_currency),
                 accrued_interest=None,
             )
         )

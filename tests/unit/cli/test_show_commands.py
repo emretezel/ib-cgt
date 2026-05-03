@@ -106,6 +106,9 @@ def _seed_trades(conn: sqlite3.Connection) -> dict[str, int]:
         qty: int | str,
         price: str,
     ) -> Trade:
+        # IB denominates forex commissions in GBP regardless of pair;
+        # stocks and futures fees share the trade's native currency.
+        fees_ccy = "GBP" if isinstance(instrument, FXInstrument) else instrument.currency
         return Trade(
             account_id="U1",
             instrument=instrument,
@@ -115,7 +118,7 @@ def _seed_trades(conn: sqlite3.Connection) -> dict[str, int]:
             settlement_date=on,
             quantity=Decimal(qty),
             price=Money.of(Decimal(price), instrument.currency),
-            fees=Money.of(Decimal("0"), instrument.currency),
+            fees=Money.of(Decimal("0"), fees_ccy),
         )
 
     trades = [
