@@ -878,7 +878,7 @@ def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
         realisation.side,
         realisation.open_date.isoformat(),
         realisation.close_date.isoformat(),
-        f"{realisation.quantity}",
+        _format_qty_2dp(realisation.quantity),
         _format_money_signed_2dp(realisation.gross_pnl_native),
         _format_money_2dp(realisation.open_fee_native),
         _format_money_2dp(realisation.close_fee_native),
@@ -898,7 +898,7 @@ def _open_position_to_cells(position: OpenPosition) -> tuple[str, ...]:
         position.side,
         position.open_date.isoformat(),
         str(position.open_trade_id),
-        f"{position.quantity_remaining}",
+        _format_qty_2dp(position.quantity_remaining),
         f"{_format_money_2dp(position.open_price)} {position.open_price.currency}",
         f"{_format_money_2dp(position.fees_remaining)} {position.fees_remaining.currency}",
     )
@@ -912,6 +912,17 @@ def _format_money_2dp(value: Money) -> str:
     appends it explicitly per cell (open-positions table).
     """
     return f"{value.amount:,.2f}"
+
+
+def _format_qty_2dp(value: Decimal) -> str:
+    """Format a quantity to 2dp with thousands separators.
+
+    Used for every qty cell in the match command outputs. Two
+    decimal places are wide enough for the fractional FX-pool
+    amounts ("88.23 CHF") and stay tidy for whole-share / whole-
+    contract figures ("100.00", "5.00").
+    """
+    return f"{value:,.2f}"
 
 
 def _format_money_signed_2dp(value: Money) -> str:
@@ -1166,7 +1177,7 @@ def _render_match_stocks_residuals(rows: list[_MatchStocksRow]) -> None:
             instrument.currency,
             str(ua.trade_id),
             ua.acquisition_date.isoformat(),
-            f"{ua.quantity_remaining}",
+            _format_qty_2dp(ua.quantity_remaining),
             _format_money_2dp(ua.cost_remaining_gbp),
         )
     _console.print(table)
@@ -1200,7 +1211,7 @@ def _render_match_stocks_final_pools(rows: list[_MatchStocksRow]) -> None:
         table.add_row(
             instrument.symbol,
             instrument.currency,
-            f"{pool.quantity}",
+            _format_qty_2dp(pool.quantity),
             _format_money_2dp(pool.total_cost_gbp),
             _format_money_2dp(pool.average_cost_gbp),
         )
@@ -1281,7 +1292,7 @@ def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -
         str(md.disposal_trade_id),
         md.disposal_date.isoformat(),
         md.match_rule.value,
-        f"{md.matched_quantity}",
+        _format_qty_2dp(md.matched_quantity),
         basis_text,
         acq_date_text,
         f"[{proceeds_style}]{_format_money_2dp(proceeds)}[/]",
@@ -1307,7 +1318,8 @@ def _basis_cells(
     # SECTION_104 — TaxLotSnapshot. Show the pool's pre-draw size
     # and average cost so the auditor can reconstruct the basis.
     pool_text = (
-        f"S.104 pool: qty={basis.quantity_before}, avg=£{_format_money_2dp(basis.average_cost_gbp)}"
+        f"S.104 pool: qty={_format_qty_2dp(basis.quantity_before)}, "
+        f"avg=£{_format_money_2dp(basis.average_cost_gbp)}"
     )
     return pool_text, "—"
 
@@ -1896,7 +1908,7 @@ def _render_match_fx_unmatched_disposals(rows: list[_MatchFxRow]) -> None:
             id_label_map.get(tid, f"#{tid}"),
             source_descriptions.get(tid, "—"),
             chunk.disposal_date.isoformat(),
-            f"{chunk.quantity_remaining}",
+            _format_qty_2dp(chunk.quantity_remaining),
             _format_money_2dp(chunk.proceeds_remaining_gbp),
         )
     _console.print(table)
@@ -1931,7 +1943,7 @@ def _render_match_fx_residuals(rows: list[_MatchFxRow]) -> None:
             id_label_map.get(ua.trade_id, f"#{ua.trade_id}"),
             source_descriptions.get(ua.trade_id, "—"),
             ua.acquisition_date.isoformat(),
-            f"{ua.quantity_remaining}",
+            _format_qty_2dp(ua.quantity_remaining),
             _format_money_2dp(ua.cost_remaining_gbp),
         )
     _console.print(table)
@@ -1959,7 +1971,7 @@ def _render_match_fx_final_pools(rows: list[_MatchFxRow]) -> None:
     for currency, pool in pools:
         table.add_row(
             currency,
-            f"{pool.quantity}",
+            _format_qty_2dp(pool.quantity),
             _format_money_2dp(pool.total_cost_gbp),
             _format_money_2dp(pool.average_cost_gbp),
         )
@@ -2045,7 +2057,7 @@ def _fx_matched_disposal_to_cells(
         disp_source,
         md.disposal_date.isoformat(),
         md.match_rule.value,
-        f"{md.matched_quantity}",
+        _format_qty_2dp(md.matched_quantity),
         basis_text,
         acq_source_text,
         acq_date_text,
@@ -2077,7 +2089,8 @@ def _fx_basis_cells(
         label = id_label_map.get(acq_id, f"#{acq_id}")
         return f"acq {label}", source_text, date_text
     pool_text = (
-        f"S.104 pool: qty={basis.quantity_before}, avg=£{_format_money_2dp(basis.average_cost_gbp)}"
+        f"S.104 pool: qty={_format_qty_2dp(basis.quantity_before)}, "
+        f"avg=£{_format_money_2dp(basis.average_cost_gbp)}"
     )
     return pool_text, "—", "—"
 
@@ -2637,26 +2650,26 @@ def _render_show_match(
             table.add_row(
                 str(i),
                 md.match_rule.value,
-                f"{md.matched_quantity}",
+                _format_qty_2dp(md.matched_quantity),
                 _format_money_2dp(md.matched_cost_gbp),
                 _format_money_2dp(md.matched_proceeds_gbp),
                 basis_text,
-                f"{after}",
+                _format_qty_2dp(after),
             )
 
         if residual is not None:
             table.add_row(
                 "—",
                 "[yellow]UNMATCHED[/]",
-                f"{residual.quantity_remaining}",
+                _format_qty_2dp(residual.quantity_remaining),
                 "—",
                 _format_money_2dp(residual.proceeds_remaining_gbp),
                 "[yellow]opening-balance shortfall[/]",
-                "0",
+                _format_qty_2dp(Decimal(0)),
             )
         _console.print(table)
         _console.print(
-            f"  [dim]total disposal qty (this pool): {total_disposal_qty} "
+            f"  [dim]total disposal qty (this pool): {_format_qty_2dp(total_disposal_qty)} "
             f"({len(chunks)} matched chunk(s))[/]"
         )
 
