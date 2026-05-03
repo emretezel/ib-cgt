@@ -24,9 +24,9 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`9`** (`001_initial.sql` through `009_dividends.sql` all applied —
-see [`schema_migrations.md`](./schema_migrations.md) for the full
-list). Whenever a new migration lands in the repository, run
+`10`** (`001_initial.sql` through `010_fx_fees_to_gbp.sql` all
+applied — see [`schema_migrations.md`](./schema_migrations.md) for
+the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
 documentation so the per-table pages reflect what is actually
 deployed.
