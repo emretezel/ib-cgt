@@ -44,6 +44,7 @@ def _make(
         trades=tuple(trades),
         instruments=tuple(instruments or []),
         corporate_actions=(),
+        dividends=(),
     )
 
 

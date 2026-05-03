@@ -86,6 +86,7 @@ def _make(rows: list[RawCorporateActionRow]) -> ParsedStatement:
         trades=(),
         instruments=(),
         corporate_actions=tuple(rows),
+        dividends=(),
     )
 
 
@@ -358,6 +359,7 @@ def test_synthesizer_ignores_regular_trades_and_instruments() -> None:
                 proceeds_text="1,250.00",
             ),
         ),
+        dividends=(),
     )
 
     [trade] = map_corporate_actions(parsed, fx_service=_FXStub(rate=Decimal(1)))

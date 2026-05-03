@@ -47,6 +47,7 @@ from rich.table import Table
 
 from ib_cgt.config import resolve_db_path, resolve_fx_base_url
 from ib_cgt.db import (
+    DividendRepo,
     FXRateRepo,
     InstrumentRepo,
     StatementRepo,
@@ -59,6 +60,8 @@ from ib_cgt.db import (
 from ib_cgt.domain import (
     AssetClass,
     DirectAcquisition,
+    Dividend,
+    DividendKind,
     FutureInstrument,
     FutureRealisation,
     FXInstrument,
@@ -157,6 +160,7 @@ def db_init() -> None:
 _RESET_TABLES_DATA: tuple[str, ...] = (
     "tax_runs",  # cascades to matched_disposals
     "trades",
+    "dividends",
     "statements",
     "instruments",  # cascades to {stock,bond,future,fx}_instruments
     "accounts",
@@ -331,6 +335,11 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
     if result.merger_trade_count:
         plural = "" if result.merger_trade_count == 1 else "s"
         summary += f" (incl. {result.merger_trade_count} corporate-action disposal{plural})"
+    if result.dividend_count:
+        plural = "" if result.dividend_count == 1 else "s"
+        summary += (
+            f"; {result.dividends_inserted} new / {result.dividend_count} dividend cashflow{plural}"
+        )
     _console.print(summary + ".")
 
 
@@ -1390,6 +1399,7 @@ def match_fx(
             forex_trades=audit.forex_trades,
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
+            dividends=audit.dividends,
             requested=currency,
         )
         source_descriptions = _build_fx_source_descriptions(
@@ -1397,18 +1407,22 @@ def match_fx(
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
         )
         date_map = _build_fx_event_date_map(
             forex_trades=audit.forex_trades,
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
         )
         id_label_map = _build_fx_id_label_map(
             forex_trades=audit.forex_trades,
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
+            dividend_real_id=audit.dividend_real_id,
         )
         results = _run_match_fx(
             engine=engine,
@@ -1416,6 +1430,7 @@ def match_fx(
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
             currencies=currencies,
             date_map=date_map,
             source_descriptions=source_descriptions,
@@ -1455,6 +1470,7 @@ def _resolve_fx_pool_currencies(
     forex_trades: list[tuple[int, Trade]],
     stock_trades: list[tuple[int, Trade]],
     future_trades: list[tuple[int, Trade]],
+    dividends: list[tuple[int, Dividend]],
     requested: str | None,
 ) -> list[str]:
     """Return the list of non-GBP currency pools to render, in stable order.
@@ -1464,7 +1480,9 @@ def _resolve_fx_pool_currencies(
     engine call that's guaranteed to be empty). Otherwise we walk
     every source and collect the union of currencies that appear,
     minus GBP — sorted alphabetically so the output is stable
-    run-to-run.
+    run-to-run. Dividends are surveyed so a pool with dividend-only
+    activity (e.g. a still-held historical position dripping cash
+    dividends with no trades in the window) still renders.
     """
     seen: set[str] = set()
     for _trade_id, trade in forex_trades:
@@ -1477,6 +1495,8 @@ def _resolve_fx_pool_currencies(
         seen.add(trade.instrument.currency)
     for _trade_id, trade in future_trades:
         seen.add(trade.instrument.currency)
+    for _synth, dividend in dividends:
+        seen.add(dividend.amount.currency)
     seen.discard("GBP")
     if requested is None:
         return sorted(seen)
@@ -1491,14 +1511,18 @@ def _build_fx_source_descriptions(
     stock_trades: list[tuple[int, Trade]],
     future_trades: list[tuple[int, Trade]],
     future_realisations: list[tuple[int, FutureRealisation, str]],
+    dividends: list[tuple[int, Dividend]],
 ) -> dict[int, str]:
     """Build the trade-id → source-label map used by the FX renderer.
 
     Forex / stock / futures-fee events use the real `trades.trade_id`
     (globally unique). Realisation P&L events use the synthetic IDs
-    the orchestrator generated (`itertools.count(10**12)`). Multiple
-    realisations can share a `close_trade_id`; the synthetic ID is
-    what disambiguates them.
+    the orchestrator generated (`itertools.count(10**12)`). Dividend
+    events use a separate synthetic-ID range
+    (`itertools.count(2 * 10**12)`) — same collision-avoidance
+    motivation as realisations, just keyed on a different table.
+    Multiple realisations can share a `close_trade_id`; the
+    synthetic ID is what disambiguates them.
     """
     out: dict[int, str] = {}
     for tid, trade in forex_trades:
@@ -1513,6 +1537,8 @@ def _build_fx_source_descriptions(
             f"futures {side} {realisation.instrument.symbol} "
             f"open={realisation.open_trade_id} close={realisation.close_trade_id}"
         )
+    for synth_id, dividend in dividends:
+        out[synth_id] = f"dividend {dividend.instrument.symbol} {dividend.kind.value}"
     return out
 
 
@@ -1522,12 +1548,15 @@ def _build_fx_event_date_map(
     stock_trades: list[tuple[int, Trade]],
     future_trades: list[tuple[int, Trade]],
     future_realisations: list[tuple[int, FutureRealisation, str]],
+    dividends: list[tuple[int, Dividend]],
 ) -> dict[int, date]:
     """Map every event id (real or synthetic) to its event date.
 
     The renderer's "Acq Date" column reads this directly. Real
     trade events use `trade_date`; futures-realisation events use
-    `close_date` (the date the P&L cashflow lands).
+    `close_date` (the date the P&L cashflow lands); dividend events
+    use `pay_date` (the date the cash hits the foreign-currency
+    balance).
     """
     out: dict[int, date] = {}
     for tid, trade in forex_trades:
@@ -1538,6 +1567,8 @@ def _build_fx_event_date_map(
         out[tid] = trade.trade_date
     for synth_id, realisation, _account in future_realisations:
         out[synth_id] = realisation.close_date
+    for synth_id, dividend in dividends:
+        out[synth_id] = dividend.pay_date
     return out
 
 
@@ -1550,12 +1581,22 @@ class _FxAuditData:
     via `FutureRuleEngine`. Bundling those into one DTO keeps both
     commands' bodies tidy and ensures they always feed the engine
     the *same* set of inputs.
+
+    `dividends` carries `(synth_id, Dividend)` pairs ready for
+    `FXRuleEngine.compute(..., dividends=...)`. The synth IDs are
+    allocated from a high range (`itertools.count(2 * 10**12)`) so
+    they don't collide with `trades.trade_id` values or with
+    futures-realisation synth IDs (`10**12`-range). The map back
+    from synth ID to real `dividend_id` lives on `dividend_real_id`
+    so the renderer can show citeable labels like ``"Div #N"``.
     """
 
     forex_trades: list[tuple[int, Trade]]
     stock_trades: list[tuple[int, Trade]]
     future_trades: list[tuple[int, Trade]]
     future_realisations: list[tuple[int, FutureRealisation, str]]
+    dividends: list[tuple[int, Dividend]]
+    dividend_real_id: dict[int, int]
     fx_service: FXService
 
 
@@ -1618,11 +1659,45 @@ def _load_fx_audit_data(
                 )
             )
 
+    # Dividends — load every non-GBP cashflow row across the whole
+    # corpus and assign synth IDs from a separate high range so the
+    # `id_label_map` machinery can resolve them without colliding
+    # with trade IDs or futures-realisation synth IDs.
+    dividends: list[tuple[int, Dividend]] = []
+    dividend_real_id: dict[int, int] = {}
+    dividend_synth_gen = count(2 * 10**12)
+    div_repo = DividendRepo(conn)
+    seen_currencies: set[str] = set()
+    for _tid, t in stock_trades:
+        seen_currencies.add(t.instrument.currency)
+    for _tid, t in future_trades:
+        seen_currencies.add(t.instrument.currency)
+    for _tid, t in forex_trades:
+        if isinstance(t.instrument, FXInstrument):
+            seen_currencies.add(t.instrument.currency_pair.base)
+            seen_currencies.add(t.instrument.currency_pair.quote)
+    seen_currencies.discard("GBP")
+    # The dividends-section can also reference instruments the user
+    # never traded in the date window (e.g. a dividend on a still-held
+    # historical position), so widen the currency set by a separate
+    # query rather than relying purely on the trade-side intersection.
+    dividend_currencies = conn.execute(
+        "SELECT DISTINCT currency FROM dividends WHERE currency != 'GBP'"
+    ).fetchall()
+    seen_currencies.update(str(r["currency"]) for r in dividend_currencies)
+    for ccy in sorted(seen_currencies):
+        for did, dividend in div_repo.for_currency(ccy, since=since, until=until):
+            synth = next(dividend_synth_gen)
+            dividends.append((synth, dividend))
+            dividend_real_id[synth] = did
+
     return _FxAuditData(
         forex_trades=forex_trades,
         stock_trades=stock_trades,
         future_trades=future_trades,
         future_realisations=future_realisations,
+        dividends=dividends,
+        dividend_real_id=dividend_real_id,
         fx_service=fx_service,
     )
 
@@ -1633,6 +1708,8 @@ def _build_fx_id_label_map(
     stock_trades: list[tuple[int, Trade]],
     future_trades: list[tuple[int, Trade]],
     future_realisations: list[tuple[int, FutureRealisation, str]],
+    dividends: list[tuple[int, Dividend]],
+    dividend_real_id: dict[int, int],
 ) -> dict[int, str]:
     """Build the short ID label map used in narrow `Disp ID` / `Acq ID` cells.
 
@@ -1642,6 +1719,12 @@ def _build_fx_id_label_map(
     close trade IDs of the realisation — synthetic engine IDs
     (`10**12 + N`) shift between runs and aren't citeable, so the
     renderer never exposes them.
+
+    Dividend events follow the same principle: the synth ID
+    (`2 * 10**12 + N`) is internal plumbing; the user-facing label
+    carries the real `dividend_id` (`Div #N` for cash dividends and
+    payment-in-lieu, `WHT #N` for withholding-tax) which they can
+    cite in a future ``ib-cgt show dividend <id>`` audit command.
 
     Multi-slice closeouts: when a single close trade drains
     several open slices, multiple realisations share the same
@@ -1675,6 +1758,14 @@ def _build_fx_id_label_map(
             out[synth_id] = f"P&L #{open_id}→#{close_id}[{i}]"
         else:
             out[synth_id] = f"P&L #{open_id}→#{close_id}"
+
+    # Dividends — `Div #N` for inflows, `WHT #N` for withholding.
+    # The real `dividend_id` is carried in the side map so the
+    # cell stays citeable across runs.
+    for synth_id, dividend in dividends:
+        real_id = dividend_real_id[synth_id]
+        prefix = "WHT" if dividend.kind is DividendKind.WITHHOLDING_TAX else "Div"
+        out[synth_id] = f"{prefix} #{real_id}"
     return out
 
 
@@ -1685,6 +1776,7 @@ def _run_match_fx(
     stock_trades: list[tuple[int, Trade]],
     future_trades: list[tuple[int, Trade]],
     future_realisations: list[tuple[int, FutureRealisation, str]],
+    dividends: list[tuple[int, Dividend]],
     currencies: list[str],
     date_map: dict[int, date],
     source_descriptions: dict[int, str],
@@ -1700,6 +1792,7 @@ def _run_match_fx(
                 stock_trades=stock_trades,
                 future_trades=future_trades,
                 future_realisations=future_realisations,
+                dividends=dividends,
             )
         except (
             WrongAssetClassError,
@@ -2416,18 +2509,22 @@ def show_match(
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
         )
         date_map = _build_fx_event_date_map(
             forex_trades=audit.forex_trades,
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
         )
         id_label_map = _build_fx_id_label_map(
             forex_trades=audit.forex_trades,
             stock_trades=audit.stock_trades,
             future_trades=audit.future_trades,
             future_realisations=audit.future_realisations,
+            dividends=audit.dividends,
+            dividend_real_id=audit.dividend_real_id,
         )
         per_pool_results: list[tuple[str, MatchingResult]] = []
         for ccy in pools:
@@ -2438,6 +2535,7 @@ def show_match(
                     stock_trades=audit.stock_trades,
                     future_trades=audit.future_trades,
                     future_realisations=audit.future_realisations,
+                    dividends=audit.dividends,
                 )
             except (
                 WrongAssetClassError,

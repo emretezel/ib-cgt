@@ -415,18 +415,19 @@ result = engine.compute(
     stock_trades=non_gbp_stock_trades,
     future_trades=non_gbp_future_trades,
     future_realisations=realisations,  # from FutureRuleEngine
+    dividends=non_gbp_dividends,       # from DividendRepo.for_currency
 )
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects events from **four sources** into GBP-denominated
+projects events from **five sources** into GBP-denominated
 `Acquisition` and `Disposal` records via the FX service, then
 delegates the match. Unlike the stock engine its API is
 **per-currency** rather than per-instrument, because UK CGT pools FX
 per single non-GBP currency vs GBP — and a single `EUR.USD` trade
 therefore touches *two* pools (one EUR, one USD).
 
-The four cashflow sources implement HMRC CG78315 — "foreign currency
+The five cashflow sources implement HMRC CG78315 — "foreign currency
 arising from any source" — so the per-currency pool reflects every
 foreign-cash movement IB reports:
 
@@ -436,11 +437,17 @@ foreign-cash movement IB reports:
    from the pool (a disposal of `(price*qty + fees)` USD); a SELL
    brings USD in (an acquisition of `(price*qty − fees)` USD). GBP
    value is the cash amount converted at trade-date spot.
-3. **Non-GBP futures trade fees** — every OPEN/CLOSE leg pays a
+3. **Non-GBP dividends** — cash dividends and payment-in-lieu rows
+   credit the pool on `pay_date` (acquisitions); withholding-tax
+   rows debit the pool (disposals). Stored as their own table
+   `dividends` rather than synthesised `Trade` rows because a
+   distribution does not transact a quantity of the underlying
+   stock — see [`docs/db/dividends.md`](db/dividends.md).
+4. **Non-GBP futures trade fees** — every OPEN/CLOSE leg pays a
    commission in the contract's native currency at trade_date,
    regardless of whether the position eventually realises a gain
    or loss. Always a disposal.
-4. **Futures realisations** — gross P&L on closed contracts settles
+5. **Futures realisations** — gross P&L on closed contracts settles
    in the contract's native currency at close_date. Winning trades
    emit acquisitions; losing trades emit disposals. The orchestrator
    runs `FutureRuleEngine` first to produce the realisation list.

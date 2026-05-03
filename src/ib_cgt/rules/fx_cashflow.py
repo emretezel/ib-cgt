@@ -43,6 +43,8 @@ from ib_cgt.domain import (
     Acquisition,
     CurrencyPair,
     Disposal,
+    Dividend,
+    DividendKind,
     FutureInstrument,
     FutureRealisation,
     FXInstrument,
@@ -351,6 +353,89 @@ def from_future_realisation(
         disposal_date=realisation.close_date,
         quantity=abs_amount,
         proceeds_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dividends — cash distributions credit the per-currency pool
+# ---------------------------------------------------------------------------
+
+
+def from_dividend(
+    synth_id: int,
+    dividend: Dividend,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | Disposal | None:
+    """Project a dividend / WHT / payment-in-lieu into an FX-pool event.
+
+    Per HMRC CG78315, foreign currency arising from any source feeds
+    the same per-currency S.104 pool, so a USD cash dividend is —
+    for FX-pool purposes — indistinguishable from a USD stock-sale
+    receipt: cash arrives in the foreign-currency balance on
+    `pay_date`, GBP-converted at that date's spot rate.
+
+    Direction is encoded in `Dividend.kind`:
+    * `cash_dividend`, `payment_in_lieu` → **Acquisition** of the
+      pool currency.
+    * `withholding_tax` → **Disposal** (cash debited at source).
+
+    The income-tax treatment of the dividend itself (basic / higher
+    rate, dividend allowance, foreign-tax-credit relief) is out of
+    scope here — this projector only models the cash leg the FX
+    pool needs.
+
+    `synth_id` (not the real `dividend_id`) is what
+    `Acquisition.trade_id` / `Disposal.trade_id` carry. Using a
+    synthetic ID lets the CLI orchestrator route dividend events
+    through the same `id_label_map` machinery as futures
+    realisations without colliding with `trades.trade_id` values
+    or with the realisation synth-id range.
+
+    `fees_gbp` is `Money.gbp(0)` on every projected event: any
+    "fee-like" amount on a dividend (e.g. WHT) gets its own
+    independent `Dividend` row already, so attaching it again as
+    a fee on the dividend-row event would double-count.
+
+    Returns `None` for GBP dividends or dividends in a currency
+    other than the requested pool.
+    """
+    native_ccy = dividend.amount.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    # Defensive: matches `Dividend.__post_init__`. The validator
+    # already rejects zero or negative amounts, but reasserting
+    # here documents the projector's contract for readers who
+    # haven't read the domain validation.
+    amount = dividend.amount.amount
+    if amount <= 0:
+        return None
+
+    gbp_value = _money_to_gbp(dividend.amount, fx, dividend.pay_date)
+
+    if dividend.kind is DividendKind.WITHHOLDING_TAX:
+        return Disposal(
+            trade_id=synth_id,
+            account_id=dividend.account_id,
+            instrument=pool_instrument,
+            disposal_date=dividend.pay_date,
+            quantity=amount,
+            proceeds_gbp=gbp_value,
+            fees_gbp=Money.gbp(Decimal(0)),
+        )
+    # CASH_DIVIDEND and PAYMENT_IN_LIEU are both inflows — cash
+    # arrives in the foreign-currency balance, the pool gains a
+    # native-currency acquisition.
+    return Acquisition(
+        trade_id=synth_id,
+        account_id=dividend.account_id,
+        instrument=pool_instrument,
+        acquisition_date=dividend.pay_date,
+        quantity=amount,
+        cost_gbp=gbp_value,
         fees_gbp=Money.gbp(Decimal(0)),
     )
 

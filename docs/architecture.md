@@ -243,13 +243,16 @@ items marked ⬜ are pending.
     pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
     shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
     feeds two pools at once with independent per-leg GBP conversion.
-    The engine consumes **four cashflow sources** per HMRC CG78315
+    The engine consumes **five cashflow sources** per HMRC CG78315
     ("foreign currency arising from any source"): forex trades,
-    non-GBP stock trades' settlement cash, non-GBP futures trade
-    fees, and futures realisation P&L. Soft-residual mode surfaces
-    any leftover shortfall (e.g. opening balance pre-dating the IB
-    history) as a yellow warning rather than blanking the pool.
-    Per-currency CLI: `ib-cgt match fx [--currency CCY]`.
+    non-GBP stock trades' settlement cash, non-GBP dividends (cash
+    dividends, payment-in-lieu, withholding tax — see the new
+    `dividends` table at [`docs/db/dividends.md`](db/dividends.md)),
+    non-GBP futures trade fees, and futures realisation P&L.
+    Soft-residual mode surfaces any leftover shortfall (e.g. opening
+    balance pre-dating the IB history) as a yellow warning rather
+    than blanking the pool. Per-currency CLI:
+    `ib-cgt match fx [--currency CCY]`.
 11. ⬜ **Calculator orchestrator** — wire engines together, tax-year
     filtering, persist `tax_run` and `future_realisations`.
 12. ⬜ **Reporting** — console + CSV + JSON renderers.

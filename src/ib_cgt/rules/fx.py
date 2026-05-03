@@ -5,16 +5,18 @@ Per `docs/architecture.md §Scope — FX treatment` and HMRC CG78315
 each non-GBP currency as its own chargeable asset, pooled per single
 currency vs GBP under the same four-rule matching as ordinary shares
 (same-day → 30-day → S.104 → s.105(2)). This engine projects events
-from **four** sources into the GBP `Acquisition` / `Disposal` shapes
+from **five** sources into the GBP `Acquisition` / `Disposal` shapes
 consumed by the shared `MatchingEngine` and runs one matcher per
 non-GBP currency:
 
 1. **Forex trades** — explicit `Forex` rows from the IB statement.
 2. **Stock trades** — non-GBP stock BUY/SELL legs settle in the
    listing currency, so they feed the per-currency pool.
-3. **Futures trade fees** — every OPEN/CLOSE leg pays a fee in the
+3. **Dividends** — non-GBP cash dividends, payment-in-lieu, and
+   withholding-tax cashflows on stock holdings.
+4. **Futures trade fees** — every OPEN/CLOSE leg pays a fee in the
    contract's native currency at trade_date.
-4. **Futures realisations** — gross P&L on closed contracts settles
+5. **Futures realisations** — gross P&L on closed contracts settles
    in the contract's native currency at close_date.
 
 Pool model — per currency, not per traded pair
@@ -58,12 +60,14 @@ from ib_cgt.domain import (
     Acquisition,
     AssetClass,
     Disposal,
+    Dividend,
     FutureRealisation,
     Trade,
 )
 from ib_cgt.domain.money import validate_currency_code
 from ib_cgt.rules.futures import FXConverter
 from ib_cgt.rules.fx_cashflow import (
+    from_dividend,
     from_forex_trade,
     from_future_fee,
     from_future_realisation,
@@ -107,6 +111,7 @@ class FXRuleEngine:
         stock_trades: Sequence[tuple[int, Trade]] = (),
         future_trades: Sequence[tuple[int, Trade]] = (),
         future_realisations: Sequence[tuple[int, FutureRealisation, str]] = (),
+        dividends: Sequence[tuple[int, Dividend]] = (),
     ) -> MatchingResult:
         """Match every disposal of `currency` against acquisitions of `currency`.
 
@@ -134,6 +139,17 @@ class FXRuleEngine:
                 `itertools.count(10**12)`. The account is supplied
                 separately because `FutureRealisation` carries no
                 account field. Pass an empty sequence to skip.
+            dividends: `(synth_id, dividend)` pairs — one per
+                non-GBP dividend / withholding-tax / payment-in-lieu
+                row. Cash dividends and PIL events become FX-pool
+                acquisitions on `pay_date`; WHT events become
+                disposals. The synth ID convention mirrors
+                `future_realisations`: the orchestrator allocates
+                from a high-numbered counter (typically
+                `itertools.count(2 * 10**12)`) so the IDs cannot
+                collide with real `trades.trade_id` values or with
+                the realisation synth-id range. Pass an empty
+                sequence to skip dividends.
 
         Returns:
             A `MatchingResult` describing the four-rule matching for
@@ -181,6 +197,19 @@ class FXRuleEngine:
                 acquisitions.append(stock_event)
             else:
                 disposals.append(stock_event)
+
+        # Dividends — cash distributions on stock holdings. Cash
+        # dividend / payment-in-lieu rows are pool acquisitions;
+        # withholding tax is a pool disposal. Direction is encoded
+        # in `Dividend.kind`, not the sign of the amount.
+        for synth_id, dividend in dividends:
+            div_event = from_dividend(synth_id, dividend, currency, self._fx, pool_instrument)
+            if div_event is None:
+                continue
+            if isinstance(div_event, Acquisition):
+                acquisitions.append(div_event)
+            else:
+                disposals.append(div_event)
 
         # Futures trade fees — every non-GBP futures leg pays a
         # commission in the contract's native currency, regardless

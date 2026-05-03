@@ -28,6 +28,7 @@ from ib_cgt.domain.disposal import (
     UnmatchedAcquisition,
     UnmatchedDisposalChunk,
 )
+from ib_cgt.domain.dividends import Dividend, DividendKind, InvalidDividendError
 from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
 from ib_cgt.domain.money import (
     CurrencyMismatchError,
@@ -61,10 +62,13 @@ __all__ = [
     "CurrencyPair",
     "DirectAcquisition",
     "Disposal",
+    "Dividend",
+    "DividendKind",
     "FXInstrument",
     "FutureInstrument",
     "FutureRealisation",
     "Instrument",
+    "InvalidDividendError",
     "InvalidInstrumentError",
     "InvalidTaxYearError",
     "InvalidTradeError",

@@ -29,6 +29,8 @@ import pytest
 
 from ib_cgt.domain import (
     DirectAcquisition,
+    Dividend,
+    DividendKind,
     FutureRealisation,
     MatchRule,
     Money,
@@ -735,3 +737,91 @@ def test_compute_treats_future_trade_fees_as_disposals() -> None:
     assert md.matched_quantity == Decimal("4.50")
     assert md.matched_cost_gbp == Money.gbp("3.51")
     assert md.matched_proceeds_gbp == Money.gbp("3.60")
+
+
+# ---------------------------------------------------------------------------
+# Dividend integration
+# ---------------------------------------------------------------------------
+
+
+def _dividend(
+    *,
+    kind: DividendKind = DividendKind.CASH_DIVIDEND,
+    pay_date: date,
+    amount: str,
+    currency: str = "USD",
+    symbol: str = "AAPL",
+) -> Dividend:
+    """Build a `Dividend` for FX-engine integration tests."""
+    return Dividend(
+        account_id="U1",
+        instrument=StockInstrument(symbol=symbol, currency=currency),
+        kind=kind,
+        pay_date=pay_date,
+        amount=Money.of(Decimal(amount), currency),
+        description=f"{symbol}(IE00B2NPL135) Cash Dividend {currency}",
+    )
+
+
+def test_compute_uses_cash_dividend_to_cover_forex_disposal() -> None:
+    """A USD cash dividend feeds the USD pool, covering a later forex SELL."""
+    div_date = date(2024, 4, 1)
+    forex_date = date(2024, 5, 1)
+    fx = MultiCcyStubFXService({("USD", div_date): Decimal("0.80")})
+    engine = FXRuleEngine(fx)
+    usd_gbp = fx_pair("USD", "GBP")
+
+    div = _dividend(pay_date=div_date, amount="100")
+    forex_disp = fx_trade(
+        action=TradeAction.SELL,
+        on=forex_date,
+        qty=50,
+        price="0.79",
+        instrument=usd_gbp,
+    )
+    result = engine.compute(
+        "USD",
+        forex_trades=[(99, forex_disp)],
+        dividends=[(2 * 10**12, div)],
+    )
+    # Dividend Apr 1 is well before May 1 forex disposal — falls into
+    # S.104 acquisition pool.
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("50")
+    # Pool average cost: 100 USD costing 80 GBP → 0.80 GBP/USD.
+    # 50 USD drawn = 40 GBP cost. Forex disposal proceeds: 50 * 0.79 = 39.50.
+    assert md.matched_cost_gbp == Money.gbp("40")
+    assert md.matched_proceeds_gbp == Money.gbp("39.50")
+    # Pool residual: 50 USD, proportional cost 40 GBP.
+    assert result.final_pool.quantity == Decimal("50")
+
+
+def test_compute_treats_withholding_tax_as_disposal() -> None:
+    """A USD WHT row → USD pool disposal at pay_date, drawn from cover."""
+    div_date = date(2024, 5, 15)
+    wht_date = date(2024, 5, 16)
+    fx = MultiCcyStubFXService(
+        {
+            ("USD", div_date): Decimal("0.80"),
+            ("USD", wht_date): Decimal("0.80"),
+        }
+    )
+    engine = FXRuleEngine(fx)
+
+    cash_div = _dividend(pay_date=div_date, amount="100")
+    wht = _dividend(kind=DividendKind.WITHHOLDING_TAX, pay_date=wht_date, amount="15")
+    result = engine.compute(
+        "USD",
+        dividends=[(2 * 10**12, cash_div), (2 * 10**12 + 1, wht)],
+    )
+    # WHT 15 USD on May 16 draws against the May 15 dividend acquisition.
+    # The acquisition is *before* the disposal, so it lands in the
+    # S.104 pool and is drawn at the pool's average cost.
+    # Pool: 100 USD costing 80 GBP → 0.80 GBP/USD avg. 15 USD drawn = 12 GBP.
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("15")
+    assert md.matched_cost_gbp == Money.gbp("12")

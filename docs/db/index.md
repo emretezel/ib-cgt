@@ -24,13 +24,12 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`5`** (`001_initial.sql`, `002_ix_instruments_currency.sql`,
-`003_split_instruments.sql`,
-`004_cascade_trades_on_statement_delete.sql`, and
-`005_trades_integer_pk.sql` all applied). Whenever a new migration
-lands in the repository, run `ib-cgt db init` against this database
-and regenerate this documentation so the per-table pages reflect
-what is actually deployed.
+`9`** (`001_initial.sql` through `009_dividends.sql` all applied —
+see [`schema_migrations.md`](./schema_migrations.md) for the full
+list). Whenever a new migration lands in the repository, run
+`ib-cgt db init` against this database and regenerate this
+documentation so the per-table pages reflect what is actually
+deployed.
 
 ## Tables
 
@@ -45,6 +44,7 @@ what is actually deployed.
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
 | `statements` | One row per imported IB HTML statement (idempotency) | [`statements.md`](./statements.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
+| `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax) | [`dividends.md`](./dividends.md) |
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
 | `tax_runs` | One row per `compute --year` invocation | [`tax_runs.md`](./tax_runs.md) |
 | `matched_disposals` | Per-chunk audit trail produced by the calculator | [`matched_disposals.md`](./matched_disposals.md) |
@@ -53,9 +53,9 @@ what is actually deployed.
 
 ```
 accounts (account_id) ──┐
-                        ├── statements ── trades ── instruments ── {stock,bond,future,fx}_instruments
-                        │                             ▲
-tax_runs ── matched_disposals ───────────────────────┘
+                        ├── statements ── trades ──── instruments ── {stock,bond,future,fx}_instruments
+                        │             └─ dividends ────┘  ▲
+tax_runs ── matched_disposals ───────────────────────────┘
 
 fx_rates (standalone cache; no FK in or out)
 ```
@@ -73,6 +73,9 @@ Foreign-key chain in detail:
 - `trades.account_id`                  → `accounts.account_id`
 - `trades.instrument_id`               → `instruments.instrument_id`
 - `trades.source_statement_hash`       → `statements.statement_hash` `ON DELETE CASCADE`
+- `dividends.account_id`               → `accounts.account_id`
+- `dividends.instrument_id`            → `instruments.instrument_id`
+- `dividends.source_statement_hash`    → `statements.statement_hash` `ON DELETE CASCADE`
 - `stock_instruments.instrument_id`    → `instruments.instrument_id` `ON DELETE CASCADE`
 - `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
 - `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`

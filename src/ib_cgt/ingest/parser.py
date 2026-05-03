@@ -151,6 +151,52 @@ class RawCorporateActionRow:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawDividendRow:
+    """One row of the Dividends section (or its WHT / PIL siblings).
+
+    IB's stocks-statement layout collapses every cash distribution into
+    a single `tblCombDiv_<acct>Body` table with one row per payment.
+    The columns are `Date | Description | Amount` plus a per-currency
+    header (the same `header-currency` toggle Trades / Corporate
+    Actions use). Withholding-tax rows live in a parallel section
+    when the broker's jurisdiction surfaces them; payment-in-lieu
+    rows currently appear inside the dividends section with a
+    `"Payment In Lieu Of Dividend"` description prefix. The parser
+    is description-blind — it just emits every row verbatim and
+    lets `ingest/dividends.py` classify them by description match.
+
+    Attributes:
+        section: Which IB section this row was extracted from. The
+            three observed values are `"dividends"` (the
+            `tblCombDiv` section — covers cash dividends and
+            payment-in-lieu rows discriminated by description),
+            `"withholding_tax"` (a `tblWithholding` section if
+            present), and `"change_in_dividend_accruals"` (a
+            `tblChangeInDividend` section — accrual adjustments
+            that are not cash). The mapper picks which sections
+            translate into `Dividend` objects.
+        currency: The sub-section currency header for this row
+            (e.g. `"USD"`).
+        date_text: Raw date string `"YYYY-MM-DD"` exactly as
+            printed.
+        description: Free-text — the gate the mapper uses to
+            classify the row's `kind` and to extract the symbol /
+            ISIN.
+        amount_text: The cash amount as printed (`"249.67"`,
+            `"-12.50"`, etc.). Sign in the source: dividends are
+            positive, WHT is negative when surfaced as a separate
+            line on a same-section sibling. The mapper takes the
+            absolute value and uses `kind` to encode direction.
+    """
+
+    section: str
+    currency: str
+    date_text: str
+    description: str
+    amount_text: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ParsedStatement:
     """The parsed statement: account + trade rows + instrument metadata."""
 
@@ -158,6 +204,7 @@ class ParsedStatement:
     trades: tuple[RawTradeRow, ...]
     instruments: tuple[RawInstrumentInfo, ...]
     corporate_actions: tuple[RawCorporateActionRow, ...]
+    dividends: tuple[RawDividendRow, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +241,28 @@ _CORPORATE_ACTION_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Description": "description",
     "Quantity": "quantity",
     "Proceeds": "proceeds",
+}
+
+# Dividend / WHT / PIL column headers. The same three columns appear
+# in every dividend-shaped section IB emits (`tblCombDiv`,
+# `tblWithholding`, `tblChangeInDividend`). Resolving by header label
+# lets us absorb future column drift the same way the trades parser
+# does.
+_DIVIDEND_COLUMN_ALIASES: Final[dict[str, str]] = {
+    "Date": "date",
+    "Description": "description",
+    "Amount": "amount",
+}
+
+# Dividend-shaped section ids → the `section` label we stamp onto
+# every `RawDividendRow` extracted from that div. The mapper later
+# branches on the label to decide which IB section a row came from
+# (which is what disambiguates cash dividends from withholding tax
+# from accrual adjustments — the columns are identical otherwise).
+_DIVIDEND_SECTION_DIV_PREFIXES: Final[dict[str, str]] = {
+    "tblCombDiv_": "dividends",
+    "tblWithholding_": "withholding_tax",
+    "tblChangeInDividend_": "change_in_dividend_accruals",
 }
 
 # Asset-class section labels we deliberately drop at parse time. Stock
@@ -242,12 +311,14 @@ def parse_statement(source_bytes: bytes) -> ParsedStatement:
     trades = tuple(_parse_trades_section(soup))
     instruments = tuple(_parse_instruments_section(soup))
     corporate_actions = tuple(_parse_corporate_actions_section(soup))
+    dividends = tuple(_parse_dividends_section(soup))
 
     return ParsedStatement(
         account_id=account_id,
         trades=trades,
         instruments=instruments,
         corporate_actions=corporate_actions,
+        dividends=dividends,
     )
 
 
@@ -698,6 +769,129 @@ def _resolve_corporate_action_columns(table: Tag) -> dict[str, int] | None:
 
 
 # ---------------------------------------------------------------------------
+# Dividends section (and its WHT / PIL / accrual siblings)
+# ---------------------------------------------------------------------------
+
+
+def _parse_dividends_section(soup: BeautifulSoup) -> list[RawDividendRow]:
+    """Yield every dividend-shaped row across all dividend sections.
+
+    Walks each prefix in `_DIVIDEND_SECTION_DIV_PREFIXES`, tags every
+    row it finds with the section label, and concatenates the lot.
+    Statements with no dividend activity yield an empty list — every
+    section is optional.
+    """
+    rows: list[RawDividendRow] = []
+    for prefix, section_label in _DIVIDEND_SECTION_DIV_PREFIXES.items():
+        for table in _find_dividend_tables(soup, prefix):
+            rows.extend(_parse_one_dividends_table(table, section_label))
+    return rows
+
+
+def _parse_one_dividends_table(table: Tag, section_label: str) -> list[RawDividendRow]:
+    """Parse a single dividend-shaped `<table>`.
+
+    The dividend layout shares the `header-currency` toggle with
+    Trades / Corporate Actions, but does not have an asset-class
+    header — every dividend is a stocks-section concept already.
+    `subtotal` and `total` rows (per-currency aggregates and the
+    cross-currency `Total in GBP` rows IB inserts) must be skipped
+    or they'd look like data rows with a blank date cell.
+    """
+    column_map = _resolve_dividend_columns(table)
+    if column_map is None:
+        return []
+
+    rows: list[RawDividendRow] = []
+    current_currency = ""
+
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+
+        if _row_has_cell_class(tr, "header-currency"):
+            current_currency = _row_first_cell_text(tr)
+            continue
+        # Both `subtotal` (per-currency) and `total` (cross-currency
+        # `Total in GBP` / `Total Dividends in GBP`) rows are
+        # display-only.
+        row_classes = tr.get("class") or []
+        if "subtotal" in row_classes or "total" in row_classes:
+            continue
+        if tr.find("th") is not None:
+            continue
+
+        cells = tr.find_all("td")
+        if not cells or not current_currency:
+            # Orphan row outside a currency section — defensive skip.
+            continue
+
+        try:
+            date_text = cells[column_map["date"]].get_text(strip=True)
+            description = cells[column_map["description"]].get_text(strip=True)
+            amount_text = cells[column_map["amount"]].get_text(strip=True)
+        except IndexError:
+            continue
+
+        # Blank date cell signals an aggregate row IB occasionally
+        # emits without a `subtotal` / `total` class.
+        if not date_text or date_text == "\xa0":
+            continue
+
+        rows.append(
+            RawDividendRow(
+                section=section_label,
+                currency=current_currency,
+                date_text=date_text,
+                description=description,
+                amount_text=amount_text,
+            )
+        )
+
+    return rows
+
+
+def _find_dividend_tables(soup: BeautifulSoup, div_id_prefix: str) -> list[Tag]:
+    """Return every `<table>` inside a div whose id starts with `div_id_prefix`."""
+    tables: list[Tag] = []
+    for div in soup.find_all("div", id=True):
+        if not isinstance(div, Tag):
+            continue
+        div_id = str(div.get("id", ""))
+        if div_id.startswith(div_id_prefix) and div_id.endswith("Body"):
+            for table in div.find_all("table"):
+                if isinstance(table, Tag):
+                    tables.append(table)
+    return tables
+
+
+def _resolve_dividend_columns(table: Tag) -> dict[str, int] | None:
+    """Map dividend-section header labels to indices.
+
+    Required: `date`, `description`, `amount`. Returns `None` when
+    any required column is missing — that table is then skipped,
+    matching the trades / corporate-actions resolvers' behaviour
+    on unrecognisable layouts.
+    """
+    required = set(_DIVIDEND_COLUMN_ALIASES.values())
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+        headers = tr.find_all("th")
+        if not headers:
+            continue
+        candidate: dict[str, int] = {}
+        for idx, th in enumerate(headers):
+            label = th.get_text(strip=True)
+            logical = _DIVIDEND_COLUMN_ALIASES.get(label)
+            if logical is not None:
+                candidate[logical] = idx
+        if required.issubset(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
 
@@ -754,6 +948,7 @@ def _optional_cell(cells: list[Tag], column_map: dict[str, int], logical: str) -
 __all__ = [
     "ParsedStatement",
     "RawCorporateActionRow",
+    "RawDividendRow",
     "RawInstrumentInfo",
     "RawTradeRow",
     "StatementParseError",

@@ -186,6 +186,52 @@ def test_ingest_persists_synthesized_merger_trade(db: sqlite3.Connection) -> Non
     assert sell["statement_row_index"] > buy["statement_row_index"]
 
 
+def test_ingest_persists_dividends(db: sqlite3.Connection) -> None:
+    """End-to-end: dividends fixture lands rows in the `dividends` table.
+
+    The fixture has 2 USD cash dividends and 1 EUR payment-in-lieu;
+    the parser → mapper → repo path must produce exactly those three
+    rows, distinguishable by `kind` and `currency`.
+    """
+    fixture = _FIXTURES / "with_dividends.htm"
+    result = ingest_statement(fixture, db)
+
+    assert result.dividend_count == 3
+    assert result.dividends_inserted == 3
+    rows = db.execute(
+        "SELECT kind, currency, amount_native FROM dividends ORDER BY pay_date"
+    ).fetchall()
+    kinds = [r["kind"] for r in rows]
+    currencies = [r["currency"] for r in rows]
+    assert kinds == ["cash_dividend", "payment_in_lieu", "cash_dividend"]
+    assert currencies == ["USD", "EUR", "USD"]
+
+
+def test_reingest_dividends_idempotent(db: sqlite3.Connection) -> None:
+    """A second ingest of the same dividend statement is a no-op."""
+    fixture = _FIXTURES / "with_dividends.htm"
+    first = ingest_statement(fixture, db)
+    second = ingest_statement(fixture, db)
+    # Hash short-circuit: second call returns already_imported, doesn't
+    # re-parse, doesn't double-insert.
+    assert second.already_imported is True
+    n = db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"]
+    assert n == first.dividend_count
+
+
+def test_replace_cascades_to_dividends(db: sqlite3.Connection) -> None:
+    """`ingest --replace` clears prior dividend rows along with trades."""
+    fixture = _FIXTURES / "with_dividends.htm"
+    ingest_statement(fixture, db)
+    n_before = db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"]
+    assert n_before == 3
+    result = ingest_statement(fixture, db, replace=True)
+    assert result.replaced is True
+    n_after = db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"]
+    # Same fixture → same dividends → same count after replace.
+    assert n_after == n_before
+
+
 def test_ingest_without_fx_service_skips_merger(db: sqlite3.Connection) -> None:
     """Without an FXService, Corporate Actions rows are silently skipped.
 
