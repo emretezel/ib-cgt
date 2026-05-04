@@ -78,15 +78,47 @@ where noted.
    "Equity and Index Options" section (see
    `parser._IGNORED_ASSET_CLASSES`): stock options are out of scope for
    v1 and the OCC-formatted symbols would otherwise be ingested as
-   stocks. The parser also walks `tblCorporateActions_*Body` divs;
-   `ingest/corporate_actions.py` materialises only cash-for-shares
-   mergers under the Stocks asset class
-   (`Merged(Acquisition) for <CCY> <PRICE> per Share`) into synthesized
-   `SELL` trades, with cross-currency proceeds FX-converted to the
-   stock's listing currency at the disposal-date spot rate. Bond
-   maturities, dividends-as-corporate-action, splits, spin-offs,
-   share-for-share mergers, and tendered-to-other-stock rows are
-   silently ignored.
+   stocks. Bond `T. Price` is rescaled by 1/100 at the mapper boundary
+   so the unit invariant `price * quantity == settlement cash` holds —
+   IB quotes bond prices as a percentage of par (`98.602` = 98.602% of
+   face value) while every other asset class uses true per-unit prices.
+   **Bond identity is the ISIN** (per migration 014): the mapper
+   resolves every trade-row symbol against the bonds-shaped Financial
+   Instrument Information table's `Security ID` column, canonicalises
+   the display symbol via `_canonicalise_gilt_symbol` (strips
+   yield-percent and IB-code suffixes from gilt symbols so all lots
+   of one gilt collapse to one instrument), and rejects with
+   `MappingError` any bond row that has no resolvable ISIN. The
+   `Issuer` column carries the gilt-classifier signal
+   (`"United Kingdom Gilt …"`); `Description` is the canonical name.
+   The parser also walks `tblCorporateActions_*Body` divs;
+   `ingest/corporate_actions.py` materialises two CGT-relevant shapes
+   into synthesized `SELL` trades that the rule engines treat as
+   ordinary disposals:
+   * **Cash-for-shares mergers** (Stocks):
+     `Merged(Acquisition) for <CCY> <PRICE> per Share` — cross-currency
+     proceeds FX-converted to the stock's listing currency at the
+     disposal-date spot rate.
+   * **Bond maturities** (Bonds):
+     `(<ISIN>) Bond Maturity FOR <CCY> <PRICE> PER BOND
+     (<symbol>, <long_desc>, <isin>)` — redemption at par on the
+     maturity date, in the bond's own currency. The gilt classifier
+     re-runs against the synthesised instrument so an exempt UKT
+     bond still routes through `ExemptBondResult` rather than the
+     S.104 path.
+
+     IB renders the same gilt under multiple trade-side aliases
+     (`UKT 0 1/4 01/31/25 5.26994388%` for one yield lot,
+     `… 9.87150193%` for another, `UKT 2 3/4 09/07/24 FH45` for the
+     maturity-row form). With ISIN as the bond's natural key
+     (migration 014) every alias collapses to one
+     `bond_instruments` row, so trade BUYs and maturity SELLs
+     reconcile naturally without any orchestrator-side filtering.
+     A defensive `_filter_maturities_with_known_instruments`
+     remains as a backstop for degenerate cases where a maturity
+     row appears for a bond that has no prior BUY in the corpus.
+   Dividends-as-corporate-action, splits, spin-offs, share-for-share
+   mergers, and tendered-to-other-stock rows are silently ignored.
 
 4. **FX rate service** — `ib_cgt.fx` — Frankfurter HTTP client (date-range
    batched), SQLite-backed cache, previous-business-day fallback for
@@ -101,7 +133,11 @@ where noted.
      their cover buy is more than 30 days later.
    - `BondRuleEngine` — four-rule matching; skips QCB/gilt-exempt
      instruments; attaches purchase/sale accrued interest to
-     cost/proceeds.
+     cost/proceeds. Sees bond maturities as ordinary SELL trades
+     (the synthesis is upstream in `ingest/corporate_actions.py`),
+     so an exempt gilt's maturity rolls into `ExemptBondResult`
+     and a non-exempt bond's maturity triggers a real S.104
+     disposal at par.
    - `FutureRuleEngine` — per-contract realised-gain on close-out; no
      pooling. Emits a separate `FutureRealisation` shape because UK
      share-matching rules (s.104 / s.105 / s.106A) do not apply to
@@ -237,18 +273,24 @@ items marked ⬜ are pending.
    / S.104 / s.105(2)) using the matching engine. Direction-agnostic
    so short round-trips fall through to s.105(2) when their cover
    buy is more than 30 days later.
-9. ⬜ **BondRuleEngine** — add QCB / gilt exempt handling; attach accrued
-   interest; reuse the matching engine.
+9. ✅ **BondRuleEngine** — auto-detects UK gilts at ingest (description
+   prefix `"United Kingdom Gilt"` with `UKT `+GBP fallback;
+   `IB_CGT_BONDS_EXEMPT` allowlist for QCBs and edge cases). Returns
+   `ExemptBondResult` for exempt bonds (no S.104 pool); applies the
+   shared four-rule matcher to non-exempt bonds with purchase / sale
+   accrued interest folded into cost / proceeds.
 10. ✅ **FXRuleEngine** — four-rule UK matching per non-GBP currency
     pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
     shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
     feeds two pools at once with independent per-leg GBP conversion.
-    The engine consumes **five cashflow sources** per HMRC CG78315
+    The engine consumes **six cashflow sources** per HMRC CG78315
     ("foreign currency arising from any source"): forex trades,
     non-GBP stock trades' settlement cash, non-GBP dividends (cash
     dividends, payment-in-lieu, withholding tax — see the new
     `dividends` table at [`docs/db/dividends.md`](db/dividends.md)),
-    non-GBP futures trade fees, and futures realisation P&L.
+    non-GBP futures trade fees, futures realisation P&L, and
+    non-GBP bond coupon payments (extracted from IB's `Interest`
+    section — always inflows).
     Soft-residual mode surfaces any leftover shortfall (e.g. opening
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
@@ -268,10 +310,10 @@ items marked ⬜ are pending.
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
-| 6 | Rule engines | `ib_cgt.rules` | 🟡 `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `FXRuleEngine` done; `BondRuleEngine` pending |
+| 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
 | 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `match futures` / `match stocks` / `match fx` / `show trade` / `show realisation` / `show match` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |

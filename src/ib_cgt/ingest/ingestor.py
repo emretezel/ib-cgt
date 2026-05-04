@@ -27,11 +27,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ib_cgt.db.repos.accounts import AccountRepo
+from ib_cgt.db.repos.bond_coupons import BondCouponRepo
 from ib_cgt.db.repos.dividends import DividendRepo
 from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
-from ib_cgt.domain import Account
-from ib_cgt.ingest.corporate_actions import FXConverter, map_corporate_actions
+from ib_cgt.domain import Account, BondInstrument, Trade
+from ib_cgt.ingest.bond_coupons import map_bond_coupons
+from ib_cgt.ingest.corporate_actions import (
+    FXConverter,
+    map_bond_maturities,
+    map_corporate_actions,
+)
 from ib_cgt.ingest.dividends import map_dividends
 from ib_cgt.ingest.hashing import compute_statement_hash
 from ib_cgt.ingest.mapper import map_rows
@@ -52,6 +58,18 @@ class IngestResult:
             cash-for-shares Corporate Actions rows ("Merged(Acquisition)").
             Reported separately so the CLI can surface them; matching
             treats them identically to ordinary sells.
+        maturity_trade_count: Subset of `trade_count` originating from
+            Bond Maturity Corporate Actions rows. Reported separately
+            so the CLI can surface them; matching treats them
+            identically to ordinary sells.
+        skipped_maturity_count: Maturity rows the synthesiser produced
+            that were dropped because no existing bond instrument
+            matches the `(symbol, currency)` IB used in the maturity
+            description. The trade-side may have ingested the same
+            underlying gilt under a yield-suffixed alias; ISIN-based
+            instrument unification is a future enhancement, and until
+            it lands these rows are surfaced as a warning rather than
+            polluting `bond_instruments`.
         inserted_count: How many of those were new rows. On a repeat
             ingest of a modified statement this can be less than
             `trade_count` if some trades were already present from a
@@ -65,6 +83,14 @@ class IngestResult:
             `inserted_count`: `INSERT OR IGNORE` on the
             `(source_statement_hash, statement_row_index)` UNIQUE
             backstops a partial-batch retry.
+        bond_coupon_count: Number of bond-coupon rows the mapper
+            extracted from the statement's `tblCombInt_*` (Interest)
+            sections. Zero on statements with no bonds. Broker
+            debit/credit interest rows are silently filtered out
+            and never counted here.
+        bond_coupons_inserted: How many of those were new rows in
+            `bond_coupons`. Same idempotency semantics as
+            `dividends_inserted`.
         already_imported: True iff the byte-identical statement had
             been imported before — parse/map were skipped. Mutually
             exclusive with `replaced`.
@@ -80,8 +106,12 @@ class IngestResult:
     inserted_count: int
     already_imported: bool
     merger_trade_count: int = 0
+    maturity_trade_count: int = 0
+    skipped_maturity_count: int = 0
     dividend_count: int = 0
     dividends_inserted: int = 0
+    bond_coupon_count: int = 0
+    bond_coupons_inserted: int = 0
     replaced: bool = False
 
 
@@ -157,7 +187,32 @@ def ingest_statement(
         merger_trades = map_corporate_actions(parsed, fx_service=fx_service)
     else:
         merger_trades = []
-    trades = regular_trades + merger_trades
+
+    # Bond maturities — issuer-redemption disposals at par. Always
+    # synthesised when present (no FX dependency: par price is in the
+    # bond's own currency). Appended after mergers so the per-statement
+    # `statement_row_index` enumeration in `TradeRepo.insert_many`
+    # produces stable identities across re-ingests.
+    #
+    # IB's Bond Maturity description carries the bond's *canonical*
+    # symbol (e.g. ``"UKT 0 1/4 01/31/25"``), while the trades section
+    # may have ingested the same underlying gilt under one or more
+    # *yield-suffixed* aliases (``"UKT 0 1/4 01/31/25 5.26994388%"``).
+    # Until ISIN-based instrument unification lands, allowing the
+    # synthesised SELL through would create an orphan
+    # `bond_instruments` row that no `BUY` ever covers, polluting the
+    # debug views and surfacing as an `UnmatchedDisposalError` in
+    # `match bonds`. The filter below drops any maturity whose
+    # `(symbol, currency)` doesn't already match an existing bond
+    # instrument; the user is told which were skipped so they can
+    # follow up.
+    candidate_maturities = map_bond_maturities(parsed)
+    maturity_trades, skipped_maturity_trades = _filter_maturities_with_known_instruments(
+        candidate_maturities,
+        conn,
+        in_flight=regular_trades + merger_trades,
+    )
+    trades = regular_trades + merger_trades + maturity_trades
 
     # Dividends / WHT / payment-in-lieu — independent event stream from
     # trades. They feed the FX rule engine via the per-currency S.104
@@ -167,9 +222,15 @@ def ingest_statement(
     # enumerates from zero.
     dividends = map_dividends(parsed)
 
+    # Bond coupon payments — sixth FX-cashflow source per CG78315.
+    # Same independence: own table, own row-index space, mapper
+    # silently skips non-coupon rows in the Interest section.
+    bond_coupons = map_bond_coupons(parsed)
+
     accounts = AccountRepo(conn)
     trade_repo = TradeRepo(conn)
     dividend_repo = DividendRepo(conn)
+    bond_coupon_repo = BondCouponRepo(conn)
 
     # One transaction for everything the parser produced. `with conn:`
     # issues COMMIT on successful exit and ROLLBACK on exception, which
@@ -180,10 +241,12 @@ def ingest_statement(
     with conn:
         if prior_existed and replace:
             # Migration 004 made `trades.source_statement_hash`
-            # ON DELETE CASCADE, and migration 009 set the same
-            # cascade on `dividends.source_statement_hash`. Removing
-            # the `statements` row therefore removes every trade and
-            # every dividend that pointed at it.
+            # ON DELETE CASCADE, migration 009 set the same cascade
+            # on `dividends.source_statement_hash`, and migration 012
+            # extends it to `bond_coupons.source_statement_hash`.
+            # Removing the `statements` row therefore atomically
+            # removes every trade, dividend, and coupon that pointed
+            # at it.
             conn.execute(
                 "DELETE FROM statements WHERE statement_hash = ?",
                 (statement_hash,),
@@ -203,18 +266,100 @@ def ingest_statement(
             dividends,
             source_statement_hash=statement_hash,
         )
+        bond_coupons_inserted = bond_coupon_repo.insert_many(
+            bond_coupons,
+            source_statement_hash=statement_hash,
+        )
 
     return IngestResult(
         statement_hash=statement_hash,
         account_id=parsed.account_id,
         trade_count=len(trades),
         merger_trade_count=len(merger_trades),
+        maturity_trade_count=len(maturity_trades),
+        skipped_maturity_count=len(skipped_maturity_trades),
         dividend_count=len(dividends),
         dividends_inserted=dividends_inserted,
+        bond_coupon_count=len(bond_coupons),
+        bond_coupons_inserted=bond_coupons_inserted,
         inserted_count=inserted,
         already_imported=False,
         replaced=prior_existed and replace,
     )
+
+
+def _filter_maturities_with_known_instruments(
+    candidates: list[Trade],
+    conn: sqlite3.Connection,
+    *,
+    in_flight: list[Trade],
+) -> tuple[list[Trade], list[Trade]]:
+    """Split synthesised bond-maturity trades into kept vs skipped.
+
+    A maturity is kept only when the `(symbol, currency)` it claims to
+    redeem already has at least one BUY trade in the DB — i.e. an open
+    holding the redemption could plausibly be settling. Without this
+    guard, a maturity row whose IB-rendered symbol differs from the
+    trade-side aliases (the user's gilts are stored under yield-
+    suffixed symbols like `"UKT 0 1/4 01/31/25 5.26994388%"` while the
+    maturity row uses the canonical `"UKT 0 1/4 01/31/25"`) would
+    silently create a new orphan `bond_instruments` row that no BUY
+    ever covers — polluting `match bonds` and surfacing as an
+    `UnmatchedDisposalError`. Skipped maturities are returned so the
+    CLI can warn the user; ISIN-level instrument unification is the
+    proper long-term reconciliation path.
+
+    Args:
+        candidates: Trades produced by `map_bond_maturities`.
+        conn: Open SQLite connection — read-only for this lookup.
+        in_flight: Trades already mapped this run that haven't yet been
+            persisted (regular trades + merger synth). Their
+            `(symbol, currency)` BUY pairs count as covered for the
+            purpose of the filter, otherwise a fresh statement that
+            buys *and* matures the same bond in one ingest would have
+            its maturity dropped.
+
+    Returns:
+        `(kept, skipped)`. The two lists partition `candidates`. Order
+        is preserved within each.
+    """
+    if not candidates:
+        return [], []
+
+    keys: set[tuple[str, str]] = {
+        (t.instrument.symbol, t.instrument.currency)
+        for t in candidates
+        if isinstance(t.instrument, BondInstrument)
+    }
+    if not keys:
+        return [], list(candidates)
+
+    placeholders = ",".join(["(?, ?)"] * len(keys))
+    flat: list[str] = [val for pair in keys for val in pair]
+    sql = (
+        "SELECT DISTINCT b.symbol, b.currency "
+        "FROM bond_instruments AS b "
+        "JOIN trades AS t ON t.instrument_id = b.instrument_id "
+        "WHERE t.action = 'buy' "
+        f"AND (b.symbol, b.currency) IN (VALUES {placeholders})"
+    )
+    rows = conn.execute(sql, flat).fetchall()
+    known: set[tuple[str, str]] = {(r["symbol"], r["currency"]) for r in rows}
+
+    # Add this-statement BUYs that haven't been persisted yet.
+    for trade in in_flight:
+        if isinstance(trade.instrument, BondInstrument) and trade.action.value == "buy":
+            known.add((trade.instrument.symbol, trade.instrument.currency))
+
+    kept: list[Trade] = []
+    skipped: list[Trade] = []
+    for trade in candidates:
+        key = (trade.instrument.symbol, trade.instrument.currency)
+        if key in known:
+            kept.append(trade)
+        else:
+            skipped.append(trade)
+    return kept, skipped
 
 
 __all__ = ["IngestResult", "ingest_statement"]

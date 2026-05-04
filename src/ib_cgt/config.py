@@ -20,6 +20,14 @@ Resolution order for `resolve_fx_base_url`:
    for pointing tests or local forks at a stub server.
 2. `https://api.frankfurter.dev` — the public ECB-backed service.
 
+Resolution order for `resolve_exempt_bonds_allowlist`:
+
+1. `IB_CGT_BONDS_EXEMPT` environment variable, if set and non-empty —
+   a comma-separated list of IB symbols that should be flagged
+   `is_cgt_exempt=True` at ingest time. Covers QCBs and any exempt
+   bond the gilt heuristics in `ingest/mapper.py` do not catch.
+2. Empty set — the heuristics alone decide.
+
 Author: Emre Tezel
 """
 
@@ -41,6 +49,13 @@ ENV_VAR: Final = DB_ENV_VAR
 # Env var that overrides the Frankfurter base URL. Defaults to the
 # public endpoint; overriding is mostly a test/dev convenience.
 FX_URL_ENV_VAR: Final = "IB_CGT_FX_URL"
+
+# Env var that supplies user-curated bond symbols to mark CGT-exempt
+# (QCBs, exotic gilts) on top of the auto-detection in
+# `ingest/mapper.py:_classify_bond_exempt`. Comma-separated literal
+# symbols — leading/trailing whitespace is stripped, empty entries
+# discarded.
+BONDS_EXEMPT_ENV_VAR: Final = "IB_CGT_BONDS_EXEMPT"
 
 # Default location — ~/.ib-cgt/ibcgt.sqlite. Using a hidden directory
 # keeps the user's home tidy; the file is single-user so no permissions
@@ -88,10 +103,31 @@ def resolve_fx_base_url() -> str:
     return url.rstrip("/")
 
 
+def resolve_exempt_bonds_allowlist() -> frozenset[str]:
+    """Return the user-supplied set of CGT-exempt bond symbols.
+
+    Read from `IB_CGT_BONDS_EXEMPT` as a comma-separated list. Empty
+    entries (`",,A"`) are discarded; surrounding whitespace on each
+    entry is stripped. The result is a `frozenset` so callers can
+    use it as a hashable, immutable lookup table without copying.
+
+    Examples:
+        unset → `frozenset()`
+        `"UKT 4 1/2 2034"` → `frozenset({"UKT 4 1/2 2034"})`
+        `"A, B ,, C"` → `frozenset({"A", "B", "C"})`
+    """
+    raw = os.environ.get(BONDS_EXEMPT_ENV_VAR, "")
+    if not raw:
+        return frozenset()
+    return frozenset(piece.strip() for piece in raw.split(",") if piece.strip())
+
+
 __all__ = [
+    "BONDS_EXEMPT_ENV_VAR",
     "DB_ENV_VAR",
     "ENV_VAR",
     "FX_URL_ENV_VAR",
     "resolve_db_path",
+    "resolve_exempt_bonds_allowlist",
     "resolve_fx_base_url",
 ]

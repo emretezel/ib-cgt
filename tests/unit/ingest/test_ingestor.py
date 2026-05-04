@@ -186,6 +186,107 @@ def test_ingest_persists_synthesized_merger_trade(db: sqlite3.Connection) -> Non
     assert sell["statement_row_index"] > buy["statement_row_index"]
 
 
+def test_ingest_persists_bond_maturity_as_sell_trade(db: sqlite3.Connection) -> None:
+    """End-to-end: bond-maturity fixture lands as a SELL trade at par.
+
+    The fixture has 1 regular bond buy + 1 Bond Maturity Corporate
+    Actions row. The maturity synthesizer turns the CA row into a
+    SELL with `price=1.00 GBP`, `fees=0`, and a `statement_row_index`
+    strictly after the buy's. No FX service is needed (par price is
+    in the bond's own currency).
+    """
+    fixture = _FIXTURES / "with_bond_maturity.htm"
+    result = ingest_statement(fixture, db)
+
+    assert result.trade_count == 2
+    assert result.maturity_trade_count == 1
+    assert result.merger_trade_count == 0
+    assert result.inserted_count == 2
+
+    rows = db.execute(
+        "SELECT action, price_amount, price_currency, fees_amount, "
+        "       quantity, statement_row_index "
+        "FROM trades ORDER BY statement_row_index"
+    ).fetchall()
+    assert len(rows) == 2
+    buy, sell = rows
+
+    # Regular bond buy: price rescaled from "98.500" → "0.985".
+    assert buy["action"] == "buy"
+    assert Decimal(buy["price_amount"]) == Decimal("0.985")
+    assert buy["price_currency"] == "GBP"
+    assert Decimal(buy["quantity"]) == Decimal("215000")
+
+    # Synthesised maturity SELL: par price 1.00, no fees, strictly after the buy.
+    assert sell["action"] == "sell"
+    assert Decimal(sell["price_amount"]) == Decimal("1")
+    assert sell["price_currency"] == "GBP"
+    assert sell["fees_amount"] == "0"
+    assert Decimal(sell["quantity"]) == Decimal("215000")
+    assert sell["statement_row_index"] > buy["statement_row_index"]
+
+    # The bond is correctly auto-classified as a UK gilt (CGT-exempt).
+    bond_row = db.execute(
+        "SELECT is_cgt_exempt FROM bond_instruments WHERE symbol = ?",
+        ("UKT 0 1/4 01/31/25",),
+    ).fetchone()
+    assert bool(bond_row["is_cgt_exempt"]) is True
+
+
+def test_ingest_collapses_yield_suffixed_bond_lots_to_one_instrument(
+    db: sqlite3.Connection,
+) -> None:
+    """Two yield-suffixed BUYs of the same underlying gilt land under one ISIN row.
+
+    The fixture has two trades — `UKT 0 1/4 01/31/25 5.26994388%` and
+    `UKT 0 1/4 01/31/25 9.87150193%` — and one bond instrument-info
+    row carrying ISIN `GB00BLPK7110`. The post-014 mapper canonicalises
+    both trade symbols to `UKT 0 1/4 01/31/25` and resolves both to
+    the same ISIN, so the two BUYs collapse to a single
+    `bond_instruments` row. This is the user's real-world shape.
+    """
+    fixture = _FIXTURES / "with_yield_suffixed_bond.htm"
+    result = ingest_statement(fixture, db)
+
+    assert result.trade_count == 2
+    assert result.inserted_count == 2
+
+    # Single bond_instruments row, ISIN-keyed and with the canonical symbol.
+    bond_rows = db.execute(
+        "SELECT isin, symbol, currency, is_cgt_exempt FROM bond_instruments"
+    ).fetchall()
+    assert len(bond_rows) == 1
+    [bond] = bond_rows
+    assert bond["isin"] == "GB00BLPK7110"
+    assert bond["symbol"] == "UKT 0 1/4 01/31/25"
+    assert bond["currency"] == "GBP"
+    assert bool(bond["is_cgt_exempt"]) is True
+
+    # Both trades reference the same instrument_id.
+    trade_rows = db.execute(
+        "SELECT instrument_id FROM trades ORDER BY statement_row_index"
+    ).fetchall()
+    assert len({r["instrument_id"] for r in trade_rows}) == 1
+
+
+def test_reingest_bond_maturity_is_idempotent(db: sqlite3.Connection) -> None:
+    """A second ingest of the same statement does not duplicate the maturity SELL."""
+    fixture = _FIXTURES / "with_bond_maturity.htm"
+
+    first = ingest_statement(fixture, db)
+    assert first.maturity_trade_count == 1
+    assert first.inserted_count == 2
+
+    second = ingest_statement(fixture, db)
+    # Hash-level short-circuit returns `already_imported` and does not
+    # re-run the parse/map pipeline.
+    assert second.already_imported is True
+    assert second.inserted_count == 0
+
+    # No duplicates landed.
+    assert TradeRepo(db).count() == 2
+
+
 def test_ingest_persists_dividends(db: sqlite3.Connection) -> None:
     """End-to-end: dividends fixture lands rows in the `dividends` table.
 

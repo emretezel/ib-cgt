@@ -1,39 +1,46 @@
-"""Synthesize SELL trades from cash-for-shares Corporate Actions rows.
+"""Synthesize SELL trades from Corporate Actions rows.
 
-A cash-for-shares merger ("Merged(Acquisition)") is, for HMRC purposes,
-an ordinary disposal: shares leave the account, cash arrives, gain/loss
-is computed against acquisition cost. So this module materialises each
-such event as a single synthesized `SELL Trade` and lets the regular
-matching engine handle it.
+Two CGT-relevant Corporate Action shapes are materialised here, both
+collapsing to a single synthesized `SELL Trade` so the regular
+matching engines (Stock / Bond) handle the disposal without knowing
+the row's origin:
 
-Scope (intentionally narrow):
+1. **Cash-for-shares mergers** (`map_corporate_actions`) — Stocks-only,
+   description matches `<TICKER>(<ISIN>) Merged(Acquisition) for <CCY>
+   <PRICE> per Share`. Cross-currency proceeds are converted to the
+   stock's listing currency at the disposal-date spot rate.
 
-* Only the **Stocks** asset class.
-* Only descriptions matching `<TICKER>(<ISIN>) Merged(Acquisition) for
-  <CCY> <PRICE> per Share` — i.e. cash consideration. Share-for-share
-  mergers (`Merged(Acquisition) for 0.5 shares of ABC`) are silently
-  ignored — those would need fresh acquisition rows on the new
-  instrument and a UK CGT s.135 reorganisation analysis, neither of
-  which is in v1.
-* Bonds, dividends-as-CA, splits, spin-offs, and tendered-to-other-stock
-  rows are silently ignored.
+2. **Bond maturities** (`map_bond_maturities`) — Bonds-only,
+   description matches `(<ISIN>) Bond Maturity FOR <CCY> <PRICE> PER
+   BOND (<symbol>, <long_desc>, <isin>)`. The redemption price (always
+   `1.00 PER BOND` in observed data) is in the bond's own currency, so
+   no FX conversion is needed. The synthesised SELL feeds the
+   `BondRuleEngine` exactly like an ordinary sell — for exempt gilts
+   it closes out the position; for non-exempt bonds it triggers a
+   real S.104 disposal.
 
-Two-row reconciliation: a cross-currency merger (e.g. GBP-listed `IEMI`
-paid out for USD cash) appears as two rows sharing the same `Date/Time`
-and `description` — one in the listing currency carrying the disposed
-quantity, one in the cash currency carrying the proceeds. Same-currency
-mergers collapse to a single row. The mapper groups by
-`(datetime_text, description)` and reads the disposed quantity from the
-non-zero-quantity row and the cash proceeds from the non-zero-proceeds
-row.
+Out of scope (silently ignored): share-for-share mergers, dividends-as-
+CA, splits, spin-offs, tendered-to-other-stock rows. Share-for-share
+mergers would need fresh acquisition rows on the new instrument and a
+UK CGT s.135 reorganisation analysis, neither of which is in v1.
 
-FX policy: when `proceeds_currency != listing_currency`, the proceeds
-are converted to the listing currency via `FXService.convert` at the
-disposal-date spot rate (the same machinery used by the rule engines
-for ordinary sells). The synthesized `Trade` therefore satisfies the
-domain invariant `Trade.price.currency == instrument.currency` without
-the rest of the pipeline needing to know that this was a corporate
-action.
+Two-row reconciliation (mergers only): a cross-currency merger (e.g.
+GBP-listed `IEMI` paid out for USD cash) appears as two rows sharing
+the same `Date/Time` and `description` — one in the listing currency
+carrying the disposed quantity, one in the cash currency carrying the
+proceeds. Same-currency mergers collapse to a single row. The mapper
+groups by `(datetime_text, description)` and reads the disposed
+quantity from the non-zero-quantity row and the cash proceeds from
+the non-zero-proceeds row. Bond maturities always appear as a single
+row, so the maturity path skips the grouping step.
+
+FX policy (mergers only): when `proceeds_currency != listing_currency`,
+the proceeds are converted to the listing currency via
+`FXService.convert` at the disposal-date spot rate (the same machinery
+used by the rule engines for ordinary sells). The synthesized `Trade`
+therefore satisfies the domain invariant
+`Trade.price.currency == instrument.currency` without the rest of the
+pipeline needing to know that this was a corporate action.
 
 Author: Emre Tezel
 """
@@ -49,9 +56,15 @@ from decimal import Decimal, InvalidOperation
 from typing import Final, Protocol
 from zoneinfo import ZoneInfo
 
-from ib_cgt.domain import Money, StockInstrument, Trade, TradeAction
-from ib_cgt.ingest.mapper import DEFAULT_STATEMENT_TZ, MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawCorporateActionRow
+from ib_cgt.config import resolve_exempt_bonds_allowlist
+from ib_cgt.domain import BondInstrument, Money, StockInstrument, Trade, TradeAction
+from ib_cgt.ingest.mapper import (
+    DEFAULT_STATEMENT_TZ,
+    MappingError,
+    _canonicalise_gilt_symbol,
+    _classify_bond_exempt,
+)
+from ib_cgt.ingest.parser import ParsedStatement, RawCorporateActionRow, RawInstrumentInfo
 
 
 class FXConverter(Protocol):
@@ -84,6 +97,29 @@ _CASH_MERGER_RE: Final[re.Pattern[str]] = re.compile(
     r"Merged\(Acquisition\)\s+for\s+"
     r"(?P<ccy>[A-Z]{3})\s+"
     r"(?P<price>[\d.,]+)\s+per Share"
+)
+
+# Bond asset-class labels we materialise maturities for. Mirror
+# `_STOCK_LABELS` for the merger path; aliasing both observed IB labels
+# (`"Bonds"` and the legacy `"Corporate and Municipal Bonds"`) so a
+# format drift doesn't silently drop maturity rows.
+_BOND_LABELS: Final[frozenset[str]] = frozenset({"Bonds", "Corporate and Municipal Bonds"})
+
+# Bond maturity description shape:
+#   (<ISIN1>)  Bond Maturity FOR <CCY> <PRICE> PER BOND
+#   (<symbol>, <long_desc>, <ISIN2>)
+# Two ISINs (header parenthetical + tail parenthetical) match the
+# observed IB layout. `par_price` is captured (rather than hard-coded
+# to `1.00`) so a non-par early call would still parse cleanly. The
+# tail parenthetical's three fields are comma-separated; the symbol
+# itself can contain spaces and slashes (e.g. `UKT 0 1/4 01/31/25`),
+# so we match non-greedily up to the first comma.
+_BOND_MATURITY_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\((?P<isin1>[A-Z0-9]{12})\)\s+"
+    r"Bond Maturity FOR\s+(?P<ccy>[A-Z]{3})\s+"
+    r"(?P<par_price>[\d.,]+)\s+PER BOND\s+"
+    r"\((?P<symbol>[^,]+?)\s*,\s*(?P<long_desc>[^,]+?)\s*,\s*"
+    r"(?P<isin2>[A-Z0-9]{12})\)\s*$"
 )
 
 
@@ -299,4 +335,163 @@ def _parse_datetime(text: str, tz: ZoneInfo) -> datetime:
     return naive.replace(tzinfo=tz)
 
 
-__all__ = ["map_corporate_actions"]
+# ---------------------------------------------------------------------------
+# Bond maturities
+# ---------------------------------------------------------------------------
+
+
+def map_bond_maturities(
+    parsed: ParsedStatement,
+    *,
+    assume_timezone: ZoneInfo = DEFAULT_STATEMENT_TZ,
+) -> list[Trade]:
+    """Synthesize SELL `Trade`s from Bond Maturity Corporate Actions rows.
+
+    A bond maturity is, for HMRC purposes, a disposal at par on the
+    redemption date — the issuer pays the full face value and the
+    position closes. For exempt gilts / QCBs the resulting `SELL` is
+    inert (the engine routes them via `ExemptBondResult`); for non-
+    exempt bonds it triggers a real S.104 disposal.
+
+    Args:
+        parsed: Output of `parser.parse_statement`. Both
+            `parsed.corporate_actions` (the source rows) and
+            `parsed.instruments` (used to recover the gilt-classifying
+            description) are consulted.
+        assume_timezone: Zone to attach to IB's naive timestamps.
+            Defaults to Europe/London.
+
+    Returns:
+        A list of `Trade(action=SELL, fees=0)` objects, one per
+        maturity event, in the order they appeared in the source.
+        Maturities of bonds whose Corporate Actions row is not in the
+        Bonds asset class — or whose description does not match the
+        IB Bond Maturity shape — are silently skipped.
+
+    Raises:
+        MappingError: On a malformed maturity row (unparseable
+            quantity, unparseable date, zero quantity, etc.). These
+            are real bugs in the source data or the parser; failing
+            loudly is better than silently dropping a disposal.
+    """
+    # Index the bond instrument-info rows by ISIN so the maturity
+    # synthesiser can recover the canonical Symbol / Description from
+    # the description's `(ISIN)` capture. Symbol-keyed lookup is kept
+    # as a fallback for older statements where the bonds-shaped table
+    # is absent.
+    info_by_isin: dict[str, RawInstrumentInfo] = {
+        info.security_id: info
+        for info in parsed.instruments
+        if info.asset_class == "Bonds" and info.security_id
+    }
+    info_by_symbol: dict[str, RawInstrumentInfo] = {
+        info.symbol: info for info in parsed.instruments if info.asset_class == "Bonds"
+    }
+    overrides = resolve_exempt_bonds_allowlist()
+
+    out: list[Trade] = []
+    for row in parsed.corporate_actions:
+        if row.asset_class not in _BOND_LABELS:
+            continue
+        match = _BOND_MATURITY_RE.match(row.description)
+        if match is None:
+            continue
+        out.append(
+            _synthesize_bond_maturity(
+                row=row,
+                match=match,
+                info_by_isin=info_by_isin,
+                info_by_symbol=info_by_symbol,
+                overrides=overrides,
+                account_id=parsed.account_id,
+                assume_timezone=assume_timezone,
+            )
+        )
+    return out
+
+
+def _synthesize_bond_maturity(
+    *,
+    row: RawCorporateActionRow,
+    match: re.Match[str],
+    info_by_isin: dict[str, RawInstrumentInfo],
+    info_by_symbol: dict[str, RawInstrumentInfo],
+    overrides: frozenset[str],
+    account_id: str,
+    assume_timezone: ZoneInfo,
+) -> Trade:
+    """Build one SELL Trade from a Bond Maturity row's regex match."""
+    raw_symbol = match.group("symbol").strip()
+    isin = match.group("isin1")
+    currency = match.group("ccy")
+    par_price = _parse_decimal(match.group("par_price"))
+    if par_price <= 0:
+        raise MappingError(
+            f"Bond maturity row has non-positive par price {match.group('par_price')!r} "
+            f"({row.description!r}); expected a positive cash-per-bond redemption."
+        )
+
+    signed_qty = _parse_decimal(row.quantity_text)
+    if signed_qty == 0:
+        raise MappingError(
+            f"Bond maturity row has zero quantity ({row.description!r}); cannot synthesize "
+            "a disposal."
+        )
+    quantity = abs(signed_qty)
+
+    trade_datetime = _parse_datetime(row.datetime_text, assume_timezone)
+    trade_date = Trade.uk_date_of(trade_datetime)
+
+    # Recover the canonical display symbol + description from the
+    # Financial Instrument Information section. ISIN keying is the
+    # primary path; the regex-captured raw symbol is a fallback for
+    # older statements that lack the bonds-shaped table.
+    info = info_by_isin.get(isin) or info_by_symbol.get(raw_symbol)
+    canonical_symbol = (
+        _canonicalise_gilt_symbol(info.symbol)
+        if info is not None
+        else _canonicalise_gilt_symbol(raw_symbol)
+    )
+    # Prefer Issuer for the gilt classifier (it carries the verbose
+    # `"United Kingdom Gilt …"` string in the bonds-shaped table);
+    # fall back to Description, then to the symbol-prefix path
+    # inside `_classify_bond_exempt`.
+    classifier_text = info.issuer_text or info.description if info is not None else None
+    is_exempt = _classify_bond_exempt(
+        symbol=raw_symbol,
+        description=classifier_text,
+        currency=currency,
+        overrides=overrides,
+    )
+    instrument = BondInstrument(
+        isin=isin,
+        symbol=canonical_symbol,
+        currency=currency,
+        is_cgt_exempt=is_exempt,
+    )
+
+    return Trade(
+        account_id=account_id,
+        instrument=instrument,
+        action=TradeAction.SELL,
+        trade_datetime=trade_datetime,
+        trade_date=trade_date,
+        # IB does not print a settlement date for corporate actions;
+        # default to the trade date (matches the cash-merger policy).
+        settlement_date=trade_date,
+        quantity=quantity,
+        # IB's "PER BOND" price is already in cash-per-face-value-unit
+        # terms — it does NOT need the `_BOND_PRICE_PAR_DIVISOR` /100
+        # rescale that the trades-section mapper applies, because the
+        # corporate-action description states `1.00 PER BOND` directly
+        # rather than a "% of par" quote.
+        price=Money.of(par_price, currency),
+        # Bond maturities carry no commissions.
+        fees=Money.of(Decimal(0), currency),
+        # Any pre-redemption coupon is a separate `bond_coupons` row;
+        # the maturity itself carries no accrued.
+        accrued_interest=None,
+    )
+
+
+__all__ = ["map_bond_maturities", "map_corporate_actions"]

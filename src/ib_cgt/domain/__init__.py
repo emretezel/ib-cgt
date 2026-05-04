@@ -15,6 +15,7 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+from ib_cgt.domain.bond_coupons import BondCoupon, InvalidBondCouponError
 from ib_cgt.domain.disposal import (
     Acquisition,
     DirectAcquisition,
@@ -57,6 +58,7 @@ __all__ = [
     "AnyInstrument",
     "AssetClass",
     "AssetClassSummary",
+    "BondCoupon",
     "BondInstrument",
     "CurrencyMismatchError",
     "CurrencyPair",
@@ -68,6 +70,7 @@ __all__ = [
     "FutureInstrument",
     "FutureRealisation",
     "Instrument",
+    "InvalidBondCouponError",
     "InvalidDividendError",
     "InvalidInstrumentError",
     "InvalidTaxYearError",

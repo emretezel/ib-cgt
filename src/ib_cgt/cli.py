@@ -23,6 +23,11 @@ Commands:
   the four-rule UK matching engine per non-GBP currency pool. A
   cross-currency trade (e.g. ``EUR.USD``) feeds two pools at once.
   Cross-account by design. Persists nothing.
+* ``ib-cgt match bonds [filters]`` — read-only debug command that
+  runs the bond rule engine against ingested bond trades. Exempt
+  bonds (gilts / QCBs) surface in a "no CGT" summary table; non-
+  exempt bonds run through the same four-rule matcher as stocks.
+  Cross-account by design. Persists nothing.
 
 The command surface and help text are deliberately terse; we'll flesh
 them out when the calculator and reporting commands land in their own
@@ -60,6 +65,7 @@ from ib_cgt.db import (
 )
 from ib_cgt.domain import (
     AssetClass,
+    BondInstrument,
     DirectAcquisition,
     Dividend,
     DividendKind,
@@ -80,6 +86,9 @@ from ib_cgt.domain import (
 from ib_cgt.fx import FrankfurterClient, FXService, RateNotFoundError
 from ib_cgt.ingest import IngestResult, ingest_statement
 from ib_cgt.rules import (
+    BondResult,
+    BondRuleEngine,
+    ExemptBondResult,
     FutureResult,
     FutureRuleEngine,
     FXRuleEngine,
@@ -142,6 +151,16 @@ check_app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(check_app, name="check")
+bonds_app = typer.Typer(
+    help=(
+        "Bond-instrument management — list ingested bonds and verify "
+        "the CGT-exempt flag inferred at ingest time. Useful as a "
+        "sanity check after re-ingesting statements with an updated "
+        "gilt classifier or `IB_CGT_BONDS_EXEMPT` allowlist."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(bonds_app, name="bonds")
 
 # One module-level Console so colour / width detection is shared across
 # commands — cheaper than re-constructing it per call.
@@ -350,10 +369,24 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
     if result.merger_trade_count:
         plural = "" if result.merger_trade_count == 1 else "s"
         summary += f" (incl. {result.merger_trade_count} corporate-action disposal{plural})"
+    if result.maturity_trade_count:
+        plural = "" if result.maturity_trade_count == 1 else "s"
+        summary += f" (incl. {result.maturity_trade_count} bond maturity disposal{plural})"
+    if result.skipped_maturity_count:
+        plural = "" if result.skipped_maturity_count == 1 else "s"
+        summary += (
+            f" (skipped {result.skipped_maturity_count} bond maturity row{plural} with "
+            "no matching bond instrument)"
+        )
     if result.dividend_count:
         plural = "" if result.dividend_count == 1 else "s"
         summary += (
             f"; {result.dividends_inserted} new / {result.dividend_count} dividend cashflow{plural}"
+        )
+    if result.bond_coupon_count:
+        plural = "" if result.bond_coupon_count == 1 else "s"
+        summary += (
+            f"; {result.bond_coupons_inserted} new / {result.bond_coupon_count} bond coupon{plural}"
         )
     _console.print(summary + ".")
 
@@ -2116,6 +2149,377 @@ def _fx_divider(currency: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# `match bonds` — UK CGT bond engine (exempt summary + four-rule matching)
+# ---------------------------------------------------------------------------
+
+
+@match_app.command("bonds")
+def match_bonds(
+    symbol: Annotated[
+        str | None,
+        typer.Option(
+            "--symbol",
+            "-s",
+            help="Filter to one bond symbol (e.g. 'UKT 0 1/8 01/30/26').",
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Inclusive lower bound on trade_date (YYYY-MM-DD). "
+                "Caveat: matching is sensitive to date clipping; for "
+                "production output omit this. Use only to construct "
+                "edge-case scenarios for debugging — clipping mid-"
+                "history breaks S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "Inclusive upper bound on trade_date (YYYY-MM-DD). "
+                "Same caveat as --since: clipping mid-history breaks "
+                "S.104 pool reconstruction."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Dry-run the bond rule engine against ingested trades.
+
+    Walks every bond instrument that matches the filters, runs
+    `BondRuleEngine.compute` against its trade history (across all
+    accounts — UK CGT pools span every account belonging to the
+    taxpayer), and renders the output. The engine returns a sealed
+    union, so the rendering branches on the result shape:
+
+    * **Exempt bonds** (gilts / QCBs) surface in a yellow "no CGT"
+      table with their native-currency buy / sell aggregates.
+      No FX conversion, no S.104 pool, no `MatchedDisposal` rows.
+    * **Non-exempt bonds** produce the same five sections
+      `match stocks` does — matched-disposal table, pool residuals,
+      final S.104 pools, summary, errors.
+
+    Nothing is written to the database — this command is a read-only
+    audit tool. As with `match stocks`, there is intentionally no
+    `--account` flag: filtering by account would silently break the
+    matching invariants for non-exempt bonds with cross-account
+    histories.
+    """
+    since_date = _parse_iso_date(since, "--since")
+    until_date = _parse_iso_date(until, "--until")
+
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        # Same defensive `apply_migrations` call as `match stocks` —
+        # a fresh DB would otherwise surface a confusing missing-
+        # table error deep in the rule engine.
+        apply_migrations(conn)
+        # The exempt branch never touches the FX cache, but the
+        # engine constructor accepts the converter unconditionally
+        # (uniform calculator-injection contract). Reusing the real
+        # `FXService` keeps the non-exempt path live for any
+        # corporate / foreign-issuer bond the user may later trade.
+        fx_service = FXService(
+            FXRateRepo(conn),
+            FrankfurterClient(base_url=resolve_fx_base_url()),
+        )
+        engine = BondRuleEngine(fx_service)
+        instruments = InstrumentRepo(conn).list_bonds(symbol=symbol)
+        results = _run_match_bonds(
+            conn=conn,
+            engine=engine,
+            instruments=instruments,
+            since=since_date,
+            until=until_date,
+        )
+    finally:
+        conn.close()
+
+    if not instruments:
+        _console.print("[yellow]No bond instruments match the given filters.[/]")
+        return
+
+    _render_match_bonds(results, db_path)
+
+
+# Per-instrument outcome — either a successful `BondResult`
+# (`MatchingResult` for non-exempt, `ExemptBondResult` for gilts /
+# QCBs), the trade-id → trade-date map needed by the renderer for
+# direct-match basis dates, or the exception the engine raised.
+# Mirrors `_MatchStocksRow`'s shape so error-isolation logic is
+# uniform across `match` commands.
+_MatchBondsRow = tuple[
+    BondInstrument,
+    BondResult | None,
+    dict[int, date],
+    Exception | None,
+]
+
+
+def _run_match_bonds(
+    *,
+    conn: sqlite3.Connection,
+    engine: BondRuleEngine,
+    instruments: list[tuple[int, BondInstrument]],
+    since: date | None,
+    until: date | None,
+) -> list[_MatchBondsRow]:
+    """Run the bond engine per-instrument with per-instrument error capture.
+
+    Builds a `{trade_id: trade_date}` map per instrument so the
+    renderer can show the basis acquisition's date alongside its
+    trade id (only relevant for the non-exempt branch — the exempt
+    branch never produces `MatchedDisposal` rows).
+    """
+    trade_repo = TradeRepo(conn)
+    out: list[_MatchBondsRow] = []
+    for instrument_id, instrument in instruments:
+        # Cross-account: account_id=None pulls every trade for this
+        # bond across every account. Per the docstring, filtering
+        # by account would break the S.104 pool for non-exempt bonds.
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id,
+            account_id=None,
+            since=since,
+            until=until,
+        )
+        date_map = {trade_id: trade.trade_date for trade_id, trade in trades}
+        try:
+            result = engine.compute(instrument, trades)
+        except (
+            WrongAssetClassError,
+            InconsistentTradeError,
+            UnmatchedDisposalError,
+            RateNotFoundError,
+        ) as exc:
+            out.append((instrument, None, date_map, exc))
+            continue
+        out.append((instrument, result, date_map, None))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers — `match bonds`
+# ---------------------------------------------------------------------------
+
+
+def _render_match_bonds(rows: list[_MatchBondsRow], db_path: Path) -> None:
+    """Render the six sections of a `match bonds` run."""
+    _render_match_bonds_exempt(rows)
+    _render_match_bonds_disposals(rows)
+    _render_match_bonds_residuals(rows)
+    _render_match_bonds_final_pools(rows)
+    _render_match_bonds_summary(rows, db_path)
+    _render_match_bonds_errors(rows)
+
+
+def _render_match_bonds_exempt(rows: list[_MatchBondsRow]) -> None:
+    """Yellow summary table for exempt bonds — no CGT, audit only.
+
+    UK gilts and QCBs produce no `MatchedDisposal` rows; this table
+    is the only window the user has into what the engine saw. The
+    native-currency totals make it cheap to spot-check that every
+    expected buy / sell registered.
+    """
+    exempt_rows: list[tuple[BondInstrument, ExemptBondResult]] = [
+        (instrument, result)
+        for instrument, result, _, error in rows
+        if error is None and isinstance(result, ExemptBondResult)
+    ]
+    if not exempt_rows:
+        return
+
+    table = Table(
+        title="Exempt bonds (gilts / QCBs — no CGT)",
+        header_style="bold yellow",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("ISIN")
+    table.add_column("Buys", justify="right")
+    table.add_column("Sells", justify="right")
+    table.add_column("Total Buy (native)", justify="right")
+    table.add_column("Total Sell (native)", justify="right")
+    for instrument, exempt in exempt_rows:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            instrument.isin or "[dim]—[/]",
+            str(exempt.exempt_buy_count),
+            str(exempt.exempt_sell_count),
+            _format_money_2dp(exempt.total_buy_native),
+            _format_money_signed_2dp(exempt.total_sell_native),
+        )
+    _console.print(table)
+
+
+def _render_match_bonds_disposals(rows: list[_MatchBondsRow]) -> None:
+    """Per-non-exempt-bond bold header + matched-disposal table.
+
+    Reuses `_matched_disposal_to_cells` — the projection is asset-
+    class-agnostic, so the same 11-column shape that drives the
+    stock disposal table works here unchanged.
+    """
+    matching_rows: list[tuple[BondInstrument, MatchingResult, dict[int, date]]] = [
+        (instrument, result, date_map)
+        for instrument, result, date_map, error in rows
+        if error is None and isinstance(result, MatchingResult)
+    ]
+    if not matching_rows:
+        return
+
+    _console.print("\n[bold]Bond matched disposals (dry-run)[/]")
+    for instrument, result, date_map in matching_rows:
+        divider = _bond_divider(instrument)
+        _console.print(f"\n[bold cyan]{divider}[/]")
+        if not result.matched_disposals:
+            _console.print("  [dim](no matched disposals)[/]")
+            continue
+        table = Table(header_style="bold", show_lines=False)
+        table.add_column("Disp ID", justify="right")
+        table.add_column("Disp Date")
+        table.add_column("Rule")
+        table.add_column("Qty", justify="right")
+        table.add_column("Acq ID / Basis")
+        table.add_column("Acq Date")
+        table.add_column("Proceeds (GBP)", justify="right")
+        table.add_column("Disp Fees (GBP)", justify="right")
+        table.add_column("Cost (GBP)", justify="right")
+        table.add_column("Acq Fees (GBP)", justify="right")
+        table.add_column("Gain (GBP)", justify="right")
+        for md in result.matched_disposals:
+            table.add_row(*_matched_disposal_to_cells(md, date_map))
+        _console.print(table)
+
+
+def _render_match_bonds_residuals(rows: list[_MatchBondsRow]) -> None:
+    """One flat table of every UnmatchedAcquisition across non-exempt bonds."""
+    residuals: list[tuple[BondInstrument, UnmatchedAcquisition]] = [
+        (instrument, ua)
+        for instrument, result, _, error in rows
+        if error is None and isinstance(result, MatchingResult)
+        for ua in result.unmatched_acquisitions
+    ]
+    if not residuals:
+        return
+
+    table = Table(
+        title="Pool residuals at end of input (non-exempt bonds)",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("Acq ID", justify="right")
+    table.add_column("Acq Date")
+    table.add_column("Qty Remaining", justify="right")
+    table.add_column("Cost Remaining (GBP)", justify="right")
+    for instrument, ua in residuals:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            str(ua.trade_id),
+            ua.acquisition_date.isoformat(),
+            _format_qty_2dp(ua.quantity_remaining),
+            _format_money_2dp(ua.cost_remaining_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_bonds_final_pools(rows: list[_MatchBondsRow]) -> None:
+    """Per-non-exempt-bond final-pool aggregate — one flat table."""
+    pools: list[tuple[BondInstrument, TaxLot]] = [
+        (instrument, result.final_pool)
+        for instrument, result, _, error in rows
+        if error is None and isinstance(result, MatchingResult) and result.final_pool.quantity > 0
+    ]
+    if not pools:
+        return
+
+    table = Table(
+        title="Final S.104 pools (non-exempt bonds)",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("Pool Qty", justify="right")
+    table.add_column("Pool Cost (GBP)", justify="right")
+    table.add_column("Avg Cost (GBP)", justify="right")
+    for instrument, pool in pools:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            _format_qty_2dp(pool.quantity),
+            _format_money_2dp(pool.total_cost_gbp),
+            _format_money_2dp(pool.average_cost_gbp),
+        )
+    _console.print(table)
+
+
+def _render_match_bonds_summary(rows: list[_MatchBondsRow], db_path: Path) -> None:
+    """Counts table — exempt vs non-exempt vs error split, plus realised gain."""
+    exempt_count = sum(
+        1 for _, result, _, error in rows if error is None and isinstance(result, ExemptBondResult)
+    )
+    matched_count = sum(
+        1 for _, result, _, error in rows if error is None and isinstance(result, MatchingResult)
+    )
+    error_count = sum(1 for _, _, _, error in rows if error is not None)
+    md_count = sum(
+        len(result.matched_disposals)
+        for _, result, _, error in rows
+        if error is None and isinstance(result, MatchingResult)
+    )
+    total_gain = Money.gbp(Decimal("0"))
+    for _, result, _, error in rows:
+        if error is not None or not isinstance(result, MatchingResult):
+            continue
+        for md in result.matched_disposals:
+            total_gain = total_gain + md.gain_gbp
+
+    table = Table(
+        title="Summary",
+        caption=f"[dim]{db_path}[/]",
+        header_style="bold",
+    )
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("…exempt (skipped)", str(exempt_count))
+    table.add_row("…non-exempt matched", str(matched_count))
+    table.add_row("…with errors", str(error_count))
+    table.add_row("Matched disposal chunks", str(md_count))
+    gain_style = "green" if total_gain.amount >= 0 else "red"
+    table.add_row(
+        "Total realised gain (GBP)",
+        f"[{gain_style}]{_format_money_2dp(total_gain)}[/]",
+    )
+    _console.print(table)
+
+
+def _render_match_bonds_errors(rows: list[_MatchBondsRow]) -> None:
+    """Print every per-instrument error in one block at the end."""
+    error_rows = [(instrument, error) for instrument, _, _, error in rows if error is not None]
+    if not error_rows:
+        return
+    _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
+    for instrument, error in error_rows:
+        _console.print(f"  [bold cyan]{_bond_divider(instrument)}[/] [red]→ {error}[/]")
+
+
+def _bond_divider(instrument: BondInstrument) -> str:
+    """Stable label used in section dividers and error rows."""
+    return f"{instrument.symbol} ({instrument.currency})"
+
+
+# ---------------------------------------------------------------------------
 # `show trade` — single-trade audit dossier
 # ---------------------------------------------------------------------------
 
@@ -3094,6 +3498,68 @@ def _json_safe(value: object) -> object:
 # signature only via the `report.results` access, so the explicit
 # import is needed for the annotation in this module.
 _CHECK_RESULT_REF: type[CheckResult] = CheckResult
+
+
+# ---------------------------------------------------------------------------
+# `bonds` subgroup
+# ---------------------------------------------------------------------------
+
+
+@bonds_app.command("list")
+def bonds_list(
+    symbol: Annotated[
+        str | None,
+        typer.Option("--symbol", "-s", help="Filter to bonds with that exact symbol."),
+    ] = None,
+) -> None:
+    """List every ingested bond with its inferred CGT-exempt flag.
+
+    The flag is set at ingest time by the gilt classifier
+    (`ingest/mapper.py:_classify_bond_exempt`). Use this command to
+    verify the classification after re-ingesting statements or
+    extending the `IB_CGT_BONDS_EXEMPT` allowlist.
+    """
+    db_path = resolve_db_path()
+    conn = open_connection(db_path)
+    try:
+        rows = InstrumentRepo(conn).list_bonds(symbol=symbol)
+    finally:
+        conn.close()
+
+    if not rows:
+        _console.print("[dim]No bond instruments found.[/]")
+        return
+
+    _render_bonds(rows, db_path)
+
+
+def _render_bonds(rows: list[tuple[int, BondInstrument]], db_path: Path) -> None:
+    """Render a `(id, BondInstrument)` list as a rich.Table."""
+    # Yellow on exempt, dim grey on non-exempt — at a glance you see
+    # which bonds the engine will pool vs skip.
+    table = Table(
+        title=f"Bond instruments — {len(rows)} rows",
+        caption=f"[dim]{db_path}[/]",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("ID", justify="right")
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("ISIN")
+    table.add_column("CGT-exempt")
+
+    for instrument_id, bond in rows:
+        flag_text = "[bold yellow]YES[/]" if bond.is_cgt_exempt else "[dim]no[/]"
+        table.add_row(
+            str(instrument_id),
+            bond.symbol,
+            bond.currency,
+            bond.isin or "[dim]—[/]",
+            flag_text,
+        )
+
+    _console.print(table)
 
 
 if __name__ == "__main__":  # pragma: no cover — direct execution path

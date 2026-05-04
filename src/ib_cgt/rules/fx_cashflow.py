@@ -41,6 +41,7 @@ from decimal import Decimal
 
 from ib_cgt.domain import (
     Acquisition,
+    BondCoupon,
     CurrencyPair,
     Disposal,
     Dividend,
@@ -434,6 +435,73 @@ def from_dividend(
         account_id=dividend.account_id,
         instrument=pool_instrument,
         acquisition_date=dividend.pay_date,
+        quantity=amount,
+        cost_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bond coupons — interest payments credit the per-currency pool
+# ---------------------------------------------------------------------------
+
+
+def from_bond_coupon(
+    synth_id: int,
+    coupon: BondCoupon,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | None:
+    """Project a bond coupon payment into an FX-pool event.
+
+    Per HMRC CG78315, foreign currency arising from any source feeds
+    the same per-currency S.104 pool, so a USD coupon on a US
+    Treasury is — for FX-pool purposes — indistinguishable from a
+    USD stock dividend or a USD stock-sale receipt: cash arrives in
+    the foreign-currency balance on `pay_date`, GBP-converted at
+    that date's spot rate.
+
+    Coupons are always **inflows** (the holder receives cash; there
+    is no withholding-tax variant on bond interest the way there is
+    on equity dividends), so the projection is always an
+    `Acquisition`. There is no signed-amount or `kind`
+    discriminator — the domain object enforces a strictly positive
+    amount.
+
+    `synth_id` (not the real `bond_coupon_id`) is what
+    `Acquisition.trade_id` carries. The CLI orchestrator allocates a
+    synthetic-ID range for coupons distinct from the realisation /
+    dividend ranges so the `id_label_map` machinery in `match fx`
+    can route audit lines to the right source.
+
+    `fees_gbp` is `Money.gbp(0)`: IB does not charge a per-coupon
+    fee, and any platform-level interest charge would land in the
+    same Interest section under a different description (broker
+    debit/credit interest) which the bond-coupon mapper already
+    filters out.
+
+    Returns `None` for GBP coupons (no FX trade is realised — the
+    cash hits the GBP balance directly) or for coupons in a currency
+    other than the requested pool.
+    """
+    native_ccy = coupon.amount.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    # Defensive: matches `BondCoupon.__post_init__`. The validator
+    # already rejects zero / negative, but the assertion documents
+    # the projector contract for readers who skip the domain layer.
+    amount = coupon.amount.amount
+    if amount <= 0:
+        return None
+
+    gbp_value = _money_to_gbp(coupon.amount, fx, coupon.pay_date)
+    return Acquisition(
+        trade_id=synth_id,
+        account_id=coupon.account_id,
+        instrument=pool_instrument,
+        acquisition_date=coupon.pay_date,
         quantity=amount,
         cost_gbp=gbp_value,
         fees_gbp=Money.gbp(Decimal(0)),

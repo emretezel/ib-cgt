@@ -94,6 +94,26 @@ def test_stock_thousands_commas_parsed() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _bond_info(
+    *,
+    symbol: str,
+    description: str,
+    security_id: str,
+    maturity: str | None = None,
+) -> RawInstrumentInfo:
+    """Bonds-shaped Financial Instrument Information row helper."""
+    return RawInstrumentInfo(
+        asset_class="Bonds",
+        symbol=symbol,
+        description=description,
+        multiplier_text=None,
+        expiry_text=None,
+        listing_exch=None,
+        security_id=security_id,
+        maturity_text=maturity,
+    )
+
+
 def test_bond_defaults_non_exempt() -> None:
     row = RawTradeRow(
         asset_class="Bonds",
@@ -105,10 +125,115 @@ def test_bond_defaults_non_exempt() -> None:
         fees_text="0",
         code="",
     )
-    trade = map_rows(_make([row]))[0]
+    info = _bond_info(
+        symbol="T 3 08/15/53",
+        description="US Treasury 3% 2053",
+        security_id="US912810TQ12",
+    )
+    trade = map_rows(_make([row], [info]))[0]
     assert isinstance(trade.instrument, BondInstrument)
+    assert trade.instrument.isin == "US912810TQ12"
     assert trade.instrument.is_cgt_exempt is False
     assert trade.action is TradeAction.BUY
+
+
+def test_bond_without_isin_raises() -> None:
+    """Migration 014 made ISIN mandatory for bonds — no info row → MappingError."""
+    row = RawTradeRow(
+        asset_class="Bonds",
+        currency="USD",
+        symbol="T 3 08/15/53",
+        datetime_text="2024-06-10, 15:00:00",
+        quantity_text="100",
+        price_text="95.50",
+        fees_text="0",
+        code="",
+    )
+    with pytest.raises(MappingError, match="no resolvable ISIN"):
+        map_rows(_make([row]))
+
+
+def test_bond_yield_suffixed_resolves_via_canonicalisation() -> None:
+    """A trade-row symbol with a yield suffix resolves to the canonical info row.
+
+    The instrument-info section keys the gilt by the canonical
+    `UKT 0 1/4 01/31/25` (or the FH45 form); the trade row uses
+    `UKT 0 1/4 01/31/25 5.27%`. The mapper must canonicalise the
+    trade-row symbol and find the same bond, populating the ISIN
+    and replacing the display symbol with the canonical form.
+    """
+    row = RawTradeRow(
+        asset_class="Bonds",
+        currency="GBP",
+        symbol="UKT 0 1/4 01/31/25 5.26994388%",
+        datetime_text="2024-06-10, 15:00:00",
+        quantity_text="25000",
+        price_text="98.500",
+        fees_text="0",
+        code="",
+    )
+    # IB's Financial Instrument Information section's Description column
+    # carries the issuer prefix `"United Kingdom Gilt …"` — that is the
+    # signal `_classify_bond_exempt` keys on for the gilt-exempt flag.
+    info = _bond_info(
+        symbol="UKT 0 1/4 01/31/25",
+        description="United Kingdom Gilt UKT 0 1/4 01/31/25",
+        security_id="GB00BLPK7110",
+        maturity="2025-01-31",
+    )
+    trade = map_rows(_make([row], [info]))[0]
+    assert isinstance(trade.instrument, BondInstrument)
+    assert trade.instrument.isin == "GB00BLPK7110"
+    # Canonical display: `UKT <coupon> <maturity>`, derived from the
+    # instrument-info Symbol column with any suffix stripped. The
+    # description's `"United Kingdom Gilt "` prefix is used for the
+    # exempt classifier but does NOT bleed into the stored symbol.
+    assert trade.instrument.symbol == "UKT 0 1/4 01/31/25"
+    assert trade.instrument.is_cgt_exempt is True
+
+
+@pytest.mark.parametrize(
+    ("ib_price", "expected_per_unit"),
+    [
+        # IB-quoted "% of par" → cash-per-unit. price * quantity then
+        # equals settlement cash with no further scaling.
+        ("98.602", Decimal("0.98602")),
+        ("100", Decimal("1")),
+        ("100.0", Decimal("1.0")),
+        ("105.25", Decimal("1.0525")),
+        ("72.125", Decimal("0.72125")),
+    ],
+)
+def test_bond_price_rescaled_to_cash_per_unit(ib_price: str, expected_per_unit: Decimal) -> None:
+    """Bond `T. Price` is divided by 100 so price * qty equals cash."""
+    row = RawTradeRow(
+        asset_class="Bonds",
+        currency="GBP",
+        symbol="UKT 0 1/8 01/30/26",
+        datetime_text="2024-06-10, 15:00:00",
+        quantity_text="250000",
+        price_text=ib_price,
+        fees_text="0",
+        code="",
+    )
+    info = _bond_info(
+        symbol="UKT 0 1/8 01/30/26",
+        description="UKT 0 1/8 01/30/26",
+        security_id="GB00BL68HJ26",
+    )
+    trade = map_rows(_make([row], [info]))[0]
+    assert trade.price.amount == expected_per_unit
+    # Cross-check: cash-per-unit times face-value quantity should be
+    # the actual GBP outlay — i.e. ib_price/100 * 250000.
+    assert trade.price.amount * trade.quantity == Decimal(ib_price) * Decimal("2500")
+
+
+def test_stock_price_not_rescaled() -> None:
+    """Only bond prices are rescaled — stocks (and other classes) are unchanged."""
+    parsed = _make([_stock_row()])
+    trade = map_rows(parsed)[0]
+    # `_stock_row` carries `price_text="204.82"`; /100 would give 2.0482.
+    assert trade.price.amount == Decimal("204.82")
 
 
 # ---------------------------------------------------------------------------

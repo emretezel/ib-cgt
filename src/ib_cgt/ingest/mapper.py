@@ -7,12 +7,19 @@ domain shapes the rest of the library consumes.
 Asset-class handling, one function per class:
 
 * **Stocks**   — `StockInstrument`; `BUY` if signed qty > 0 else `SELL`.
-* **Bonds**    — `BondInstrument(is_cgt_exempt=False)` (the exempt flag
-                 is a per-instrument override handled by a future
-                 `BondOverrideConfig`). Accrued interest is not present
-                 in the 12-column statement layout, so v1 leaves
-                 `accrued_interest=None`; the BondRuleEngine plan will
-                 introduce the richer layout when we need it.
+* **Bonds**    — `BondInstrument`; `BUY` if signed qty > 0 else `SELL`.
+                 The `is_cgt_exempt` flag is inferred at ingest time by
+                 `_classify_bond_exempt`: the description from the
+                 statement's Financial Instrument Information section
+                 (`"United Kingdom Gilt …"`) is the primary signal,
+                 with a `UKT `-prefix-on-GBP fallback for rows that
+                 lack instrument-info metadata, plus a user-supplied
+                 allowlist (env var `IB_CGT_BONDS_EXEMPT`) for QCBs
+                 and any non-gilt edge cases. Accrued interest is not
+                 yet extracted by the parser, so v1 leaves
+                 `accrued_interest=None`; the `BondRuleEngine` reads
+                 it when present and is forward-compatible with a
+                 future parser change that wires the column through.
 * **Futures**  — `FutureInstrument` with `contract_multiplier` and
                  `expiry_date` looked up from the statement's Financial
                  Instrument Information section (`RawInstrumentInfo`).
@@ -43,11 +50,13 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Final
 from zoneinfo import ZoneInfo
 
+from ib_cgt.config import resolve_exempt_bonds_allowlist
 from ib_cgt.domain import (
     AnyInstrument,
     BondInstrument,
@@ -87,6 +96,28 @@ _STOCK_LABELS: Final[frozenset[str]] = frozenset({"Stocks"})
 _BOND_LABELS: Final[frozenset[str]] = frozenset({"Bonds", "Corporate and Municipal Bonds"})
 _FUTURE_LABELS: Final[frozenset[str]] = frozenset({"Futures"})
 _FX_LABELS: Final[frozenset[str]] = frozenset({"Forex"})
+
+# UK gilt classifier signals. The IB Financial Instrument Information
+# section's `Description` column reads `"United Kingdom Gilt UKT …"`
+# for every UK gilt observed in the user's corpus — the prefix is
+# the load-bearing signal. The bare-symbol fallback (`UKT `)
+# is used when the instrument-info row is missing (older statement
+# vintages) and only fires for GBP-denominated rows because
+# foreign-currency UKT-prefixed paper is implausible.
+_UK_GILT_DESCRIPTION_PREFIX: Final = "united kingdom gilt"
+_UK_GILT_SYMBOL_PREFIX: Final = "UKT "
+
+# Matches an `MM/DD/YY` token. Bordered by `\b` so `2 3/4 09/07/24` (a
+# coupon fraction followed by a date) finds two date-shaped substrings;
+# `_canonicalise_gilt_symbol` keeps only the LAST one as the maturity.
+_GILT_DATE_RE: Final = re.compile(r"\b\d{2}/\d{2}/\d{2}\b")
+
+# IB quotes bond `T. Price` as a percentage of par (e.g. `98.602` means
+# 98.602% of face value), with `Quantity` carrying the face-value
+# nominal. The downstream invariant — shared with stocks, futures, FX —
+# is that `Trade.price.amount * Trade.quantity` equals settlement cash,
+# so divide the IB-quoted price by 100 once at the ingest boundary.
+_BOND_PRICE_PAR_DIVISOR: Final = Decimal(100)
 
 # UK taxpayer default — confirmed with the user during planning. Kept at
 # module level so tests can `import` it without reaching into a function.
@@ -194,7 +225,7 @@ def _map_one(
         instrument, action = _build_stock(raw, signed_qty)
         events = [(action, abs(signed_qty))]
     elif raw.asset_class in _BOND_LABELS:
-        instrument, action = _build_bond(raw, signed_qty)
+        instrument, action = _build_bond(raw, signed_qty, info_by_symbol)
         events = [(action, abs(signed_qty))]
     elif raw.asset_class in _FUTURE_LABELS:
         instrument = _build_future_instrument(raw, info_by_symbol)
@@ -206,6 +237,12 @@ def _map_one(
         events = [(action, abs(signed_qty))]
     else:
         raise MappingError(f"Unsupported asset class section: {raw.asset_class!r} ({raw=})")
+
+    # Bonds are the only asset class IB quotes as a percentage of par;
+    # rescale here so the post-mapper invariant `price * qty == cash`
+    # matches the convention every other asset class already follows.
+    if isinstance(instrument, BondInstrument):
+        price = price / _BOND_PRICE_PAR_DIVISOR
 
     trade_date = Trade.uk_date_of(trade_datetime)
 
@@ -268,17 +305,190 @@ def _build_stock(raw: RawTradeRow, signed_qty: Decimal) -> tuple[StockInstrument
     return instrument, action
 
 
-def _build_bond(raw: RawTradeRow, signed_qty: Decimal) -> tuple[BondInstrument, TradeAction]:
+def _build_bond(
+    raw: RawTradeRow,
+    signed_qty: Decimal,
+    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+) -> tuple[BondInstrument, TradeAction]:
     """Map a Bonds row to (BondInstrument, BUY|SELL).
 
-    v1 always marks the instrument as non-exempt; a future
-    `BondOverrideConfig` mechanism (tracked in `docs/architecture.md`
-    §Implementation order item 7) will let users mark specific gilts /
-    QCBs as exempt without re-ingesting statements.
+    Bond identity is the ISIN (post-migration 014). The trade-row
+    symbol may be yield-suffixed (`UKT 0 1/4 01/31/25 5.27%`); we
+    resolve the matching Financial Instrument Information row by
+    walking exact-symbol → canonicalised-symbol → description-keyed
+    fallbacks (see `resolve_bond_info`), then take the canonical
+    Description as the display symbol and the `Security ID` cell
+    as the natural-key ISIN. The `is_cgt_exempt` flag is computed
+    by `_classify_bond_exempt` using the recovered description as
+    the primary signal.
+
+    Loud-fail: a bond row with no resolvable ISIN raises
+    `MappingError`. Re-classification of pre-014 statements that
+    lack the bonds-shaped instrument-info table requires either
+    upgrading the source statement or extending
+    `IB_CGT_BONDS_EXEMPT` and the parser.
     """
     action = TradeAction.BUY if signed_qty > 0 else TradeAction.SELL
-    instrument = BondInstrument(symbol=raw.symbol, currency=raw.currency, is_cgt_exempt=False)
+    info = resolve_bond_info(raw.symbol, info_by_symbol)
+    if info is None or not info.security_id:
+        raise MappingError(
+            f"Bond row for symbol {raw.symbol!r} has no resolvable ISIN. "
+            "v1 requires every bond to carry a Security ID from the "
+            "Financial Instrument Information section. Older statement "
+            "vintages may need to be re-fetched from IB with the "
+            "bonds-shaped instrument-info table enabled."
+        )
+    # Display form: canonicalise the instrument-info Symbol column.
+    # For gilts this strips the trailing yield / IB-code token so the
+    # stored symbol is `UKT <coupon> <maturity>` exactly as the user
+    # specified. For non-gilts the canonicaliser no-ops, so we keep
+    # the IB-rendered symbol verbatim.
+    canonical_symbol = _canonicalise_gilt_symbol(info.symbol)
+    # Gilt classifier signal: in the bonds-shaped instrument-info
+    # table the "United Kingdom Gilt …" string lives in the Issuer
+    # column; the Description column carries just the canonical
+    # symbol form. Prefer Issuer when present so the classifier sees
+    # the full issuer name. The Description fallback covers older
+    # statement vintages whose schema lacks the Issuer column.
+    classifier_text = info.issuer_text or info.description
+    is_exempt = _classify_bond_exempt(
+        symbol=raw.symbol,
+        description=classifier_text,
+        currency=raw.currency,
+        overrides=resolve_exempt_bonds_allowlist(),
+    )
+    instrument = BondInstrument(
+        isin=info.security_id,
+        symbol=canonical_symbol,
+        currency=raw.currency,
+        is_cgt_exempt=is_exempt,
+    )
     return instrument, action
+
+
+def resolve_bond_info(
+    symbol: str,
+    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+) -> RawInstrumentInfo | None:
+    """Look up the Financial Instrument Information row for a bond.
+
+    The trade-row symbol may not match the instrument-info row's
+    `Symbol` column verbatim — IB renders the same gilt as
+    `UKT 2 3/4 09/07/24 4.56970771%` (yield-suffixed) in the trades
+    section but `UKT 2 3/4 09/07/24 FH45` (or just
+    `UKT 2 3/4 09/07/24`) in the instrument-info section. Walk three
+    lookup strategies in priority order:
+
+    1. **Exact** match on the trade-row symbol — covers older
+       statements where both sections agree.
+    2. **Canonicalised** match — strip the gilt yield-suffix from
+       the trade-row symbol and look up the canonical form. The
+       instrument-info section's keys may already be canonical, or
+       canonicalising them too gives us a hit.
+    3. **Description** match — the instrument-info Description column
+       always carries the canonical IB form
+       (`UKT 2 3/4 09/07/24`), so a canonicalised trade-row symbol
+       that matches a description is the same instrument.
+
+    Public (no leading underscore) so the corporate-actions and
+    bond-coupons mappers can share it.
+    """
+    direct = info_by_symbol.get(("Bonds", symbol))
+    if direct is not None:
+        return direct
+
+    canonical = _canonicalise_gilt_symbol(symbol)
+    if canonical != symbol:
+        canonical_hit = info_by_symbol.get(("Bonds", canonical))
+        if canonical_hit is not None:
+            return canonical_hit
+
+    # Description-keyed fallback: scan the bond rows for one whose
+    # canonicalised Symbol or Description matches the canonical
+    # trade-row symbol. The dict is small (≤ a few dozen rows in
+    # practice), so the linear scan is fine.
+    for (asset_class, _info_symbol), info in info_by_symbol.items():
+        if asset_class != "Bonds":
+            continue
+        if _canonicalise_gilt_symbol(info.symbol) == canonical:
+            return info
+        if info.description and info.description == canonical:
+            return info
+    return None
+
+
+def _canonicalise_gilt_symbol(symbol: str) -> str:
+    """Strip trailing yield / IB-code tokens from a UK gilt symbol.
+
+    The canonical form for a UK gilt is `UKT <coupon> <maturity>`,
+    where `<maturity>` is an `MM/DD/YY` token. IB sometimes appends a
+    yield-percent (`4.56970771%`) or an internal position code
+    (`FH45`) after the maturity; for natural-key purposes those
+    suffixes are noise and must be removed so that all lots of the
+    same gilt collapse to one bond instrument keyed by ISIN.
+
+    Non-gilt symbols (no `UKT ` prefix) and gilt symbols that are
+    already canonical (no trailing token after the date) are returned
+    unchanged. Defensive: a symbol with no recognisable maturity-date
+    token is also returned unchanged — better to preserve the input
+    than truncate at an arbitrary boundary.
+    """
+    if not symbol.startswith(_UK_GILT_SYMBOL_PREFIX):
+        return symbol
+    matches = list(_GILT_DATE_RE.finditer(symbol))
+    if not matches:
+        return symbol
+    last = matches[-1]
+    return symbol[: last.end()].rstrip()
+
+
+def _classify_bond_exempt(
+    *,
+    symbol: str,
+    description: str | None,
+    currency: str,
+    overrides: frozenset[str],
+) -> bool:
+    """Decide whether a bond should be treated as CGT-exempt at ingest.
+
+    The classifier returns True when any of the following signals fire:
+
+    1. **Description match** (primary): the IB Financial Instrument
+       Information description starts with `"United Kingdom Gilt"`
+       (case-insensitive). This is the authoritative signal — IB
+       prints the issuer name verbatim.
+    2. **Symbol-prefix fallback**: the description is missing AND the
+       symbol starts with `"UKT "` AND the currency is `"GBP"`.
+       Older statement vintages can omit the instrument-info row;
+       the symbol prefix is the next-best evidence and the GBP gate
+       prevents a false positive on a foreign-currency listing
+       that happens to share the prefix.
+    3. **User allowlist**: the symbol appears in `overrides` (loaded
+       from `IB_CGT_BONDS_EXEMPT`). Covers QCBs and any exempt bond
+       the heuristics miss.
+
+    Args:
+        symbol: The IB symbol exactly as it appears on the trade row.
+        description: The bond's Description from the instrument-info
+            section, or None when no row is present.
+        currency: The trade's native currency (ISO-4217).
+        overrides: Set of symbols the user has explicitly tagged as
+            exempt. Compared verbatim against `symbol`.
+
+    Returns:
+        True iff the bond should be flagged `is_cgt_exempt=True`.
+    """
+    if symbol in overrides:
+        return True
+    if description is not None:
+        # Strip leading whitespace and lowercase before the prefix
+        # check so we don't trip on stray non-breaking spaces or
+        # case drift between statement vintages. A non-matching
+        # description short-circuits the symbol fallback so a
+        # mis-symbolled corporate bond cannot be promoted by prefix
+        # alone.
+        return description.lstrip().lower().startswith(_UK_GILT_DESCRIPTION_PREFIX)
+    return currency == "GBP" and symbol.startswith(_UK_GILT_SYMBOL_PREFIX)
 
 
 def _build_future_instrument(

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head><title>U9999998 Activity Statement April 6, 2024 - April 5, 2025</title></head>
+<body>
+
+<!-- Account Information -->
+<div id="tblAccountInfo_U9999998Body">
+<table>
+  <tr><td>Account</td><td>U9999998</td></tr>
+</table>
+</div>
+
+<!-- Trades section: one Bonds buy of a UK gilt. The maturity disposal
+     is in the Corporate Actions section below. The buy gives the
+     mapper a chance to register the bond instrument so the test can
+     assert on its post-maturity row count. -->
+<div id="tblTransactions_U9999998Body">
+<table id="summaryDetailTable">
+<thead>
+<tr>
+<th align="left">Symbol</th>
+<th align="left">Date/Time</th>
+<th align="right">Quantity</th>
+<th align="right">T. Price</th>
+<th align="right">C. Price</th>
+<th align="right">Proceeds</th>
+<th align="right">Comm/Fee</th>
+<th align="right">Basis</th>
+<th align="right">Realized P/L</th>
+<th align="right">Realized P/L %</th>
+<th align="right">MTM P/L</th>
+<th align="right">Code</th>
+</tr>
+</thead>
+<tbody><tr><td class="header-asset" colspan="12">Bonds</td></tr></tbody>
+<tbody><tr><td class="header-currency" colspan="12">GBP</td></tr></tbody>
+<tbody>
+<tr>
+<td>UKT 0 1/4 01/31/25</td>
+<td>2024-05-15, 10:00:00</td>
+<td align="right">215000</td>
+<td align="right">98.500</td>
+<td align="right">98.6000</td>
+<td align="right">-211,775.00</td>
+<td align="right">0</td>
+<td align="right">211,775.00</td>
+<td align="right">0.00</td>
+<td align="right">0.00</td>
+<td align="right">0.00</td>
+<td align="right">O</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<!-- Financial Instrument Information — carries the "United Kingdom Gilt"
+     description that the gilt classifier keys on, plus the
+     `Security ID` column carrying the ISIN that the post-014
+     mapper uses as the bond's natural key. The bonds-shaped table
+     is the second variant of `tblContractInfo*Body` IB emits;
+     the parser auto-detects which schema each table follows by
+     looking at its <thead>. -->
+<div id="tblContractInfoU9999998Body">
+<table>
+<thead>
+<tr>
+<th align="left">Symbol</th>
+<th align="left">Description</th>
+<th align="left">Conid</th>
+<th align="left">Security ID</th>
+<th align="left">Underlying</th>
+<th align="left">Listing Exch</th>
+<th align="left">Multiplier</th>
+<th align="left">Type</th>
+<th align="left">Issuer</th>
+<th align="left">Maturity</th>
+<th align="left">Code</th>
+</tr>
+</thead>
+<tr><td class="header-asset" colspan="11">Bonds</td></tr>
+<tr>
+<td>UKT 0 1/4 01/31/25</td>     <!-- Symbol -->
+<td>UKT 0 1/4 01/31/25</td>     <!-- Description (canonical form) -->
+<td>499581086</td>              <!-- Conid -->
+<td>GB00BLPK7110</td>           <!-- Security ID = ISIN -->
+<td>UKT</td>                     <!-- Underlying -->
+<td>&nbsp;</td>                 <!-- Listing Exch -->
+<td>1</td>                       <!-- Multiplier -->
+<td>Govt</td>                   <!-- Type -->
+<td>United Kingdom Gilt UKT 0 1/4 01/31/25</td>  <!-- Issuer -->
+<td>2025-01-31</td>             <!-- Maturity -->
+<td>&nbsp;</td>                 <!-- Code -->
+</tr>
+</table>
+</div>
+
+<!-- Corporate Actions: a Bond Maturity row redeeming the gilt at par.
+     IB renders these as a single row in the bond's own currency;
+     `quantity` is negative (disposed) and `proceeds` carries the cash
+     redemption (face value × par). -->
+<div id="tblCorporateActions_U9999998Body">
+<table>
+<thead>
+<tr>
+<th align="left">Report Date</th>
+<th align="left">Date/Time</th>
+<th align="left">Description</th>
+<th align="right">Quantity</th>
+<th align="right">Proceeds</th>
+<th align="right">Value</th>
+<th align="right">Realized P/L</th>
+<th align="right">Code</th>
+</tr>
+</thead>
+<tr><td class="header-asset" align="left" valign="middle" colspan="8">Bonds</td></tr>
+<tr><td class="header-currency" align="left" valign="middle" colspan="8">GBP</td></tr>
+<tr>
+<td>2025-01-31</td>
+<td>2025-01-30, 20:25:00</td>
+<td>(GB00BLPK7110)  Bond Maturity FOR GBP 1.00 PER BOND (UKT 0 1/4 01/31/25, UKT 0 1/4 01/31/25, GB00BLPK7110)</td>
+<td align="right">-215,000</td>
+<td align="right">215,000.00</td>
+<td align="right">0.00</td>
+<td align="right">2,943.35</td>
+<td align="right">&nbsp;</td>
+</tr>
+</table>
+</div>
+
+</body>
+</html>

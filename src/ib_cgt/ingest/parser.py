@@ -100,7 +100,21 @@ class RawTradeRow:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RawInstrumentInfo:
-    """One row of the Financial Instrument Information section."""
+    """One row of the Financial Instrument Information section.
+
+    Two table shapes are observed in IB's HTML:
+
+    * **Futures-style** — `Symbol | Description | Conid | Underlying |
+      Listing Exch | Multiplier | Expiry | Delivery Month | Code`.
+      Populates `multiplier_text` and `expiry_text`.
+    * **Bonds-style** — `Symbol | Description | Conid | Security ID
+      | Underlying | Listing Exch | Multiplier | Type | Issuer |
+      Maturity | Code`. Populates `security_id` (the bond's ISIN)
+      and `maturity_text`.
+
+    The two new fields default to `None` so the bonds path is opt-
+    in: a stocks-only or futures-only statement parses unchanged.
+    """
 
     asset_class: str
     symbol: str
@@ -108,6 +122,9 @@ class RawInstrumentInfo:
     multiplier_text: str | None
     expiry_text: str | None
     listing_exch: str | None
+    security_id: str | None = None
+    maturity_text: str | None = None
+    issuer_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -197,6 +214,37 @@ class RawDividendRow:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawInterestRow:
+    """One row of the Interest section (`tblCombInt_<acct>Body`).
+
+    The same `Date | Description | Amount` shape as a dividend row,
+    plus the per-currency `header-currency` toggle. The Interest
+    section is heterogeneous: broker debit/credit interest, debit
+    interest accruals, and **bond coupon payments** all live here,
+    distinguished only by description prefix. The parser is
+    description-blind — it emits every row verbatim and lets
+    `ingest/bond_coupons.py` filter to the
+    `"Bond Coupon Payment (…)"` rows that matter for CGT / FX-pool
+    matching.
+
+    Attributes:
+        currency: The sub-section currency header for this row
+            (e.g. ``"GBP"``, ``"USD"``).
+        date_text: Raw date string `"YYYY-MM-DD"` exactly as printed.
+        description: Free-text — the gate the mapper uses to filter
+            bond-coupon rows out from broker-interest rows.
+        amount_text: The cash amount as printed (`"162.50"`, `"-2.49"`).
+            Bond coupons are positive; broker debit interest is
+            negative; coupon mappers take the absolute value.
+    """
+
+    currency: str
+    date_text: str
+    description: str
+    amount_text: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ParsedStatement:
     """The parsed statement: account + trade rows + instrument metadata."""
 
@@ -205,6 +253,10 @@ class ParsedStatement:
     instruments: tuple[RawInstrumentInfo, ...]
     corporate_actions: tuple[RawCorporateActionRow, ...]
     dividends: tuple[RawDividendRow, ...]
+    # Defaulted so older test fixtures that hand-construct
+    # `ParsedStatement` without the Interest section still type-check
+    # without ceremony. Real parser output always populates this.
+    interest: tuple[RawInterestRow, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +282,14 @@ _INSTRUMENT_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Multiplier": "multiplier",
     "Expiry": "expiry",
     "Listing Exch": "listing_exch",
+    # Bonds-shaped table only; ignored by futures-shaped tables.
+    # `Security ID` carries the bond's ISIN (`GB00BHBFH458`),
+    # `Maturity` the redemption date (`YYYY-MM-DD`), and `Issuer`
+    # the verbose human-readable name (`United Kingdom Gilt UKT
+    # 2 3/4 09/07/24`) — the gilt classifier keys on the latter.
+    "Security ID": "security_id",
+    "Maturity": "maturity",
+    "Issuer": "issuer",
 }
 
 # Corporate Actions column headers we keep. Value, Realized P/L and Code
@@ -249,6 +309,16 @@ _CORPORATE_ACTION_COLUMN_ALIASES: Final[dict[str, str]] = {
 # lets us absorb future column drift the same way the trades parser
 # does.
 _DIVIDEND_COLUMN_ALIASES: Final[dict[str, str]] = {
+    "Date": "date",
+    "Description": "description",
+    "Amount": "amount",
+}
+
+# Interest section column headers — IB uses the same three columns as
+# dividends (`Date | Description | Amount`). Kept as a separate alias
+# table so a future column drift in one section doesn't ripple to the
+# other; the resolver `_resolve_interest_columns` keys on this dict.
+_INTEREST_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Date": "date",
     "Description": "description",
     "Amount": "amount",
@@ -312,6 +382,7 @@ def parse_statement(source_bytes: bytes) -> ParsedStatement:
     instruments = tuple(_parse_instruments_section(soup))
     corporate_actions = tuple(_parse_corporate_actions_section(soup))
     dividends = tuple(_parse_dividends_section(soup))
+    interest = tuple(_parse_interest_section(soup))
 
     return ParsedStatement(
         account_id=account_id,
@@ -319,6 +390,7 @@ def parse_statement(source_bytes: bytes) -> ParsedStatement:
         instruments=instruments,
         corporate_actions=corporate_actions,
         dividends=dividends,
+        interest=interest,
     )
 
 
@@ -581,6 +653,9 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
         multiplier_text = _optional_cell(cells, column_map, "multiplier")
         expiry_text = _optional_cell(cells, column_map, "expiry")
         listing_exch = _optional_cell(cells, column_map, "listing_exch")
+        security_id = _optional_cell(cells, column_map, "security_id")
+        maturity_text = _optional_cell(cells, column_map, "maturity")
+        issuer_text = _optional_cell(cells, column_map, "issuer")
 
         rows.append(
             RawInstrumentInfo(
@@ -590,6 +665,9 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
                 multiplier_text=multiplier_text,
                 expiry_text=expiry_text,
                 listing_exch=listing_exch,
+                security_id=security_id,
+                maturity_text=maturity_text,
+                issuer_text=issuer_text,
             )
         )
 
@@ -892,6 +970,124 @@ def _resolve_dividend_columns(table: Tag) -> dict[str, int] | None:
 
 
 # ---------------------------------------------------------------------------
+# Interest section (broker debit/credit interest + bond coupon payments)
+# ---------------------------------------------------------------------------
+
+
+def _parse_interest_section(soup: BeautifulSoup) -> list[RawInterestRow]:
+    """Yield every Interest-section row across all `tblCombInt_*` divs.
+
+    Mirrors `_parse_dividends_section` — same `Date | Description |
+    Amount` columns, same `header-currency` toggle, same
+    `subtotal` / `total` skip semantics. The parser is description-
+    blind; the mapper layer
+    (`ingest/bond_coupons.py`) is what filters out broker-interest
+    rows and keeps only `"Bond Coupon Payment (…)"` rows.
+    """
+    rows: list[RawInterestRow] = []
+    for table in _find_interest_tables(soup):
+        rows.extend(_parse_one_interest_table(table))
+    return rows
+
+
+def _parse_one_interest_table(table: Tag) -> list[RawInterestRow]:
+    """Parse a single Interest-section `<table>`."""
+    column_map = _resolve_interest_columns(table)
+    if column_map is None:
+        return []
+
+    rows: list[RawInterestRow] = []
+    current_currency = ""
+
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+
+        if _row_has_cell_class(tr, "header-currency"):
+            current_currency = _row_first_cell_text(tr)
+            continue
+        # `subtotal` (per-currency aggregate) and `total`
+        # (cross-currency `Total in GBP`) rows are display-only.
+        row_classes = tr.get("class") or []
+        if "subtotal" in row_classes or "total" in row_classes:
+            continue
+        if tr.find("th") is not None:
+            continue
+
+        cells = tr.find_all("td")
+        if not cells or not current_currency:
+            # Orphan row outside a currency section — defensive skip.
+            continue
+
+        try:
+            date_text = cells[column_map["date"]].get_text(strip=True)
+            description = cells[column_map["description"]].get_text(strip=True)
+            amount_text = cells[column_map["amount"]].get_text(strip=True)
+        except IndexError:
+            continue
+
+        # Blank date cell signals an aggregate row IB occasionally
+        # emits without a `subtotal` / `total` class.
+        if not date_text or date_text == "\xa0":
+            continue
+
+        rows.append(
+            RawInterestRow(
+                currency=current_currency,
+                date_text=date_text,
+                description=description,
+                amount_text=amount_text,
+            )
+        )
+
+    return rows
+
+
+def _find_interest_tables(soup: BeautifulSoup) -> list[Tag]:
+    """Return every `<table>` inside an Interest-section div.
+
+    The enclosing `<div>` ids look like `tblCombInt_U…Body`. Walks
+    all tables inside each match — same shape as the dividends
+    finder.
+    """
+    tables: list[Tag] = []
+    for div in soup.find_all("div", id=True):
+        if not isinstance(div, Tag):
+            continue
+        div_id = str(div.get("id", ""))
+        if div_id.startswith("tblCombInt_") and div_id.endswith("Body"):
+            for table in div.find_all("table"):
+                if isinstance(table, Tag):
+                    tables.append(table)
+    return tables
+
+
+def _resolve_interest_columns(table: Tag) -> dict[str, int] | None:
+    """Map Interest-section header labels to indices.
+
+    Required: `date`, `description`, `amount`. Returns `None` when
+    any required column is missing — that table is then skipped,
+    matching the dividends resolver's discipline.
+    """
+    required = set(_INTEREST_COLUMN_ALIASES.values())
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+        headers = tr.find_all("th")
+        if not headers:
+            continue
+        candidate: dict[str, int] = {}
+        for idx, th in enumerate(headers):
+            label = th.get_text(strip=True)
+            logical = _INTEREST_COLUMN_ALIASES.get(label)
+            if logical is not None:
+                candidate[logical] = idx
+        if required.issubset(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
 
@@ -950,6 +1146,7 @@ __all__ = [
     "RawCorporateActionRow",
     "RawDividendRow",
     "RawInstrumentInfo",
+    "RawInterestRow",
     "RawTradeRow",
     "StatementParseError",
     "parse_statement",

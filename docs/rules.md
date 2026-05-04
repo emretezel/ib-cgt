@@ -416,18 +416,19 @@ result = engine.compute(
     future_trades=non_gbp_future_trades,
     future_realisations=realisations,  # from FutureRuleEngine
     dividends=non_gbp_dividends,       # from DividendRepo.for_currency
+    bond_coupons=non_gbp_bond_coupons, # from BondCouponRepo.for_currency
 )
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects events from **five sources** into GBP-denominated
+projects events from **six sources** into GBP-denominated
 `Acquisition` and `Disposal` records via the FX service, then
 delegates the match. Unlike the stock engine its API is
 **per-currency** rather than per-instrument, because UK CGT pools FX
 per single non-GBP currency vs GBP — and a single `EUR.USD` trade
 therefore touches *two* pools (one EUR, one USD).
 
-The five cashflow sources implement HMRC CG78315 — "foreign currency
+The six cashflow sources implement HMRC CG78315 — "foreign currency
 arising from any source" — so the per-currency pool reflects every
 foreign-cash movement IB reports:
 
@@ -451,6 +452,15 @@ foreign-cash movement IB reports:
    in the contract's native currency at close_date. Winning trades
    emit acquisitions; losing trades emit disposals. The orchestrator
    runs `FutureRuleEngine` first to produce the realisation list.
+6. **Non-GBP bond coupons** — coupon payments on foreign-currency
+   bond holdings credit the pool on `pay_date`. Always
+   acquisitions (coupons are credits — there is no withholding-tax
+   variant on bond interest in the corpora seen so far). Stored as
+   their own table `bond_coupons`, separate from `dividends`
+   because IB emits them in a different statement section
+   (`tblCombInt_*`) and the income-tax treatment differs (interest
+   savings allowance vs dividend allowance). See
+   [`docs/db/bond_coupons.md`](db/bond_coupons.md).
 
 The cashflow projection helpers live in
 [`src/ib_cgt/rules/fx_cashflow.py`](../src/ib_cgt/rules/fx_cashflow.py).
@@ -583,16 +593,90 @@ indicates bad data.
 residuals surface in `MatchingResult.unmatched_disposals` instead
 (soft-residual mode).
 
+## `BondRuleEngine`
+
+```python
+from ib_cgt.rules import BondRuleEngine, BondResult, ExemptBondResult
+
+engine = BondRuleEngine(fx=fx_service)
+result: BondResult = engine.compute(bond_instrument, trades_for_bond)
+```
+
+Bonds split into two regimes under UK CGT:
+
+* **CGT-exempt** — UK gilts and Qualifying Corporate Bonds. No
+  matching, no S.104 pool, no `MatchedDisposal` rows.
+* **Non-exempt** — corporate / foreign-issuer bonds that don't
+  qualify. Standard four-rule matching (same-day → 30-day → S.104
+  → s.105(2)) with purchase / sale accrued interest folded into
+  cost / proceeds.
+
+The engine branches on `BondInstrument.is_cgt_exempt`, which the
+ingest mapper sets at trade-ingestion time via
+`_classify_bond_exempt` in
+[`src/ib_cgt/ingest/mapper.py`](../src/ib_cgt/ingest/mapper.py):
+
+1. **Description match** (primary): the IB Financial Instrument
+   Information description starts with `"United Kingdom Gilt"`
+   (case-insensitive). Authoritative for UK gilts — IB prints the
+   issuer name verbatim.
+2. **Symbol-prefix fallback**: when no instrument-info description
+   is available, a symbol of `UKT …` on a GBP-denominated bond is
+   classified as a gilt. The GBP gate avoids a false positive on
+   any foreign-currency listing that happens to share the prefix.
+3. **User allowlist**: the env var `IB_CGT_BONDS_EXEMPT="SYM1,SYM2"`
+   marks any additional bonds CGT-exempt — covers QCBs and any
+   exempt bond the heuristics miss.
+
+Run `ib-cgt bonds list` to inspect the inferred classification and
+verify that every gilt / QCB has been correctly flagged before
+running the calculator.
+
+### Result shape
+
+`BondResult` is a sealed union:
+
+| Branch              | Returned for            | Carries                                                           |
+|---------------------|-------------------------|-------------------------------------------------------------------|
+| `ExemptBondResult`  | `is_cgt_exempt=True`    | Aggregate buy / sell counts and native-currency totals for audit. |
+| `MatchingResult`    | `is_cgt_exempt=False`   | The four-rule matched disposals, residuals, and final pool.       |
+
+The exempt branch performs no FX conversion (none is required —
+the bond does not produce any CGT event), so an exempt-bonds-only
+run can be made before the FX cache is populated.
+
+### Per-trade projection (non-exempt branch)
+
+Both legs use the trade-date spot rate; native-currency arithmetic
+folds in accrued interest:
+
+```
+cost_native     = price * quantity + accrued + fees   (BUY)
+proceeds_native = price * quantity + accrued - fees   (SELL)
+```
+
+The accrued-interest field on `Trade` is `Money | None`. When
+present it is the cash side of the accrued portion of the
+last-coupon-to-trade-date interest, in the bond's native currency.
+The mapper does not yet extract this column from IB statements
+(gilts are exempt → no accrued path is exercised today); the
+engine tolerates `None` as zero so the projection is forward-
+compatible with a future ingestion change.
+
+### Errors
+
+| Exception                | When                                                                                          |
+|--------------------------|-----------------------------------------------------------------------------------------------|
+| `WrongAssetClassError`   | The instrument passed to `compute` is not a `BondInstrument`.                                 |
+| `InconsistentTradeError` | A bond trade carries an action other than `BUY` / `SELL`.                                     |
+| `ValueError`             | A trade in the input list references a different bond than the engine was called with.        |
+| `UnmatchedDisposalError` | Non-exempt branch only. A disposal still has residual quantity after all four matching passes (typically a buy-to-cover never appearing in the input). |
+
 ## What's not implemented yet
 
-`BondRuleEngine` is pending (see
-[`architecture.md`](./architecture.md#implementation-order), step
-9). It will consume `MatchingEngine` as its internal matching
-primitive, layering on bond-specific quirks (QCB / gilt exemption,
-purchase / sale accrued interest) on the way in. The strategy-pattern
-abstract base class will be revisited then — three concrete engines
-(`StockRuleEngine`, `FXRuleEngine`, `FutureRuleEngine`) start to
-justify the boilerplate, but the per-engine APIs are not yet
-identical (FX is per-currency, the others per-instrument), so the
-shape of any base class is best designed against four real
-implementations rather than three.
+A strategy-pattern abstract base class for the four engines is
+deliberately deferred — the per-engine APIs are not yet identical
+(FX is per-currency, Stock / Bond / Future are per-instrument; Bond
+returns a sealed union, Future returns its own shape). With four
+real implementations now in place, the right abstraction is easier
+to see; we'll revisit when the calculator orchestrator lands.

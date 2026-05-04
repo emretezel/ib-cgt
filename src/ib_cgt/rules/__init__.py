@@ -34,6 +34,7 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+from ib_cgt.rules.bonds import BondResult, BondRuleEngine, ExemptBondResult
 from ib_cgt.rules.errors import (
     InconsistentTradeError,
     RuleEngineError,
@@ -46,6 +47,9 @@ from ib_cgt.rules.matching import MatchingEngine, MatchingResult
 from ib_cgt.rules.stocks import StockRuleEngine
 
 __all__ = [
+    "BondResult",
+    "BondRuleEngine",
+    "ExemptBondResult",
     "FXConverter",
     "FXRuleEngine",
     "FutureResult",

@@ -5,7 +5,7 @@ Per `docs/architecture.md §Scope — FX treatment` and HMRC CG78315
 each non-GBP currency as its own chargeable asset, pooled per single
 currency vs GBP under the same four-rule matching as ordinary shares
 (same-day → 30-day → S.104 → s.105(2)). This engine projects events
-from **five** sources into the GBP `Acquisition` / `Disposal` shapes
+from **six** sources into the GBP `Acquisition` / `Disposal` shapes
 consumed by the shared `MatchingEngine` and runs one matcher per
 non-GBP currency:
 
@@ -18,6 +18,10 @@ non-GBP currency:
    contract's native currency at trade_date.
 5. **Futures realisations** — gross P&L on closed contracts settles
    in the contract's native currency at close_date.
+6. **Bond coupons** — non-GBP coupon payments on bond holdings
+   credit the per-currency balance on `pay_date`. Always inflows
+   (coupons are credits; there is no withholding-tax variant on
+   bond interest in the corpora seen so far).
 
 Pool model — per currency, not per traded pair
 ----------------------------------------------
@@ -59,6 +63,7 @@ from collections.abc import Sequence
 from ib_cgt.domain import (
     Acquisition,
     AssetClass,
+    BondCoupon,
     Disposal,
     Dividend,
     FutureRealisation,
@@ -67,6 +72,7 @@ from ib_cgt.domain import (
 from ib_cgt.domain.money import validate_currency_code
 from ib_cgt.rules.futures import FXConverter
 from ib_cgt.rules.fx_cashflow import (
+    from_bond_coupon,
     from_dividend,
     from_forex_trade,
     from_future_fee,
@@ -112,6 +118,7 @@ class FXRuleEngine:
         future_trades: Sequence[tuple[int, Trade]] = (),
         future_realisations: Sequence[tuple[int, FutureRealisation, str]] = (),
         dividends: Sequence[tuple[int, Dividend]] = (),
+        bond_coupons: Sequence[tuple[int, BondCoupon]] = (),
     ) -> MatchingResult:
         """Match every disposal of `currency` against acquisitions of `currency`.
 
@@ -150,6 +157,14 @@ class FXRuleEngine:
                 collide with real `trades.trade_id` values or with
                 the realisation synth-id range. Pass an empty
                 sequence to skip dividends.
+            bond_coupons: `(synth_id, coupon)` pairs — one per
+                non-GBP bond coupon payment. Always projects to a
+                pool acquisition on `pay_date` (coupons are credits;
+                no withholding-tax variant). Synth-ID range is
+                disjoint from `dividends` and `future_realisations`
+                ranges (orchestrator typically allocates from
+                `itertools.count(3 * 10**12)`). Pass an empty
+                sequence to skip coupons.
 
         Returns:
             A `MatchingResult` describing the four-rule matching for
@@ -210,6 +225,17 @@ class FXRuleEngine:
                 acquisitions.append(div_event)
             else:
                 disposals.append(div_event)
+
+        # Bond coupons — interest payments on bond holdings. Always
+        # an Acquisition (coupons are credits; the Interest section
+        # has no withholding-tax variant for bond coupons). The
+        # bond-coupon mapper has already filtered out broker
+        # interest; everything reaching this loop is a real coupon.
+        for synth_id, coupon in bond_coupons:
+            coupon_event = from_bond_coupon(synth_id, coupon, currency, self._fx, pool_instrument)
+            if coupon_event is None:
+                continue
+            acquisitions.append(coupon_event)
 
         # Futures trade fees — every non-GBP futures leg pays a
         # commission in the contract's native currency, regardless

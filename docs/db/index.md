@@ -24,8 +24,8 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`10`** (`001_initial.sql` through `010_fx_fees_to_gbp.sql` all
-applied — see [`schema_migrations.md`](./schema_migrations.md) for
+`14`** (`001_initial.sql` through `014_bond_instruments_isin_natural_key.sql`
+all applied — see [`schema_migrations.md`](./schema_migrations.md) for
 the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
 documentation so the per-table pages reflect what is actually
@@ -39,12 +39,13 @@ deployed.
 | `accounts` | One row per Interactive Brokers account | [`accounts.md`](./accounts.md) |
 | `instruments` | Thin parent: id, asset-class discriminator, ISIN | [`instruments.md`](./instruments.md) |
 | `stock_instruments` | Asset-class child of `instruments` for equity listings | [`stock_instruments.md`](./stock_instruments.md) |
-| `bond_instruments` | Asset-class child of `instruments` for bonds (with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
+| `bond_instruments` | Asset-class child of `instruments` for bonds (ISIN-keyed, with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
 | `future_instruments` | Asset-class child of `instruments` for futures (multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
 | `statements` | One row per imported IB HTML statement (idempotency) | [`statements.md`](./statements.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
 | `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax) | [`dividends.md`](./dividends.md) |
+| `bond_coupons` | One row per bond coupon payment from IB's Interest section | [`bond_coupons.md`](./bond_coupons.md) |
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
 | `tax_runs` | One row per `compute --year` invocation | [`tax_runs.md`](./tax_runs.md) |
 | `matched_disposals` | Per-chunk audit trail produced by the calculator | [`matched_disposals.md`](./matched_disposals.md) |
@@ -53,9 +54,10 @@ deployed.
 
 ```
 accounts (account_id) ──┐
-                        ├── statements ── trades ──── instruments ── {stock,bond,future,fx}_instruments
-                        │             └─ dividends ────┘  ▲
-tax_runs ── matched_disposals ───────────────────────────┘
+                        ├── statements ── trades ──────── instruments ── {stock,bond,future,fx}_instruments
+                        │             ├─ dividends ──────┘  ▲
+                        │             └─ bond_coupons ──┘   │
+tax_runs ── matched_disposals ───────────────────────────────┘
 
 fx_rates (standalone cache; no FK in or out)
 ```
@@ -76,6 +78,9 @@ Foreign-key chain in detail:
 - `dividends.account_id`               → `accounts.account_id`
 - `dividends.instrument_id`            → `instruments.instrument_id`
 - `dividends.source_statement_hash`    → `statements.statement_hash` `ON DELETE CASCADE`
+- `bond_coupons.account_id`            → `accounts.account_id`
+- `bond_coupons.instrument_id`         → `instruments.instrument_id`
+- `bond_coupons.source_statement_hash` → `statements.statement_hash` `ON DELETE CASCADE`
 - `stock_instruments.instrument_id`    → `instruments.instrument_id` `ON DELETE CASCADE`
 - `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
 - `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`

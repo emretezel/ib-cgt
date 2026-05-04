@@ -62,7 +62,14 @@ def test_returns_only_futures_when_other_classes_present(db: sqlite3.Connection)
     """Stocks, bonds, and FX rows must not appear in the result."""
     repo = InstrumentRepo(db)
     repo.upsert(StockInstrument(symbol="AAPL", currency="USD"))
-    repo.upsert(BondInstrument(symbol="UKT-4.5-2034", currency="GBP", is_cgt_exempt=True))
+    repo.upsert(
+        BondInstrument(
+            isin="GB00BMTH8938",
+            symbol="UKT 4 1/2 06/07/34",
+            currency="GBP",
+            is_cgt_exempt=True,
+        )
+    )
     repo.upsert(
         FXInstrument(
             symbol="EUR.GBP",

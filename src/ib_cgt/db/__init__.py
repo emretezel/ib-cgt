@@ -24,6 +24,7 @@ from __future__ import annotations
 from ib_cgt.db.connection import open_connection, open_memory_connection
 from ib_cgt.db.migrator import apply_migrations
 from ib_cgt.db.repos.accounts import AccountRepo
+from ib_cgt.db.repos.bond_coupons import BondCouponRepo, StoredBondCoupon
 from ib_cgt.db.repos.dividends import DividendRepo, StoredDividend
 from ib_cgt.db.repos.fx_rates import FXRate, FXRateRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
@@ -33,6 +34,7 @@ from ib_cgt.db.repos.trades import StoredTrade, TradeRepo
 
 __all__ = [
     "AccountRepo",
+    "BondCouponRepo",
     "DividendRepo",
     "FXRate",
     "FXRateRepo",
@@ -40,6 +42,7 @@ __all__ = [
     "MatchedDisposalRepo",
     "StatementRepo",
     "StatementRow",
+    "StoredBondCoupon",
     "StoredDividend",
     "StoredTrade",
     "TaxRun",

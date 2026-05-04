@@ -57,10 +57,105 @@ def test_futures_with_different_expiries_are_distinct(db: sqlite3.Connection) ->
 
 
 def test_bond_exempt_flag_round_trips(db: sqlite3.Connection) -> None:
+    """A bond round-trips identity (ISIN), display fields, and the exempt flag."""
     repo = InstrumentRepo(db)
-    gilt = BondInstrument(symbol="UKT-4.5-2034", currency="GBP", is_cgt_exempt=True)
+    gilt = BondInstrument(
+        isin="GB00BMTH8938",
+        symbol="UKT 4 1/2 06/07/34",
+        currency="GBP",
+        is_cgt_exempt=True,
+    )
     iid = repo.upsert(gilt)
     assert repo.get(iid) == gilt
+
+
+def test_bond_without_isin_rejected(db: sqlite3.Connection) -> None:
+    """Migration 014 made ISIN the bond's natural key — upsert must require it."""
+    repo = InstrumentRepo(db)
+    gilt_no_isin = BondInstrument(
+        symbol="UKT 4 1/2 06/07/34",
+        currency="GBP",
+        is_cgt_exempt=True,
+    )
+    with pytest.raises(ValueError, match="no ISIN"):
+        repo.upsert(gilt_no_isin)
+
+
+def test_two_bond_lots_with_same_isin_collapse_to_one_row(db: sqlite3.Connection) -> None:
+    """Different IB symbol forms with the same ISIN are one bond.
+
+    Models the user's case: the trade-side renders a gilt as
+    `UKT 0 1/4 01/31/25 5.27%`, the maturity row uses
+    `UKT 0 1/4 01/31/25`, and both share ISIN `GB00BLPK7110`. The
+    natural-key match on ISIN folds them into one bond_instruments
+    row; the latest symbol (closer to canonical) wins on display.
+    """
+    repo = InstrumentRepo(db)
+    yield_form = BondInstrument(
+        isin="GB00BLPK7110",
+        symbol="UKT 0 1/4 01/31/25 5.26994388%",
+        currency="GBP",
+        is_cgt_exempt=True,
+    )
+    canonical = BondInstrument(
+        isin="GB00BLPK7110",
+        symbol="UKT 0 1/4 01/31/25",
+        currency="GBP",
+        is_cgt_exempt=True,
+    )
+    id1 = repo.upsert(yield_form)
+    id2 = repo.upsert(canonical)
+    assert id1 == id2
+    # Single row in bond_instruments — collapsed by ISIN.
+    assert db.execute("SELECT COUNT(*) FROM bond_instruments").fetchone()[0] == 1
+    # The most recent symbol wins on update.
+    loaded = repo.get(id1)
+    assert isinstance(loaded, BondInstrument)
+    assert loaded.symbol == "UKT 0 1/4 01/31/25"
+
+
+def test_bond_exempt_flag_promotes_only(db: sqlite3.Connection) -> None:
+    """An existing exempt bond cannot be silently demoted by a placeholder False."""
+    repo = InstrumentRepo(db)
+    exempt = BondInstrument(
+        isin="GB00BLPK7110",
+        symbol="UKT 0 1/4 01/31/25",
+        currency="GBP",
+        is_cgt_exempt=True,
+    )
+    placeholder = BondInstrument(
+        isin="GB00BLPK7110",
+        symbol="UKT 0 1/4 01/31/25",
+        currency="GBP",
+        is_cgt_exempt=False,
+    )
+    repo.upsert(exempt)
+    repo.upsert(placeholder)
+    loaded = repo.get(repo.upsert(exempt))
+    assert isinstance(loaded, BondInstrument)
+    assert loaded.is_cgt_exempt is True
+
+
+def test_bond_exempt_flag_promotes_when_classifier_promotes(db: sqlite3.Connection) -> None:
+    """A non-exempt → exempt re-classification IS allowed (promotion direction)."""
+    repo = InstrumentRepo(db)
+    non_exempt = BondInstrument(
+        isin="XS0000000001",
+        symbol="ACME 5 2030",
+        currency="USD",
+        is_cgt_exempt=False,
+    )
+    repo.upsert(non_exempt)
+    exempt = BondInstrument(
+        isin="XS0000000001",
+        symbol="ACME 5 2030",
+        currency="USD",
+        is_cgt_exempt=True,
+    )
+    iid = repo.upsert(exempt)
+    loaded = repo.get(iid)
+    assert isinstance(loaded, BondInstrument)
+    assert loaded.is_cgt_exempt is True
 
 
 def test_fx_pair_round_trips(db: sqlite3.Connection) -> None:
@@ -140,7 +235,12 @@ def test_list_stocks_excludes_other_asset_classes(db: sqlite3.Connection) -> Non
     """A bond/future/fx with the same symbol must not appear in `list_stocks`."""
     repo = InstrumentRepo(db)
     stock = StockInstrument(symbol="ABC", currency="USD")
-    bond = BondInstrument(symbol="ABC", currency="USD")
+    bond = BondInstrument(
+        isin="US0000000001",
+        symbol="ABC",
+        currency="USD",
+        is_cgt_exempt=False,
+    )
     repo.upsert(stock)
     repo.upsert(bond)
 
