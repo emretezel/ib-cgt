@@ -59,4 +59,4 @@ def test_is_frozen_value_object() -> None:
     position = StatementPosition(account_id="U1", instrument=AAPL, quantity=Decimal("1"))
     assert position == StatementPosition(account_id="U1", instrument=AAPL, quantity=Decimal("1"))
     with pytest.raises(FrozenInstanceError):
-        position.quantity = Decimal("2")  # type: ignore[misc]
+        setattr(position, "quantity", Decimal("2"))  # noqa: B010 — the frozen check is the point

@@ -24,7 +24,7 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`17`** (`001_initial.sql` through `017_cash_events.sql`
+`20`** (`001_initial.sql` through `020_tax_run_issues.sql`
 all applied — see [`schema_migrations.md`](./schema_migrations.md) for
 the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
@@ -51,6 +51,9 @@ deployed.
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
 | `tax_runs` | One row per `compute --year` invocation | [`tax_runs.md`](./tax_runs.md) |
 | `matched_disposals` | Per-chunk audit trail produced by the calculator | [`matched_disposals.md`](./matched_disposals.md) |
+| `future_realisations` | Per-run closed-out futures contracts (the s.143(5) side of a run) | [`future_realisations.md`](./future_realisations.md) |
+| `fx_event_sources` | Per-run map from synthetic FX event ids to the dividend / coupon / cash-event / realisation they stood for | [`fx_event_sources.md`](./fx_event_sources.md) |
+| `tax_run_issues` | Per-run errors and warnings recorded by `compute` ("save what worked") | [`tax_run_issues.md`](./tax_run_issues.md) |
 
 ## Entity-relationship overview
 
@@ -61,7 +64,10 @@ accounts (account_id) ──┐
                         │             ├─ bond_coupons ───────┘  │
                         │             ├─ statement_positions ─┘  │
                         │             └─ cash_events              │
-tax_runs ── matched_disposals ───────────────────────────────────┘
+tax_runs ──┬─ matched_disposals ────────────────────────────────┤
+           ├─ future_realisations ──────────────────────────────┤
+           ├─ tax_run_issues ───────────────────────────────────┘
+           └─ fx_event_sources
 
 fx_rates (standalone cache; no FK in or out)
 ```
@@ -95,6 +101,11 @@ Foreign-key chain in detail:
 - `fx_instruments.instrument_id`       → `instruments.instrument_id` `ON DELETE CASCADE`
 - `matched_disposals.run_id`           → `tax_runs.run_id` `ON DELETE CASCADE`
 - `matched_disposals.instrument_id`    → `instruments.instrument_id`
+- `future_realisations.run_id`         → `tax_runs.run_id` `ON DELETE CASCADE`
+- `future_realisations.instrument_id`  → `instruments.instrument_id`
+- `fx_event_sources.run_id`            → `tax_runs.run_id` `ON DELETE CASCADE`
+- `tax_run_issues.run_id`              → `tax_runs.run_id` `ON DELETE CASCADE`
+- `tax_run_issues.instrument_id`       → `instruments.instrument_id`
 
 ## Views
 
@@ -131,6 +142,8 @@ Amounts are magnitudes, with direction carried by an `action` or
 [`cash_events.amount_native`](./cash_events.md) is **signed**, because
 the same kind of movement (a fee, broker interest) goes either way
 and the sign is the only trustworthy direction signal on those rows.
+`future_realisations.gross_pnl_native` / `proceeds_gbp` are signed
+for the same reason: a close-out's net cashflow is a loss or a gain.
 
 ### Dates and datetimes
 

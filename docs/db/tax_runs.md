@@ -4,9 +4,13 @@
 
 One row per completed `ib-cgt compute --year YYYY` invocation,
 capturing the tax year, when the computation ran, and the headline
-net-gain figure in GBP. A re-run for the same tax year **replaces**
-its prior row atomically (delete-then-insert in a single transaction,
-cascading to [`matched_disposals`](./matched_disposals.md)). The
+net-gain figure in GBP — the sum over both
+[`matched_disposals`](./matched_disposals.md) and
+[`future_realisations`](./future_realisations.md) of proceeds minus
+cost. A re-run for the same tax year **replaces** its prior row
+atomically (delete-then-insert in a single transaction, cascading to
+every child table). Migration 018 emptied the table once, before any
+writer existed. The
 single-row-per-year invariant is enforced at the application layer in
 [`TaxRunRepo.replace_for`](../../src/ib_cgt/db/repos/tax_runs.py); the
 database itself permits multiple rows per year so future workflows
@@ -34,10 +38,13 @@ surrogate keeps the FK narrow.
 
 ## Foreign keys
 
-None outbound. Inbound:
-[`matched_disposals.run_id`](./matched_disposals.md) targets this
-table with `ON DELETE CASCADE` so replacing a run automatically
-removes its disposal chunks.
+None outbound. Inbound, all `ON DELETE CASCADE`:
+[`matched_disposals.run_id`](./matched_disposals.md),
+[`future_realisations.run_id`](./future_realisations.md),
+[`fx_event_sources.run_id`](./fx_event_sources.md) and
+[`tax_run_issues.run_id`](./tax_run_issues.md) — replacing a run
+automatically removes its chunks, its futures realisations, its
+synthetic-id map and its issues.
 
 ## Uniqueness constraints
 

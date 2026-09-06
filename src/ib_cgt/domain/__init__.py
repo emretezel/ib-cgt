@@ -47,6 +47,12 @@ from ib_cgt.domain.money import (
 )
 from ib_cgt.domain.positions import InvalidStatementPositionError, StatementPosition
 from ib_cgt.domain.report import AssetClassSummary, TaxYearReport
+from ib_cgt.domain.run_issue import (
+    InvalidRunIssueError,
+    IssueSeverity,
+    RunIssue,
+    RunIssueKind,
+)
 from ib_cgt.domain.tax_year import InvalidTaxYearError, TaxYear
 from ib_cgt.domain.trading import (
     Account,
@@ -90,14 +96,18 @@ __all__ = [
     "InvalidCashEventError",
     "InvalidDividendError",
     "InvalidInstrumentError",
+    "InvalidRunIssueError",
     "InvalidStatementPositionError",
     "InvalidTaxYearError",
     "InvalidTradeError",
+    "IssueSeverity",
     "MatchBasis",
     "MatchRule",
     "MatchedDisposal",
     "Money",
     "OpenPosition",
+    "RunIssue",
+    "RunIssueKind",
     "StatementPosition",
     "StockInstrument",
     "TaxLot",
