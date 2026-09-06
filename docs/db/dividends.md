@@ -4,6 +4,14 @@
 
 One row per non-trade cash distribution parsed from an IB statement —
 cash dividends, payment-in-lieu-of-dividend, and withholding tax.
+Withholding rows come from IB's `tblWithholdingTax_<acct>Body` section
+(the parser originally keyed on a shorter `tblWithholding_` prefix
+IB never emits, so no withholding row was ingested before the fix).
+Only withholding rows that **name a stock** land here; the section's
+instrument-less rows — tax withheld on broker interest and its
+cancellation — are [`cash_events`](./cash_events.md) of kind
+`withholding`, and the two mappers partition the section through
+`has_instrument_prefix`.
 Dividends themselves are **income**, not CGT events; this table
 exists so the FX rule engine can fold the foreign-currency cash leg
 into the per-currency S.104 pool (HMRC CG78315 — "foreign currency
@@ -119,4 +127,5 @@ LIMIT 5;
 ```
 
 (empty on a fresh DB; populated after the first ingest of a
-statement carrying a `tblCombDiv_<acct>Body` section.)
+statement carrying a `tblCombDiv_<acct>Body` or
+`tblWithholdingTax_<acct>Body` section.)

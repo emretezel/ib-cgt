@@ -87,6 +87,8 @@ def _seed_full_trade(conn: sqlite3.Connection, *, currency: str, trade_date: dat
             source_path="/dev/null",
             account_id="U0001",
             trade_count=1,
+            period_start=date(2024, 4, 6),
+            period_end=date(2025, 4, 5),
         )
 
     trade = Trade(

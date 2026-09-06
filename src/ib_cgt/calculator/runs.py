@@ -28,6 +28,7 @@ from ib_cgt.domain import (
     AnyInstrument,
     BondCoupon,
     BondInstrument,
+    CashEvent,
     Dividend,
     FutureInstrument,
     FutureRealisation,
@@ -99,15 +100,18 @@ class FXInputs:
     Synthetic id ranges are disjoint by construction so an id can be
     classified by magnitude alone if ever needed for debugging:
     realisations start at ``10**12``, dividends at ``2 * 10**12``,
-    coupons at ``3 * 10**12``. Allocation order is deterministic for a
-    given database (futures in `list_futures` order then engine emit
-    order; dividends and coupons by currency then pay date), which the
-    persisted-run provenance table relies on.
+    coupons at ``3 * 10**12``, cash events at ``4 * 10**12``.
+    Allocation order is deterministic for a given database (futures in
+    `list_futures` order then engine emit order; dividends, coupons and
+    cash events by currency then date), which the persisted-run
+    provenance table relies on.
 
     Attributes:
         forex_trades: Every forex trade, in chronological order.
         stock_trades: Non-GBP stock trades only (GBP stocks never
             touch a pool).
+        bond_trades: Non-GBP bond trades only, exempt or not — their
+            settlement cash is the cashflow.
         future_trades: Non-GBP futures trades only — their commissions
             are the cashflow.
         future_realisations: `(synthetic_id, realisation, account_id)`
@@ -115,6 +119,8 @@ class FXInputs:
         dividends: `(synthetic_id, dividend)` for every dividend-shaped
             row (cash, payment-in-lieu, withholding tax).
         bond_coupons: `(synthetic_id, coupon)` for every coupon row.
+        cash_events: `(synthetic_id, event)` for every instrument-less
+            cash movement (interest, external transfers, fees).
         sources: Synthetic id → provenance reference.
         currencies: Every non-GBP currency touched by any source,
             sorted — the list of pools a full pass computes.
@@ -122,10 +128,12 @@ class FXInputs:
 
     forex_trades: tuple[tuple[int, Trade], ...]
     stock_trades: tuple[tuple[int, Trade], ...]
+    bond_trades: tuple[tuple[int, Trade], ...]
     future_trades: tuple[tuple[int, Trade], ...]
     future_realisations: tuple[tuple[int, FutureRealisation, str], ...]
     dividends: tuple[tuple[int, Dividend], ...]
     bond_coupons: tuple[tuple[int, BondCoupon], ...]
+    cash_events: tuple[tuple[int, CashEvent], ...]
     sources: Mapping[int, FXEventSource]
     currencies: tuple[str, ...]
 

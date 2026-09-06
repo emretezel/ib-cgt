@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from ib_cgt.db import TradeRepo, apply_migrations, open_connection
-from ib_cgt.domain import Trade
+from ib_cgt.db import StatementPositionRepo, TradeRepo, apply_migrations, open_connection
+from ib_cgt.domain import StatementPosition, Trade
 from ib_cgt.ingest.ingestor import ingest_statement
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
@@ -38,7 +38,15 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 def _counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {
         table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-        for table in ("accounts", "statements", "instruments", "trades", "dividends")
+        for table in (
+            "accounts",
+            "statements",
+            "instruments",
+            "trades",
+            "dividends",
+            "cash_events",
+            "statement_positions",
+        )
     }
 
 
@@ -64,3 +72,30 @@ def test_failed_ingest_leaves_nothing_behind(
     result = ingest_statement(fixture, db)
     assert result.inserted_count == 5
     assert _counts(db)["statements"] == 1
+
+
+def test_failure_in_the_last_step_rolls_back_cash_events_and_positions(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positions are written last; a failure there undoes every earlier insert."""
+    fixture = _FIXTURES / "with_open_positions.htm"
+
+    def boom(
+        self: StatementPositionRepo,
+        positions: Iterable[StatementPosition],
+        *,
+        source_statement_hash: str,
+    ) -> int:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(StatementPositionRepo, "insert_many", boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        ingest_statement(fixture, db)
+
+    assert _counts(db) == dict.fromkeys(_counts(db), 0)
+    assert not db.in_transaction
+
+    monkeypatch.undo()
+    result = ingest_statement(fixture, db)
+    assert result.cash_events_inserted == 8
+    assert result.positions_inserted == 5

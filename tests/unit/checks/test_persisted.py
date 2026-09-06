@@ -50,7 +50,12 @@ def _seed_minimal_trade(conn: sqlite3.Connection) -> int:
     """Insert one stock trade so matched_disposals can FK against it."""
     AccountRepo(conn).upsert(Account(account_id="U1"))
     StatementRepo(conn).record(
-        statement_hash="h", source_path="/tmp/x", account_id="U1", trade_count=0
+        statement_hash="h",
+        source_path="/tmp/x",
+        account_id="U1",
+        trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     instrument = StockInstrument(symbol="ABC", currency="GBP")
     TradeRepo(conn).insert_many(

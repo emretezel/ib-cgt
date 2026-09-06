@@ -130,3 +130,57 @@ def test_baseline_per_check_clean(
     report = run_all(db, fx=fx_service, scope=Scope.DATA)
     r = _check(report.results, check_id)
     assert r.status is Status.OK, f"{check_id} unexpectedly: {r.status} {r.detail}"
+
+
+# ---------------------------------------------------------------------------
+# A14 — cash_events referential integrity and sanity
+# ---------------------------------------------------------------------------
+
+
+def _seed_cash_event(db: sqlite3.Connection) -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from ib_cgt.db import CashEventRepo
+    from ib_cgt.domain import CashEvent, CashEventKind, Money
+
+    CashEventRepo(db).insert_many(
+        [
+            CashEvent(
+                account_id="U1004320",
+                kind=CashEventKind.INTEREST,
+                value_date=date(2025, 4, 3),
+                amount=Money.of(Decimal("12.34"), "USD"),
+                description="USD Credit Interest for Mar-2025",
+            )
+        ],
+        source_statement_hash="hash-a",
+    )
+
+
+def test_A14_clean_with_a_well_formed_cash_event(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    _seed_cash_event(db)
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    assert _check(report.results, "A14").status is Status.OK
+
+
+def test_A14_warns_on_unknown_account(db: sqlite3.Connection, fx_service: FXService) -> None:
+    _seed_cash_event(db)
+    db.execute("PRAGMA foreign_keys = OFF")
+    db.execute("UPDATE cash_events SET account_id = 'ZZZZ'")
+    db.commit()
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    r = _check(report.results, "A14")
+    assert r.status is Status.WARN
+    assert "1 cash_events row(s)" in (r.detail or "")
+
+
+def test_A14_warns_on_zero_amount(db: sqlite3.Connection, fx_service: FXService) -> None:
+    """The domain rejects a zero row; a stored zero can only be a hand-edit."""
+    _seed_cash_event(db)
+    db.execute("UPDATE cash_events SET amount_native = '0'")
+    db.commit()
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    assert _check(report.results, "A14").status is Status.WARN

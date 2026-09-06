@@ -40,6 +40,8 @@ def _seed(db: sqlite3.Connection, *, account_id: str = "U1") -> None:
         source_path="/tmp/stmt.html",
         account_id=account_id,
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
 

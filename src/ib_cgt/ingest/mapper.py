@@ -329,10 +329,29 @@ def _build_bond(
     `IB_CGT_BONDS_EXEMPT` and the parser.
     """
     action = TradeAction.BUY if signed_qty > 0 else TradeAction.SELL
-    info = resolve_bond_info(raw.symbol, info_by_symbol)
+    return build_bond_instrument(raw.symbol, raw.currency, info_by_symbol), action
+
+
+def build_bond_instrument(
+    symbol: str,
+    currency: str,
+    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+) -> BondInstrument:
+    """Resolve a statement bond symbol to its ISIN-keyed `BondInstrument`.
+
+    Shared by the trade mapper and the Open Positions mapper so a
+    bond held and a bond traded resolve to one identity. Walks the
+    Financial Instrument Information section via `resolve_bond_info`,
+    canonicalises the display symbol, and classifies exemption.
+
+    Raises:
+        MappingError: No instrument-info row with a Security ID can
+            be resolved for `symbol`.
+    """
+    info = resolve_bond_info(symbol, info_by_symbol)
     if info is None or not info.security_id:
         raise MappingError(
-            f"Bond row for symbol {raw.symbol!r} has no resolvable ISIN. "
+            f"Bond row for symbol {symbol!r} has no resolvable ISIN. "
             "v1 requires every bond to carry a Security ID from the "
             "Financial Instrument Information section. Older statement "
             "vintages may need to be re-fetched from IB with the "
@@ -352,18 +371,17 @@ def _build_bond(
     # statement vintages whose schema lacks the Issuer column.
     classifier_text = info.issuer_text or info.description
     is_exempt = _classify_bond_exempt(
-        symbol=raw.symbol,
+        symbol=symbol,
         description=classifier_text,
-        currency=raw.currency,
+        currency=currency,
         overrides=resolve_exempt_bonds_allowlist(),
     )
-    instrument = BondInstrument(
+    return BondInstrument(
         isin=info.security_id,
         symbol=canonical_symbol,
-        currency=raw.currency,
+        currency=currency,
         is_cgt_exempt=is_exempt,
     )
-    return instrument, action
 
 
 def resolve_bond_info(
@@ -496,10 +514,29 @@ def _build_future_instrument(
     info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
 ) -> FutureInstrument:
     """Resolve multiplier + expiry from the instruments side-table."""
-    info = info_by_symbol.get(("Futures", raw.symbol))
+    return build_future_instrument(raw.symbol, raw.currency, info_by_symbol)
+
+
+def build_future_instrument(
+    symbol: str,
+    currency: str,
+    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+) -> FutureInstrument:
+    """Resolve a statement futures symbol to its `FutureInstrument`.
+
+    Shared by the trade mapper and the Open Positions mapper. The
+    multiplier and expiry come from the Financial Instrument
+    Information section — the statement's own instrument table — so
+    a contract held and a contract traded resolve to one identity.
+
+    Raises:
+        MappingError: No instrument-info row carries both a
+            multiplier and an expiry for `symbol`.
+    """
+    info = info_by_symbol.get(("Futures", symbol))
     if info is None or info.multiplier_text is None or info.expiry_text is None:
         raise MappingError(
-            f"Futures row for symbol {raw.symbol!r} has no matching entry in the "
+            f"Futures row for symbol {symbol!r} has no matching entry in the "
             "Financial Instrument Information section (need Multiplier + Expiry)."
         )
 
@@ -509,19 +546,19 @@ def _build_future_instrument(
         multiplier = Decimal(info.multiplier_text.replace(",", ""))
     except InvalidOperation as exc:
         raise MappingError(
-            f"Unparseable futures multiplier {info.multiplier_text!r} for {raw.symbol!r}"
+            f"Unparseable futures multiplier {info.multiplier_text!r} for {symbol!r}"
         ) from exc
 
     try:
         expiry_date = datetime.strptime(info.expiry_text, "%Y-%m-%d").date()
     except ValueError as exc:
         raise MappingError(
-            f"Unparseable futures expiry {info.expiry_text!r} for {raw.symbol!r}"
+            f"Unparseable futures expiry {info.expiry_text!r} for {symbol!r}"
         ) from exc
 
     return FutureInstrument(
-        symbol=raw.symbol,
-        currency=raw.currency,
+        symbol=symbol,
+        currency=currency,
         contract_multiplier=multiplier,
         expiry_date=expiry_date,
     )
@@ -712,5 +749,8 @@ def _derive_futures_events(
 __all__ = [
     "DEFAULT_STATEMENT_TZ",
     "MappingError",
+    "build_bond_instrument",
+    "build_future_instrument",
     "map_rows",
+    "resolve_bond_info",
 ]

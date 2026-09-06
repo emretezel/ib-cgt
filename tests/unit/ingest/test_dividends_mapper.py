@@ -15,7 +15,7 @@ from decimal import Decimal
 import pytest
 
 from ib_cgt.domain import DividendKind, Money
-from ib_cgt.ingest.dividends import map_dividends
+from ib_cgt.ingest.dividends import has_instrument_prefix, map_dividends
 from ib_cgt.ingest.mapper import MappingError
 from ib_cgt.ingest.parser import ParsedStatement, RawDividendRow
 
@@ -24,6 +24,8 @@ def _make_parsed(rows: list[RawDividendRow]) -> ParsedStatement:
     """Wrap a list of dividend rows in an otherwise-empty ParsedStatement."""
     return ParsedStatement(
         account_id="U1",
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
         trades=(),
         instruments=(),
         corporate_actions=(),
@@ -219,3 +221,34 @@ def test_currency_grouping_preserved_across_multiple_currency_sections() -> None
     )
     out = map_dividends(parsed)
     assert [d.amount.currency for d in out] == ["EUR", "USD", "EUR"]
+
+
+def test_withholding_on_broker_interest_is_left_to_the_cash_event_mapper() -> None:
+    """A withholding-section row with no `<SYMBOL>(<SECID>)` prefix is skipped, not raised.
+
+    IB books tax withheld on credit interest (and its cancellation)
+    in the Withholding Tax section; nothing names a stock, so it is a
+    cash event rather than a dividend.
+    """
+    parsed = _make_parsed(
+        [
+            RawDividendRow(
+                section="withholding_tax",
+                currency="GBP",
+                date_text="2019-01-04",
+                description="Withholding @ 30% on Credit Interest for Dec-2018",
+                amount_text="-1.61",
+            ),
+            RawDividendRow(
+                section="withholding_tax",
+                currency="USD",
+                date_text="2018-04-06",
+                description="BIG(US0893021032) Cash Dividend 0.30000000 USD per Share - US Tax",
+                amount_text="-6.75",
+            ),
+        ]
+    )
+    dividends = map_dividends(parsed)
+    assert [d.instrument.symbol for d in dividends] == ["BIG"]
+    assert has_instrument_prefix("BIG(US0893021032) Cash Dividend") is True
+    assert has_instrument_prefix("CANCEL WITHHOLDING ON Credit Interest for Dec-2018") is False

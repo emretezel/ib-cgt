@@ -11,6 +11,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 from ib_cgt.db import AccountRepo, StatementRepo, StatementRow
 from ib_cgt.domain import Account
@@ -24,6 +25,8 @@ def test_get_returns_recorded_metadata(db: sqlite3.Connection) -> None:
         source_path="/tmp/U1_2024.html",
         account_id="U1",
         trade_count=42,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     row = StatementRepo(db).get("abc123")
     assert row is not None

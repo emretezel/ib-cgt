@@ -39,6 +39,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ib_cgt.calculator.positions import PositionReconciliation
     from ib_cgt.calculator.runs import (
         BondEngineRun,
         EngineOutputs,
@@ -175,6 +176,7 @@ class CheckContext:
     _bond_runs: list[BondEngineRun] | None = field(default=None, repr=False)
     _future_runs: list[FutureEngineRun] | None = field(default=None, repr=False)
     _fx_runs: list[FXEngineRun] | None = field(default=None, repr=False)
+    _position_recs: tuple[PositionReconciliation, ...] | None = field(default=None, repr=False)
 
     @property
     def is_narrowed(self) -> bool:
@@ -244,6 +246,19 @@ class CheckContext:
                 )
             )
         return self._fx_runs
+
+    def position_reconciliations(self) -> tuple[PositionReconciliation, ...]:
+        """Return the cached trade-vs-statement position reconciliation.
+
+        Whole-history by nature (it compares against each account's
+        latest statement), so the context's `symbol` / date filters
+        do not apply to it.
+        """
+        if self._position_recs is None:
+            from ib_cgt.calculator.positions import reconcile_positions
+
+            self._position_recs = reconcile_positions(self.conn)
+        return self._position_recs
 
     def engine_outputs(self) -> EngineOutputs:
         """Bundle the four cached runs into the calculator's `EngineOutputs`.

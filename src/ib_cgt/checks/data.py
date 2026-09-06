@@ -512,3 +512,43 @@ def _check_dividends_referential(ctx: CheckContext) -> Finding:
         detail=f"{len(rows)} dividend row(s) with broken refs or missing pay_date",
         evidence=_rows_to_evidence(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# A14 — cash_events FK + sane value_date / amount
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="A14",
+    description=(
+        "cash_events reference a live account/statement and carry a date and a non-zero amount"
+    ),
+    tier=Tier.A,
+    scopes={Scope.ALL, Scope.DATA},
+    severity=Severity.WARN,
+)
+def _check_cash_events_referential(ctx: CheckContext) -> Finding:
+    """The `dividends` twin (A13) for instrument-less cash movements.
+
+    A zero amount is flagged alongside the referential breaks: the
+    domain rejects it at ingest, so a stored zero can only come from
+    a hand-edit, and the FX projector would treat it as an event.
+    """
+    rows = ctx.conn.execute(
+        "SELECT c.cash_event_id, c.account_id, c.source_statement_hash, "
+        "       c.value_date, c.amount_native "
+        "FROM cash_events c "
+        "LEFT JOIN accounts a ON a.account_id = c.account_id "
+        "LEFT JOIN statements s ON s.statement_hash = c.source_statement_hash "
+        "WHERE a.account_id IS NULL OR s.statement_hash IS NULL "
+        "OR c.value_date IS NULL OR c.value_date = '' "
+        "OR c.amount_native IN ('0', '0.0', '0.00')"
+    ).fetchall()
+    if not rows:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(rows)} cash_events row(s) with broken refs, missing date or zero amount",
+        evidence=_rows_to_evidence(rows),
+    )

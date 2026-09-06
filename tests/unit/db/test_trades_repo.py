@@ -9,9 +9,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ib_cgt.db import AccountRepo, StatementRepo, TradeRepo
+from ib_cgt.db import AccountRepo, InstrumentRepo, StatementRepo, TradeRepo
 from ib_cgt.domain import (
     Account,
+    FutureInstrument,
     Money,
     StockInstrument,
     Trade,
@@ -33,6 +34,8 @@ def _seed_account_and_statement(
         source_path="/tmp/stmt.html",
         account_id=account_id,
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
 
@@ -162,3 +165,110 @@ def test_unknown_statement_hash_rejected(db: sqlite3.Connection) -> None:
     repo = TradeRepo(db)
     with pytest.raises(sqlite3.IntegrityError):
         repo.insert_many([_aapl_buy()], source_statement_hash="unknown-hash")
+
+
+# ---------------------------------------------------------------------------
+# signed_quantity_by_instrument — the trade side of position reconciliation
+# ---------------------------------------------------------------------------
+
+
+def _trade(
+    instrument: StockInstrument | FutureInstrument,
+    action: TradeAction,
+    on: date,
+    qty: str,
+    *,
+    account_id: str = "U1",
+) -> Trade:
+    return Trade(
+        account_id=account_id,
+        instrument=instrument,
+        action=action,
+        trade_datetime=datetime(on.year, on.month, on.day, 14, 0, tzinfo=_UK),
+        trade_date=on,
+        settlement_date=on,
+        quantity=Decimal(qty),
+        price=Money.of(Decimal("10"), instrument.currency),
+        fees=Money.of(Decimal("0"), instrument.currency),
+    )
+
+
+def test_signed_quantity_nets_buys_and_sells(db: sqlite3.Connection) -> None:
+    _seed_account_and_statement(db)
+    repo = TradeRepo(db)
+    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    repo.insert_many(
+        [
+            _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),
+            _trade(aapl, TradeAction.SELL, date(2024, 7, 2), "4"),
+        ],
+        source_statement_hash="hash-a",
+    )
+    (iid,) = [i for i, _ in InstrumentRepo(db).list_stocks()]
+    assert repo.signed_quantity_by_instrument("U1", up_to=date(2024, 7, 31)) == {iid: Decimal("6")}
+
+
+def test_signed_quantity_futures_actions(db: sqlite3.Connection) -> None:
+    """OPEN_SHORT subtracts, CLOSE_SHORT adds; OPEN_LONG adds, CLOSE_LONG subtracts."""
+    _seed_account_and_statement(db)
+    repo = TradeRepo(db)
+    es = FutureInstrument(
+        symbol="ES",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 12, 19),
+    )
+    cl = FutureInstrument(
+        symbol="CL",
+        currency="USD",
+        contract_multiplier=Decimal("1000"),
+        expiry_date=date(2025, 6, 20),
+    )
+    repo.insert_many(
+        [
+            _trade(es, TradeAction.OPEN_SHORT, date(2024, 7, 1), "3"),
+            _trade(es, TradeAction.CLOSE_SHORT, date(2024, 7, 2), "1"),
+            _trade(cl, TradeAction.OPEN_LONG, date(2024, 7, 1), "5"),
+            _trade(cl, TradeAction.CLOSE_LONG, date(2024, 7, 3), "2"),
+        ],
+        source_statement_hash="hash-a",
+    )
+    by_symbol = {inst.symbol: iid for iid, inst in InstrumentRepo(db).list_futures()}
+    net = repo.signed_quantity_by_instrument("U1", up_to=date(2024, 7, 31))
+    assert net == {by_symbol["ES"]: Decimal("-2"), by_symbol["CL"]: Decimal("3")}
+
+
+def test_signed_quantity_omits_flat_instruments(db: sqlite3.Connection) -> None:
+    _seed_account_and_statement(db)
+    repo = TradeRepo(db)
+    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    repo.insert_many(
+        [
+            _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),
+            _trade(aapl, TradeAction.SELL, date(2024, 7, 2), "10"),
+        ],
+        source_statement_hash="hash-a",
+    )
+    assert repo.signed_quantity_by_instrument("U1", up_to=date(2024, 7, 31)) == {}
+
+
+def test_signed_quantity_honours_up_to_and_account(db: sqlite3.Connection) -> None:
+    _seed_account_and_statement(db)
+    _seed_account_and_statement(db, account_id="U2", statement_hash="hash-b")
+    repo = TradeRepo(db)
+    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    repo.insert_many(
+        [
+            _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),
+            _trade(aapl, TradeAction.SELL, date(2024, 8, 1), "10"),  # after the cut-off
+        ],
+        source_statement_hash="hash-a",
+    )
+    repo.insert_many(
+        [_trade(aapl, TradeAction.BUY, date(2024, 7, 1), "7", account_id="U2")],
+        source_statement_hash="hash-b",
+    )
+    (iid,) = [i for i, _ in InstrumentRepo(db).list_stocks()]
+    assert repo.signed_quantity_by_instrument("U1", up_to=date(2024, 7, 31)) == {iid: Decimal("10")}
+    assert repo.signed_quantity_by_instrument("U1", up_to=date(2024, 8, 31)) == {}
+    assert repo.signed_quantity_by_instrument("U2", up_to=date(2024, 7, 31)) == {iid: Decimal("7")}

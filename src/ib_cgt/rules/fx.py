@@ -5,23 +5,28 @@ Per `docs/architecture.md §Scope — FX treatment` and HMRC CG78315
 each non-GBP currency as its own chargeable asset, pooled per single
 currency vs GBP under the same four-rule matching as ordinary shares
 (same-day → 30-day → S.104 → s.105(2)). This engine projects events
-from **six** sources into the GBP `Acquisition` / `Disposal` shapes
+from **eight** sources into the GBP `Acquisition` / `Disposal` shapes
 consumed by the shared `MatchingEngine` and runs one matcher per
 non-GBP currency:
 
 1. **Forex trades** — explicit `Forex` rows from the IB statement.
 2. **Stock trades** — non-GBP stock BUY/SELL legs settle in the
    listing currency, so they feed the per-currency pool.
-3. **Dividends** — non-GBP cash dividends, payment-in-lieu, and
+3. **Bond trades** — non-GBP bond BUY/SELL legs (exempt or not,
+   maturities included) settle in the bond's currency the same way.
+4. **Dividends** — non-GBP cash dividends, payment-in-lieu, and
    withholding-tax cashflows on stock holdings.
-4. **Futures trade fees** — every OPEN/CLOSE leg pays a fee in the
+5. **Futures trade fees** — every OPEN/CLOSE leg pays a fee in the
    contract's native currency at trade_date.
-5. **Futures realisations** — gross P&L on closed contracts settles
+6. **Futures realisations** — gross P&L on closed contracts settles
    in the contract's native currency at close_date.
-6. **Bond coupons** — non-GBP coupon payments on bond holdings
+7. **Bond coupons** — non-GBP coupon payments on bond holdings
    credit the per-currency balance on `pay_date`. Always inflows
    (coupons are credits; there is no withholding-tax variant on
    bond interest in the corpora seen so far).
+8. **Cash events** — instrument-less movements: broker credit /
+   debit interest, external deposits and withdrawals, fee rows.
+   Direction is the sign of the amount.
 
 Pool model — per currency, not per traded pair
 ----------------------------------------------
@@ -64,6 +69,7 @@ from ib_cgt.domain import (
     Acquisition,
     AssetClass,
     BondCoupon,
+    CashEvent,
     Disposal,
     Dividend,
     FutureRealisation,
@@ -73,6 +79,8 @@ from ib_cgt.domain.money import validate_currency_code
 from ib_cgt.rules.futures import FXConverter
 from ib_cgt.rules.fx_cashflow import (
     from_bond_coupon,
+    from_bond_trade,
+    from_cash_event,
     from_dividend,
     from_forex_trade,
     from_future_fee,
@@ -115,10 +123,12 @@ class FXRuleEngine:
         currency: str,
         forex_trades: Sequence[tuple[int, Trade]] = (),
         stock_trades: Sequence[tuple[int, Trade]] = (),
+        bond_trades: Sequence[tuple[int, Trade]] = (),
         future_trades: Sequence[tuple[int, Trade]] = (),
         future_realisations: Sequence[tuple[int, FutureRealisation, str]] = (),
         dividends: Sequence[tuple[int, Dividend]] = (),
         bond_coupons: Sequence[tuple[int, BondCoupon]] = (),
+        cash_events: Sequence[tuple[int, CashEvent]] = (),
     ) -> MatchingResult:
         """Match every disposal of `currency` against acquisitions of `currency`.
 
@@ -134,6 +144,10 @@ class FXRuleEngine:
                 stock trades. The engine projects only trades whose
                 listing currency equals `currency`. Pass an empty
                 sequence to skip stock cashflows.
+            bond_trades: `(trade_id, trade)` pairs for non-GBP bond
+                trades, exempt or not — a purchase spends the bond's
+                currency, a sale (or synthesised maturity) brings it
+                in. Same projection contract as `stock_trades`.
             future_trades: `(trade_id, trade)` pairs for non-GBP
                 futures trades. Used to capture the per-trade fees
                 that flow out of the pool at trade_date. Pass an
@@ -165,6 +179,14 @@ class FXRuleEngine:
                 ranges (orchestrator typically allocates from
                 `itertools.count(3 * 10**12)`). Pass an empty
                 sequence to skip coupons.
+            cash_events: `(synth_id, event)` pairs — one per
+                instrument-less cash movement (broker interest,
+                external deposits and withdrawals, fee rows). A
+                positive amount projects to an acquisition, a
+                negative one to a disposal, on `value_date`. Synth-ID
+                range is disjoint from the others (orchestrator
+                allocates from `itertools.count(4 * 10**12)`). Pass
+                an empty sequence to skip cash events.
 
         Returns:
             A `MatchingResult` describing the four-rule matching for
@@ -213,6 +235,19 @@ class FXRuleEngine:
             else:
                 disposals.append(stock_event)
 
+        # Bond trades — one event per non-GBP trade in the target
+        # currency, the mirror of the stock projection (BUY →
+        # disposal, SELL → acquisition). Exemption is irrelevant to
+        # the cash leg.
+        for trade_id, trade in bond_trades:
+            bond_event = from_bond_trade(trade_id, trade, currency, self._fx, pool_instrument)
+            if bond_event is None:
+                continue
+            if isinstance(bond_event, Acquisition):
+                acquisitions.append(bond_event)
+            else:
+                disposals.append(bond_event)
+
         # Dividends — cash distributions on stock holdings. Cash
         # dividend / payment-in-lieu rows are pool acquisitions;
         # withholding tax is a pool disposal. Direction is encoded
@@ -259,6 +294,18 @@ class FXRuleEngine:
                 acquisitions.append(pnl_event)
             else:
                 disposals.append(pnl_event)
+
+        # Cash events — instrument-less movements (broker interest,
+        # external transfers, fees). Direction is the sign of the
+        # amount: inflows acquire, outflows dispose.
+        for synth_id, movement in cash_events:
+            cash_event = from_cash_event(synth_id, movement, currency, self._fx, pool_instrument)
+            if cash_event is None:
+                continue
+            if isinstance(cash_event, Acquisition):
+                acquisitions.append(cash_event)
+            else:
+                disposals.append(cash_event)
 
         return self._matcher.match(
             pool_instrument,

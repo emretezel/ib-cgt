@@ -42,6 +42,8 @@ def _seed_accounts_and_statement(
         source_path="/tmp/stmt.html",
         account_id=account_ids[0],
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
 

@@ -19,7 +19,7 @@ import pytest
 from ib_cgt.domain import BondCoupon, Money
 from ib_cgt.ingest.bond_coupons import map_bond_coupons
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo, RawInterestRow
+from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawInstrumentInfo
 
 
 def _gilt_info(
@@ -41,17 +41,19 @@ def _gilt_info(
 
 
 def _parsed(
-    *interest_rows: RawInterestRow,
+    *interest_rows: RawCashRow,
     instruments: tuple[RawInstrumentInfo, ...] = (),
 ) -> ParsedStatement:
     """Wrap rows in a minimal `ParsedStatement` for the mapper."""
     return ParsedStatement(
         account_id="U1",
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
         trades=(),
         instruments=instruments,
         corporate_actions=(),
         dividends=(),
-        interest=interest_rows,
+        cash_rows=interest_rows,
     )
 
 
@@ -61,8 +63,9 @@ def _row(
     currency: str = "GBP",
     date_text: str = "2025-07-30",
     amount_text: str = "162.50",
-) -> RawInterestRow:
-    return RawInterestRow(
+) -> RawCashRow:
+    return RawCashRow(
+        section="interest",
         currency=currency,
         date_text=date_text,
         description=description,

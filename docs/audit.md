@@ -28,6 +28,11 @@ In `match fx` output:
 - `Cpn #N` — a bond coupon, cited by its `bond_coupons.bond_coupon_id`.
   Coupons reach the pools through the shared engine runner, so they
   appear in `match fx` exactly as `compute` will see them.
+- `Cash #N` — an instrument-less cash movement (broker interest, an
+  external deposit or withdrawal, a fee, interest withholding),
+  cited by its `cash_events.cash_event_id`. The description column
+  prints `<kind>: <IB description>`, e.g.
+  `transfer: Electronic Fund Transfer`.
 
 The synthetic integer ids the FX engine works with internally are
 never printed; the runner's provenance map

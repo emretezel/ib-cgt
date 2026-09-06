@@ -135,6 +135,8 @@ def _seed_trades(conn: sqlite3.Connection) -> None:
         source_path="/tmp/stmt.html",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     es = _es_dec25()
     nq = _nq_dec25()
@@ -423,6 +425,8 @@ def test_match_futures_collects_errors_in_trailing_block(
             source_path="/tmp/stmt-eur.html",
             account_id="U1",
             trade_count=0,
+            period_start=date(2024, 4, 6),
+            period_end=date(2025, 4, 5),
         )
         TradeRepo(conn).insert_many([eur_open, eur_close], source_statement_hash="hash-eur")
     finally:

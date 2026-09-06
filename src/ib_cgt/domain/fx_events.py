@@ -75,7 +75,18 @@ class BondCouponRef:
         _require_positive("BondCouponRef.bond_coupon_id", self.bond_coupon_id)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CashEventRef:
+    """An instrument-less cash movement row (`cash_events.cash_event_id`)."""
+
+    cash_event_id: int
+
+    def __post_init__(self) -> None:
+        """The cash-event id must be a real (positive) row id."""
+        _require_positive("CashEventRef.cash_event_id", self.cash_event_id)
+
+
 # Sealed union of every source a synthetic FX event id can point at.
 # Consumers branch with `isinstance`; adding a source means adding a
 # member here and a branch everywhere mypy flags as non-exhaustive.
-FXEventSource = FutureRealisationRef | DividendRef | BondCouponRef
+FXEventSource = FutureRealisationRef | DividendRef | BondCouponRef | CashEventRef

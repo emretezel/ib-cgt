@@ -41,6 +41,20 @@ futures/24_25.htm, see `docs/architecture.md` §Component map item 3):
   The downstream consumer (`ingest/corporate_actions.py`) materialises
   cash-for-shares mergers into synthesized SELL trades; the parser is
   scope-blind and emits every action row verbatim.
+* Statement period: read from the `<title>` — `"U… Activity Statement
+  April 7, 2025 - April 3, 2026 - …"` — the one place every vintage
+  prints the range in a fixed shape. A statement with no range in its
+  title is rejected.
+* Cash-shaped sections — Interest (`tblCombInt_`), Deposits &
+  Withdrawals (`tblCombDepWith_`), Fees (`tblCombFees_`) — share the
+  `Date | Description | Amount` columns and the `header-currency`
+  toggle. Every row is emitted as a `RawCashRow` tagged with its
+  section; the mappers decide which rows are bond coupons and which
+  are instrument-less cash events.
+* Open Positions section: `<div id="tblOpenPositions_<acct>Body">`,
+  the same `header-asset` / `header-currency` shape as Trades, one row
+  per symbol still held on the last day of the period. Bonds print the
+  long description and the symbol in one cell separated by `<br/>`.
 
 Author: Emre Tezel
 """
@@ -49,6 +63,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Final
 
 from bs4 import BeautifulSoup, Tag
@@ -214,30 +229,34 @@ class RawDividendRow:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class RawInterestRow:
-    """One row of the Interest section (`tblCombInt_<acct>Body`).
+class RawCashRow:
+    """One row of a cash-shaped section: Interest, Deposits & Withdrawals, or Fees.
 
-    The same `Date | Description | Amount` shape as a dividend row,
-    plus the per-currency `header-currency` toggle. The Interest
-    section is heterogeneous: broker debit/credit interest, debit
-    interest accruals, and **bond coupon payments** all live here,
-    distinguished only by description prefix. The parser is
-    description-blind — it emits every row verbatim and lets
-    `ingest/bond_coupons.py` filter to the
-    `"Bond Coupon Payment (…)"` rows that matter for CGT / FX-pool
-    matching.
+    All three sections share the `Date | Description | Amount` shape
+    and the per-currency `header-currency` toggle; only the enclosing
+    div differs, which `section` records. Each is heterogeneous —
+    the Interest section alone holds broker debit / credit interest,
+    stock-lending income, accrued-interest lines on bond purchases,
+    and **bond coupon payments** — distinguished only by description.
+    The parser is description-blind: it emits every row verbatim and
+    lets the mappers (`ingest/bond_coupons.py`, `ingest/cash_events.py`)
+    decide what each row is.
 
     Attributes:
+        section: Which section the row came from — one of
+            `"interest"`, `"deposits_withdrawals"`, `"fees"` (the
+            values of `_CASH_SECTION_DIV_PREFIXES`).
         currency: The sub-section currency header for this row
             (e.g. ``"GBP"``, ``"USD"``).
         date_text: Raw date string `"YYYY-MM-DD"` exactly as printed.
-        description: Free-text — the gate the mapper uses to filter
-            bond-coupon rows out from broker-interest rows.
-        amount_text: The cash amount as printed (`"162.50"`, `"-2.49"`).
-            Bond coupons are positive; broker debit interest is
-            negative; coupon mappers take the absolute value.
+        description: Free-text — the gate the mappers use to classify
+            the row.
+        amount_text: The cash amount as printed (`"162.50"`,
+            `"-2.49"`). The sign is meaningful: credits are positive,
+            debits negative.
     """
 
+    section: str
     currency: str
     date_text: str
     description: str
@@ -245,18 +264,56 @@ class RawInterestRow:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawOpenPositionRow:
+    """One row of the Open Positions section, still as raw text.
+
+    The section lists what was still held on the last day of the
+    statement period, per asset class and currency, one row per
+    symbol. The columns are `Symbol | Quantity | Mult | Cost Price |
+    … | Code` for stocks and futures; the bonds sub-table prints
+    `Accrued Int` where `Mult` would be. Only the identity and the
+    signed quantity matter downstream.
+
+    Attributes:
+        asset_class: The section-header label after
+            `_normalize_asset_class` — `"Stocks"`, `"Bonds"`,
+            `"Futures"`.
+        currency: The sub-section currency header.
+        symbol: The IB symbol. For bonds IB prints the long
+            description and the symbol in one cell separated by a
+            line break; this is the last line.
+        description: The text before that line break (empty for
+            stocks and futures) — a resolution aid for bonds.
+        quantity_text: Signed quantity as printed, thousands commas
+            included (`"-3"`, `"30,000"`).
+        multiplier_text: The `Mult` cell where the sub-table has one,
+            else `None`.
+    """
+
+    asset_class: str
+    currency: str
+    symbol: str
+    description: str
+    quantity_text: str
+    multiplier_text: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ParsedStatement:
-    """The parsed statement: account + trade rows + instrument metadata."""
+    """The parsed statement: account, period, trade rows, and every side section."""
 
     account_id: str
+    period_start: date
+    period_end: date
     trades: tuple[RawTradeRow, ...]
     instruments: tuple[RawInstrumentInfo, ...]
     corporate_actions: tuple[RawCorporateActionRow, ...]
     dividends: tuple[RawDividendRow, ...]
-    # Defaulted so older test fixtures that hand-construct
-    # `ParsedStatement` without the Interest section still type-check
-    # without ceremony. Real parser output always populates this.
-    interest: tuple[RawInterestRow, ...] = ()
+    # The side sections are defaulted so test fixtures that hand-
+    # construct a `ParsedStatement` for one mapper need not spell out
+    # the others. Real parser output always populates every field.
+    cash_rows: tuple[RawCashRow, ...] = ()
+    open_positions: tuple[RawOpenPositionRow, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -314,26 +371,62 @@ _DIVIDEND_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Amount": "amount",
 }
 
-# Interest section column headers — IB uses the same three columns as
-# dividends (`Date | Description | Amount`). Kept as a separate alias
-# table so a future column drift in one section doesn't ripple to the
-# other; the resolver `_resolve_interest_columns` keys on this dict.
-_INTEREST_COLUMN_ALIASES: Final[dict[str, str]] = {
+# Cash-shaped section column headers — Interest, Deposits &
+# Withdrawals and Fees all use the same three columns as dividends
+# (`Date | Description | Amount`). Kept as a separate alias table so a
+# future column drift in one family doesn't ripple to the other; the
+# resolver `_resolve_cash_columns` keys on this dict.
+_CASH_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Date": "date",
     "Description": "description",
     "Amount": "amount",
 }
+
+# Open Positions column headers. Only `Symbol` and `Quantity` are
+# required — the bonds sub-table has no `Mult` column (it prints
+# `Accrued Int` in that slot), so the multiplier is optional.
+_POSITION_COLUMN_ALIASES: Final[dict[str, str]] = {
+    "Symbol": "symbol",
+    "Quantity": "quantity",
+    "Mult": "multiplier",
+}
+_POSITION_REQUIRED_COLUMNS: Final[frozenset[str]] = frozenset({"symbol", "quantity"})
 
 # Dividend-shaped section ids → the `section` label we stamp onto
 # every `RawDividendRow` extracted from that div. The mapper later
 # branches on the label to decide which IB section a row came from
 # (which is what disambiguates cash dividends from withholding tax
 # from accrual adjustments — the columns are identical otherwise).
+# IB's real withholding-tax div is `tblWithholdingTax_<acct>Body`; the
+# shorter `tblWithholding_` prefix is kept for the layout the mapper
+# was originally written against.
 _DIVIDEND_SECTION_DIV_PREFIXES: Final[dict[str, str]] = {
     "tblCombDiv_": "dividends",
+    "tblWithholdingTax_": "withholding_tax",
     "tblWithholding_": "withholding_tax",
     "tblChangeInDividend_": "change_in_dividend_accruals",
 }
+
+# Cash-shaped section ids → the `section` label stamped onto every
+# `RawCashRow`. Emit order is this dict's order, which fixes the
+# per-statement row index the `cash_events` table is keyed on.
+_CASH_SECTION_DIV_PREFIXES: Final[dict[str, str]] = {
+    "tblCombInt_": "interest",
+    "tblCombDepWith_": "deposits_withdrawals",
+    "tblCombFees_": "fees",
+}
+
+# Open Positions section div prefix (`tblOpenPositions_<acct>Body`).
+_OPEN_POSITIONS_DIV_PREFIX: Final = "tblOpenPositions_"
+
+# Statement period as printed in the page title: `"U… Activity
+# Statement April 7, 2025 - April 3, 2026 - Interactive Brokers"`.
+# Present on every vintage from 2017 onwards; the body prints the
+# same range under a "Period" label but not in a stable element.
+_TITLE_PERIOD_PATTERN: Final = re.compile(
+    r"([A-Z][a-z]+ \d{1,2}, \d{4})\s*-\s*([A-Z][a-z]+ \d{1,2}, \d{4})"
+)
+_TITLE_DATE_FORMAT: Final = "%B %d, %Y"
 
 # Asset-class section labels we deliberately drop at parse time. Stock
 # options arrive on IB statements under the "Equity and Index Options"
@@ -378,20 +471,55 @@ def parse_statement(source_bytes: bytes) -> ParsedStatement:
     soup = BeautifulSoup(source_bytes, "lxml")
 
     account_id = _extract_account_id(soup)
+    period_start, period_end = _extract_period(soup)
     trades = tuple(_parse_trades_section(soup))
     instruments = tuple(_parse_instruments_section(soup))
     corporate_actions = tuple(_parse_corporate_actions_section(soup))
     dividends = tuple(_parse_dividends_section(soup))
-    interest = tuple(_parse_interest_section(soup))
+    cash_rows = tuple(_parse_cash_sections(soup))
+    open_positions = tuple(_parse_open_positions_section(soup))
 
     return ParsedStatement(
         account_id=account_id,
+        period_start=period_start,
+        period_end=period_end,
         trades=trades,
         instruments=instruments,
         corporate_actions=corporate_actions,
         dividends=dividends,
-        interest=interest,
+        cash_rows=cash_rows,
+        open_positions=open_positions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Statement period
+# ---------------------------------------------------------------------------
+
+
+def _extract_period(soup: BeautifulSoup) -> tuple[date, date]:
+    """Return the `(period_start, period_end)` the statement covers.
+
+    Read from the `<title>` — the one place every IB vintage prints
+    the range in a fixed shape. A statement whose title carries no
+    range is not something this project can place in time, so it is
+    rejected rather than guessed at.
+    """
+    title = soup.title
+    match = _TITLE_PERIOD_PATTERN.search(title.get_text()) if title is not None else None
+    if match is None:
+        raise StatementParseError(
+            "Could not locate the statement period in the <title> (expected "
+            "'<Month D, YYYY> - <Month D, YYYY>')."
+        )
+    try:
+        start = datetime.strptime(match.group(1), _TITLE_DATE_FORMAT).date()
+        end = datetime.strptime(match.group(2), _TITLE_DATE_FORMAT).date()
+    except ValueError as exc:
+        raise StatementParseError(f"Unparseable statement period in <title>: {exc}") from exc
+    if start > end:
+        raise StatementParseError(f"Statement period in <title> runs backwards ({start} - {end}).")
+    return start, end
 
 
 # ---------------------------------------------------------------------------
@@ -970,33 +1098,36 @@ def _resolve_dividend_columns(table: Tag) -> dict[str, int] | None:
 
 
 # ---------------------------------------------------------------------------
-# Interest section (broker debit/credit interest + bond coupon payments)
+# Cash-shaped sections: Interest, Deposits & Withdrawals, Fees
 # ---------------------------------------------------------------------------
 
 
-def _parse_interest_section(soup: BeautifulSoup) -> list[RawInterestRow]:
-    """Yield every Interest-section row across all `tblCombInt_*` divs.
+def _parse_cash_sections(soup: BeautifulSoup) -> list[RawCashRow]:
+    """Yield every row of the three cash-shaped sections, tagged by section.
 
     Mirrors `_parse_dividends_section` — same `Date | Description |
     Amount` columns, same `header-currency` toggle, same
-    `subtotal` / `total` skip semantics. The parser is description-
-    blind; the mapper layer
-    (`ingest/bond_coupons.py`) is what filters out broker-interest
-    rows and keeps only `"Bond Coupon Payment (…)"` rows.
+    `subtotal` / `total` skip semantics. Walks the sections in
+    `_CASH_SECTION_DIV_PREFIXES` order (interest, then deposits and
+    withdrawals, then fees) so the emit order — and with it the
+    per-statement row index — is stable. The parser is description-
+    blind; the mappers (`ingest/bond_coupons.py`,
+    `ingest/cash_events.py`) decide what each row is.
     """
-    rows: list[RawInterestRow] = []
-    for table in _find_interest_tables(soup):
-        rows.extend(_parse_one_interest_table(table))
+    rows: list[RawCashRow] = []
+    for prefix, section_label in _CASH_SECTION_DIV_PREFIXES.items():
+        for table in _find_dividend_tables(soup, prefix):
+            rows.extend(_parse_one_cash_table(table, section_label))
     return rows
 
 
-def _parse_one_interest_table(table: Tag) -> list[RawInterestRow]:
-    """Parse a single Interest-section `<table>`."""
-    column_map = _resolve_interest_columns(table)
+def _parse_one_cash_table(table: Tag, section_label: str) -> list[RawCashRow]:
+    """Parse a single cash-shaped `<table>`."""
+    column_map = _resolve_cash_columns(table)
     if column_map is None:
         return []
 
-    rows: list[RawInterestRow] = []
+    rows: list[RawCashRow] = []
     current_currency = ""
 
     for tr in table.find_all("tr"):
@@ -1032,7 +1163,8 @@ def _parse_one_interest_table(table: Tag) -> list[RawInterestRow]:
             continue
 
         rows.append(
-            RawInterestRow(
+            RawCashRow(
+                section=section_label,
                 currency=current_currency,
                 date_text=date_text,
                 description=description,
@@ -1043,33 +1175,14 @@ def _parse_one_interest_table(table: Tag) -> list[RawInterestRow]:
     return rows
 
 
-def _find_interest_tables(soup: BeautifulSoup) -> list[Tag]:
-    """Return every `<table>` inside an Interest-section div.
-
-    The enclosing `<div>` ids look like `tblCombInt_U…Body`. Walks
-    all tables inside each match — same shape as the dividends
-    finder.
-    """
-    tables: list[Tag] = []
-    for div in soup.find_all("div", id=True):
-        if not isinstance(div, Tag):
-            continue
-        div_id = str(div.get("id", ""))
-        if div_id.startswith("tblCombInt_") and div_id.endswith("Body"):
-            for table in div.find_all("table"):
-                if isinstance(table, Tag):
-                    tables.append(table)
-    return tables
-
-
-def _resolve_interest_columns(table: Tag) -> dict[str, int] | None:
-    """Map Interest-section header labels to indices.
+def _resolve_cash_columns(table: Tag) -> dict[str, int] | None:
+    """Map cash-section header labels to indices.
 
     Required: `date`, `description`, `amount`. Returns `None` when
     any required column is missing — that table is then skipped,
     matching the dividends resolver's discipline.
     """
-    required = set(_INTEREST_COLUMN_ALIASES.values())
+    required = set(_CASH_COLUMN_ALIASES.values())
     for tr in table.find_all("tr"):
         if not isinstance(tr, Tag):
             continue
@@ -1079,10 +1192,136 @@ def _resolve_interest_columns(table: Tag) -> dict[str, int] | None:
         candidate: dict[str, int] = {}
         for idx, th in enumerate(headers):
             label = th.get_text(strip=True)
-            logical = _INTEREST_COLUMN_ALIASES.get(label)
+            logical = _CASH_COLUMN_ALIASES.get(label)
             if logical is not None:
                 candidate[logical] = idx
         if required.issubset(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Open Positions section
+# ---------------------------------------------------------------------------
+
+
+def _parse_open_positions_section(soup: BeautifulSoup) -> list[RawOpenPositionRow]:
+    """Yield every Open Positions row across all `tblOpenPositions_*` divs.
+
+    The section has the Trades section's shape — `header-asset` and
+    `header-currency` toggles, `subtotal` / `total` display rows —
+    and, on newer vintages, several sub-tables (one per custodian,
+    one for bonds with a different column set). Every table is
+    walked; columns are resolved by label per table. Rows in an
+    ignored asset class (stock options) are dropped exactly as their
+    trades are. A statement with nothing open has no section at all
+    and yields an empty list.
+    """
+    rows: list[RawOpenPositionRow] = []
+    for table in _find_dividend_tables(soup, _OPEN_POSITIONS_DIV_PREFIX):
+        rows.extend(_parse_one_open_positions_table(table))
+    return rows
+
+
+def _parse_one_open_positions_table(table: Tag) -> list[RawOpenPositionRow]:
+    """Parse a single Open Positions `<table>`."""
+    column_map = _resolve_position_columns(table)
+    if column_map is None:
+        return []
+
+    rows: list[RawOpenPositionRow] = []
+    current_asset_class = ""
+    current_currency = ""
+
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+
+        if _row_has_cell_class(tr, "header-asset"):
+            current_asset_class = _normalize_asset_class(_row_first_cell_text(tr))
+            continue
+        if _row_has_cell_class(tr, "header-currency"):
+            current_currency = _row_first_cell_text(tr)
+            continue
+        row_classes = tr.get("class") or []
+        if "subtotal" in row_classes or "total" in row_classes:
+            continue
+        if tr.find("th") is not None:
+            continue
+
+        cells = tr.find_all("td")
+        if not cells or not current_asset_class or not current_currency:
+            continue
+        if current_asset_class in _IGNORED_ASSET_CLASSES:
+            continue
+
+        try:
+            symbol_cell = cells[column_map["symbol"]]
+            quantity_text = cells[column_map["quantity"]].get_text(strip=True)
+        except IndexError:
+            continue
+        if not isinstance(symbol_cell, Tag):
+            continue
+        # A blank quantity marks an aggregate row IB occasionally emits
+        # without a `subtotal` / `total` class (the empty bonds sub-table
+        # on a statement with no bond positions is the observed case).
+        if not quantity_text or quantity_text == "\xa0":
+            continue
+
+        symbol, description = _split_symbol_cell(symbol_cell)
+        if not symbol:
+            continue
+        rows.append(
+            RawOpenPositionRow(
+                asset_class=current_asset_class,
+                currency=current_currency,
+                symbol=symbol,
+                description=description,
+                quantity_text=quantity_text,
+                multiplier_text=_optional_cell(cells, column_map, "multiplier"),
+            )
+        )
+
+    return rows
+
+
+def _split_symbol_cell(cell: Tag) -> tuple[str, str]:
+    """Return `(symbol, description)` from an Open Positions symbol cell.
+
+    Stocks and futures print the bare symbol. Bonds print the long
+    description and the symbol in one cell separated by `<br/>`
+    (`United Kingdom Gilt UKT 2 1/4 09/07/23<br/>UKT 2 1/4 09/07/23`),
+    so the symbol is the last line and everything before it is the
+    description. Separating on the line break rather than on text
+    keeps a symbol containing spaces intact.
+    """
+    lines = [line.strip() for line in cell.get_text("\n").split("\n")]
+    lines = [line for line in lines if line and line != "\xa0"]
+    if not lines:
+        return "", ""
+    return lines[-1], " ".join(lines[:-1])
+
+
+def _resolve_position_columns(table: Tag) -> dict[str, int] | None:
+    """Map Open Positions header labels to indices.
+
+    Required: `symbol`, `quantity`. `multiplier` is optional because
+    the bonds sub-table has no `Mult` column. Returns `None` when a
+    required column is missing — that table is then skipped.
+    """
+    for tr in table.find_all("tr"):
+        if not isinstance(tr, Tag):
+            continue
+        headers = tr.find_all("th")
+        if not headers:
+            continue
+        candidate: dict[str, int] = {}
+        for idx, th in enumerate(headers):
+            label = th.get_text(strip=True)
+            logical = _POSITION_COLUMN_ALIASES.get(label)
+            if logical is not None:
+                candidate[logical] = idx
+        if _POSITION_REQUIRED_COLUMNS.issubset(candidate):
             return candidate
     return None
 
@@ -1143,10 +1382,11 @@ def _optional_cell(cells: list[Tag], column_map: dict[str, int], logical: str) -
 
 __all__ = [
     "ParsedStatement",
+    "RawCashRow",
     "RawCorporateActionRow",
     "RawDividendRow",
     "RawInstrumentInfo",
-    "RawInterestRow",
+    "RawOpenPositionRow",
     "RawTradeRow",
     "StatementParseError",
     "parse_statement",

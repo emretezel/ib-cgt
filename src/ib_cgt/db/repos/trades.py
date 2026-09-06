@@ -18,6 +18,8 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
+from typing import Final
 
 from ib_cgt.db.codecs import (
     cols_to_money,
@@ -31,6 +33,13 @@ from ib_cgt.db.codecs import (
 )
 from ib_cgt.db.repos.instruments import InstrumentRepo
 from ib_cgt.domain import AssetClass, Trade, TradeAction
+
+# Actions that increase the signed holding; every other action
+# decreases it. Used by `signed_quantity_by_instrument` — the
+# trade-derived side of the open-position reconciliation.
+_POSITION_INCREASING_ACTIONS: Final[frozenset[TradeAction]] = frozenset(
+    {TradeAction.BUY, TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT}
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -273,6 +282,35 @@ class TradeRepo:
         )
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
+
+    def signed_quantity_by_instrument(self, account_id: str, *, up_to: date) -> dict[int, Decimal]:
+        """Net position per instrument implied by one account's trades up to a date.
+
+        Buys and long opens add, sells and long closes subtract, short
+        opens subtract and short closes add — so the value is the
+        signed holding (negative = short) the trade history says the
+        account has at the close of `up_to`. This is the trade side of
+        the reconciliation against the statement's Open Positions.
+
+        Instruments whose trades net to exactly zero are omitted: a
+        flat instrument has no position to compare. Sums are done in
+        Python `Decimal`, never in SQL — the quantity column is
+        Decimal-as-TEXT and SQLite would sum it as floating point.
+        """
+        rows = self._conn.execute(
+            "SELECT instrument_id, action, quantity FROM trades "
+            "WHERE account_id = ? AND trade_date <= ? "
+            "ORDER BY instrument_id",
+            (account_id, date_to_text(up_to)),
+        ).fetchall()
+        net: dict[int, Decimal] = {}
+        for row in rows:
+            action = TradeAction(row["action"])
+            quantity = text_to_dec(row["quantity"])
+            signed = quantity if action in _POSITION_INCREASING_ACTIONS else -quantity
+            instrument_id = int(row["instrument_id"])
+            net[instrument_id] = net.get(instrument_id, Decimal(0)) + signed
+        return {iid: qty for iid, qty in net.items() if qty != 0}
 
     def count(self) -> int:
         """Return the total row count — test-support helper."""

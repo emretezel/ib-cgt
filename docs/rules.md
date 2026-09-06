@@ -417,18 +417,20 @@ result = engine.compute(
     future_realisations=realisations,  # from FutureRuleEngine
     dividends=non_gbp_dividends,       # from DividendRepo.for_currency
     bond_coupons=non_gbp_bond_coupons, # from BondCouponRepo.for_currency
+    bond_trades=non_gbp_bond_trades,   # real trade ids, like stocks
+    cash_events=non_gbp_cash_events,   # from CashEventRepo.for_currency
 )
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects events from **six sources** into GBP-denominated
+projects events from **eight sources** into GBP-denominated
 `Acquisition` and `Disposal` records via the FX service, then
 delegates the match. Unlike the stock engine its API is
 **per-currency** rather than per-instrument, because UK CGT pools FX
 per single non-GBP currency vs GBP — and a single `EUR.USD` trade
 therefore touches *two* pools (one EUR, one USD).
 
-The six cashflow sources implement HMRC CG78315 — "foreign currency
+The eight cashflow sources implement HMRC CG78315 — "foreign currency
 arising from any source" — so the per-currency pool reflects every
 foreign-cash movement IB reports:
 
@@ -461,6 +463,41 @@ foreign-cash movement IB reports:
    (`tblCombInt_*`) and the income-tax treatment differs (interest
    savings allowance vs dividend allowance). See
    [`docs/db/bond_coupons.md`](db/bond_coupons.md).
+7. **Non-GBP bond trades** — the mirror of the stock projection: a
+   BUY spends `(price*qty + accrued + fees)` of the bond's currency
+   (a disposal), a SELL — a synthesised maturity included — brings
+   `(price*qty + accrued − fees)` in (an acquisition), GBP value at
+   trade-date spot. Whether the bond is CGT-exempt is irrelevant to
+   the cash leg. `accrued` is `Trade.accrued_interest` when set and
+   zero otherwise — today always zero, see the accrued-interest
+   invariant below.
+8. **Non-GBP cash events** — broker interest, external deposits and
+   withdrawals, fee rows and interest withholding
+   ([`docs/db/cash_events.md`](db/cash_events.md)). **Direction is
+   the sign of the amount**: positive rows are acquisitions at the
+   value-date spot, negative rows are disposals of the absolute
+   amount. IB's descriptions are never consulted for direction — it
+   printed negative `JPY Credit Interest` throughout the negative-
+   rate years, and a fee can be refunded.
+
+Three conventions behind the last source are user decisions rather
+than HMRC guidance, and are recorded here as such:
+
+- **External deposits are booked at spot** on the day they arrive.
+  The statements cannot show what the currency cost when it was
+  bought elsewhere, so the GBP value at the deposit date stands in
+  for the true acquisition cost — chosen so a pool is not left
+  permanently short of dollars that are plainly there.
+- **Transfers between the taxpayer's own accounts are ignored.**
+  Both legs appear (one per account) and the pools already span every
+  account, so they net to zero.
+- **Accrued interest reaches a pool by exactly one route.** The
+  statement's `Purchase / Sale Accrued Interest` lines are ordinary
+  interest cash events because the trade mapper never populates
+  `Trade.accrued_interest`. If a later change populates the trade
+  field, the cash-event mapper must start excluding those lines in
+  the same change — otherwise the accrued cash would hit the pool
+  twice (once through `from_bond_trade`, once as a cash event).
 
 The cashflow projection helpers live in
 [`src/ib_cgt/rules/fx_cashflow.py`](../src/ib_cgt/rules/fx_cashflow.py).
@@ -693,7 +730,7 @@ command sees the same inputs and the same engine behaviour.
 | `run_stock_engine(conn, fx, *, symbol, since, until)`      | One `StockEngineRun` per stock, cross-account, soft-residual mode.                              |
 | `run_bond_engine(conn, fx, *, symbol, since, until)`       | One `BondEngineRun` per bond (sealed `BondResult` union), soft-residual mode.                   |
 | `run_future_engine(conn, fx, *, symbol, account_id, …)`    | One `FutureEngineRun` per contract, GBP contracts included.                                     |
-| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP futures trades, futures realisations, dividends, coupons, provenance map, pool list. |
+| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP bond / non-GBP futures trades, futures realisations, dividends, coupons, cash events, provenance map, pool list. |
 | `run_fx_engine(conn, fx, *, future_runs, currency, …)`     | One `FXEngineRun` per non-GBP pool; runs its own futures pass when none is supplied.            |
 | `run_engines(conn, fx)`                                    | The whole-history pass: futures → stocks → bonds → FX.                                          |
 
@@ -712,13 +749,51 @@ relative to FX is immaterial; FX is a pure sink.
 
 **Synthetic ids and provenance.** Non-trade FX cashflows get
 integer ids from disjoint high ranges — realisations from
-`10**12`, dividends from `2 * 10**12`, coupons from `3 * 10**12`
-— allocated in a deterministic order (futures in `list_futures`
-order and engine emit order, then dividends and coupons by
-currency and pay date). `FXInputs.sources` maps every synthetic
-id to a `FutureRealisationRef` / `DividendRef` / `BondCouponRef`
-(`ib_cgt.domain.fx_events`), which is how the audit output prints
-`P&L #A→#B`, `Div #N`, `WHT #N` and `Cpn #N` instead of the ids.
+`10**12`, dividends from `2 * 10**12`, coupons from `3 * 10**12`,
+cash events from `4 * 10**12` — allocated in a deterministic order
+(futures in `list_futures` order and engine emit order, then
+dividends, coupons and cash events by currency and date).
+`FXInputs.sources` maps every synthetic id to a
+`FutureRealisationRef` / `DividendRef` / `BondCouponRef` /
+`CashEventRef` (`ib_cgt.domain.fx_events`), which is how the audit
+output prints `P&L #A→#B`, `Div #N`, `WHT #N`, `Cpn #N` and
+`Cash #N` instead of the ids. Bond trades, like stock trades, carry
+their real `trades` ids and need no provenance entry.
+
+## Open positions and residuals
+
+Since the matching engines run in soft-residual mode, a disposal
+with nothing to match against — a sale of shares bought before the
+earliest statement, a short still open, a futures contract opened
+but never closed — no longer stops a run. What decides whether such
+a residual is *fine* or a *data gap* is the broker's own view of the
+book: the Open Positions section of each account's latest statement
+([`docs/db/statement_positions.md`](db/statement_positions.md)).
+
+`ib_cgt.calculator.positions.reconcile_positions` nets every
+account's trades up to its latest statement's `period_end`
+(`TradeRepo.signed_quantity_by_instrument`) and compares the result
+with that statement's positions, **summed across accounts**. UK CGT
+pools are per taxpayer, and IB position transfers between the
+taxpayer's own accounts are not trades and are never ingested, so a
+per-account comparison would flag every transferred holding twice;
+the taxpayer-level totals are what the pools see. Each instrument
+gets one `PositionReconciliation` whose status is:
+
+| Status             | Meaning                                                                                   |
+|--------------------|-------------------------------------------------------------------------------------------|
+| `match`            | Both totals agree — including two accounts whose legs net to zero, or a flat instrument no statement lists. |
+| `mismatch`         | Both sides carry a quantity and they differ.                                              |
+| `not_on_statement` | The trades net to a non-zero holding no latest statement lists (a sale never ingested, an over-sold stock, a futures OPEN whose contract the statement no longer carries). |
+| `no_trades`        | A statement lists a holding the trades never built (bought before the earliest statement — cost basis unknown). |
+
+Check **C7** reports every non-`match` row (ERROR severity) and the
+tax-year calculator will turn the same rows into `position_mismatch`
+issues. A residual the statement *confirms* — an open short it lists,
+an open futures contract it lists — is not a gap. FX pools are never
+reconciled: the earliest statement is the origin of every pool and
+pre-history balances are unknowable by design, so an FX residual is
+only ever a warning.
 
 ## What's not implemented yet
 

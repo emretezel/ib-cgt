@@ -24,16 +24,22 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
+from typing import Final
 
 from ib_cgt.db.connection import transaction
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo
+from ib_cgt.db.repos.cash_events import CashEventRepo
 from ib_cgt.db.repos.dividends import DividendRepo
+from ib_cgt.db.repos.instruments import InstrumentRepo
+from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
-from ib_cgt.domain import Account, BondInstrument, Trade
+from ib_cgt.domain import Account, AssetClass, BondInstrument, StatementPosition, Trade
 from ib_cgt.ingest.bond_coupons import map_bond_coupons
+from ib_cgt.ingest.cash_events import map_cash_events
 from ib_cgt.ingest.corporate_actions import (
     FXConverter,
     map_bond_maturities,
@@ -42,7 +48,8 @@ from ib_cgt.ingest.corporate_actions import (
 from ib_cgt.ingest.dividends import map_dividends
 from ib_cgt.ingest.hashing import compute_statement_hash
 from ib_cgt.ingest.mapper import map_rows
-from ib_cgt.ingest.parser import parse_statement
+from ib_cgt.ingest.parser import RawOpenPositionRow, parse_statement
+from ib_cgt.ingest.positions import map_open_positions
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -113,7 +120,13 @@ class IngestResult:
     dividends_inserted: int = 0
     bond_coupon_count: int = 0
     bond_coupons_inserted: int = 0
+    position_count: int = 0
+    positions_inserted: int = 0
+    unresolved_position_symbols: tuple[str, ...] = ()
+    cash_event_count: int = 0
+    cash_events_inserted: int = 0
     replaced: bool = False
+    withdrawn_statement_count: int = 0
 
 
 def ingest_statement(
@@ -223,15 +236,29 @@ def ingest_statement(
     # enumerates from zero.
     dividends = map_dividends(parsed)
 
-    # Bond coupon payments — sixth FX-cashflow source per CG78315.
+    # Bond coupon payments — an FX-cashflow source per CG78315.
     # Same independence: own table, own row-index space, mapper
     # silently skips non-coupon rows in the Interest section.
     bond_coupons = map_bond_coupons(parsed)
+
+    # Instrument-less cash movements — broker interest, external
+    # transfers, fees — the remaining CG78315 sources. The cash-event
+    # mapper takes what the coupon mapper leaves of the Interest
+    # section, so the two never double-count a row.
+    cash_events = map_cash_events(parsed)
+
+    # Open positions on the period's last day. Rows the statement's own
+    # instrument-information section cannot resolve (held-over futures
+    # on legacy vintages) are resolved below against instruments already
+    # in the DB — including the ones this very ingest is about to add.
+    positions, leftover_position_rows = map_open_positions(parsed)
 
     accounts = AccountRepo(conn)
     trade_repo = TradeRepo(conn)
     dividend_repo = DividendRepo(conn)
     bond_coupon_repo = BondCouponRepo(conn)
+    cash_event_repo = CashEventRepo(conn)
+    position_repo = StatementPositionRepo(conn)
 
     # One transaction for everything the parser produced. `transaction()`
     # issues COMMIT on successful exit and ROLLBACK on exception, which
@@ -241,25 +268,34 @@ def ingest_statement(
     # prior-row delete also lives inside this transaction so a failure
     # between the delete and the re-insert leaves the DB exactly as it
     # was before the call.
+    withdrawn = 0
     with transaction(conn):
         if prior_existed and replace:
-            # Migration 004 made `trades.source_statement_hash`
-            # ON DELETE CASCADE, migration 009 set the same cascade
-            # on `dividends.source_statement_hash`, and migration 012
-            # extends it to `bond_coupons.source_statement_hash`.
-            # Removing the `statements` row therefore atomically
-            # removes every trade, dividend, and coupon that pointed
-            # at it.
+            # Every dependent table's `source_statement_hash` is
+            # ON DELETE CASCADE (migrations 004, 009, 012, 016, 017), so
+            # removing the `statements` row atomically removes every
+            # trade, dividend, coupon, position and cash event that
+            # pointed at it.
             conn.execute(
                 "DELETE FROM statements WHERE statement_hash = ?",
                 (statement_hash,),
             )
         accounts.upsert(Account(account_id=parsed.account_id))
+        if replace:
+            # A re-downloaded statement has new bytes (a new hash) but
+            # is the same statement: withdraw the earlier version at
+            # the same path so its trades don't sit beside the new
+            # ones. Same cascade as above.
+            withdrawn = statements.delete_by_path(
+                parsed.account_id, str(path), except_hash=statement_hash
+            )
         statements.record(
             statement_hash=statement_hash,
             source_path=str(path),
             account_id=parsed.account_id,
             trade_count=len(trades),
+            period_start=parsed.period_start,
+            period_end=parsed.period_end,
         )
         inserted = trade_repo.insert_many(
             trades,
@@ -271,6 +307,20 @@ def ingest_statement(
         )
         bond_coupons_inserted = bond_coupon_repo.insert_many(
             bond_coupons,
+            source_statement_hash=statement_hash,
+        )
+        cash_events_inserted = cash_event_repo.insert_many(
+            cash_events,
+            source_statement_hash=statement_hash,
+        )
+        # Positions last: the trades above may have created the very
+        # instrument rows a leftover position resolves against.
+        resolved_leftovers, unresolved = _resolve_leftover_positions(
+            leftover_position_rows, parsed.account_id, InstrumentRepo(conn)
+        )
+        all_positions = positions + resolved_leftovers
+        positions_inserted = position_repo.insert_many(
+            all_positions,
             source_statement_hash=statement_hash,
         )
 
@@ -285,10 +335,66 @@ def ingest_statement(
         dividends_inserted=dividends_inserted,
         bond_coupon_count=len(bond_coupons),
         bond_coupons_inserted=bond_coupons_inserted,
+        position_count=len(all_positions),
+        positions_inserted=positions_inserted,
+        unresolved_position_symbols=tuple(row.symbol for row in unresolved),
+        cash_event_count=len(cash_events),
+        cash_events_inserted=cash_events_inserted,
         inserted_count=inserted,
         already_imported=False,
         replaced=prior_existed and replace,
+        withdrawn_statement_count=withdrawn,
     )
+
+
+def _resolve_leftover_positions(
+    leftovers: list[RawOpenPositionRow],
+    account_id: str,
+    instruments: InstrumentRepo,
+) -> tuple[list[StatementPosition], list[RawOpenPositionRow]]:
+    """Resolve position rows the statement's own instrument table could not.
+
+    A futures contract held over a year end appears in the Open
+    Positions section of a legacy statement that lacks an instrument-
+    information row for it, because it was not traded in that period.
+    The contract was traded — and so stored — in an earlier statement,
+    so a `(symbol, currency)` lookup against `future_instruments`
+    finds it. Exactly one hit resolves the row; none or several (the
+    same root symbol on two expiries) leave it unresolved, and the
+    caller reports the symbol rather than guessing.
+    """
+    resolved: list[StatementPosition] = []
+    unresolved: list[RawOpenPositionRow] = []
+    for raw in leftovers:
+        asset_class = _POSITION_ASSET_CLASSES.get(raw.asset_class)
+        hits = (
+            instruments.find_by_symbol(asset_class, raw.symbol, raw.currency)
+            if asset_class is not None
+            else []
+        )
+        if len(hits) != 1:
+            unresolved.append(raw)
+            continue
+        _iid, instrument = hits[0]
+        resolved.append(
+            StatementPosition(
+                account_id=account_id,
+                instrument=instrument,
+                quantity=Decimal(raw.quantity_text.replace(",", "")),
+            )
+        )
+    return resolved, unresolved
+
+
+# Open Positions section labels → the asset class whose child table a
+# leftover row is resolved against. Options never reach here (the
+# parser drops them) and FX has no positions section.
+_POSITION_ASSET_CLASSES: Final[dict[str, AssetClass]] = {
+    "Stocks": AssetClass.STOCK,
+    "Bonds": AssetClass.BOND,
+    "Corporate and Municipal Bonds": AssetClass.BOND,
+    "Futures": AssetClass.FUTURE,
+}
 
 
 def _filter_maturities_with_known_instruments(

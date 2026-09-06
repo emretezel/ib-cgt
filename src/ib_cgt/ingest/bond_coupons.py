@@ -1,6 +1,6 @@
 """Synthesize `BondCoupon` objects from IB statement Interest rows.
 
-The parser emits one `RawInterestRow` per row across the
+The parser emits one `RawCashRow` per row across the
 `tblCombInt_*` sections. Most of those rows are broker debit /
 credit interest accruals — out of scope here. This module is the
 business-rules half: filter to rows whose description matches the
@@ -43,7 +43,7 @@ from ib_cgt.ingest.mapper import (
     _canonicalise_gilt_symbol,
     resolve_bond_info,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo, RawInterestRow
+from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawInstrumentInfo
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,6 +60,21 @@ _COUPON_DESCRIPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"^Bond Coupon Payment \((?P<symbol>.+?)\s*-\s*(?P<long_desc>.+)\)\s*$"
 )
 
+# The section label the parser stamps on Interest-section rows — keep
+# in lockstep with `parser._CASH_SECTION_DIV_PREFIXES`.
+_SECTION_INTEREST: Final = "interest"
+
+
+def is_coupon_description(description: str) -> bool:
+    """True iff an Interest-section description is a bond coupon payment.
+
+    Shared with `ingest/cash_events.py`, which must leave coupon rows
+    to this module: the two mappers partition the Interest section
+    between them, and this predicate is the single definition of the
+    boundary.
+    """
+    return _COUPON_DESCRIPTION_RE.match(description) is not None
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -70,10 +85,10 @@ def map_bond_coupons(parsed: ParsedStatement) -> list[BondCoupon]:
     """Translate every Interest-section coupon row into a `BondCoupon`.
 
     Args:
-        parsed: Output of `parser.parse_statement`. Both
-            `parsed.interest` (the source rows) and
-            `parsed.instruments` (used to resolve each coupon to an
-            ISIN) are consulted.
+        parsed: Output of `parser.parse_statement`. Both the
+            Interest-section rows of `parsed.cash_rows` (the source
+            rows) and `parsed.instruments` (used to resolve each
+            coupon to an ISIN) are consulted.
 
     Returns:
         A list of `BondCoupon` objects in the order they appeared in
@@ -95,7 +110,9 @@ def map_bond_coupons(parsed: ParsedStatement) -> list[BondCoupon]:
     }
 
     out: list[BondCoupon] = []
-    for raw in parsed.interest:
+    for raw in parsed.cash_rows:
+        if raw.section != _SECTION_INTEREST:
+            continue
         coupon = _try_synthesize(raw, parsed.account_id, info_by_symbol)
         if coupon is not None:
             out.append(coupon)
@@ -108,7 +125,7 @@ def map_bond_coupons(parsed: ParsedStatement) -> list[BondCoupon]:
 
 
 def _try_synthesize(
-    raw: RawInterestRow,
+    raw: RawCashRow,
     account_id: str,
     info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
 ) -> BondCoupon | None:
@@ -195,4 +212,4 @@ def _parse_decimal(text: str, description: str) -> Decimal:
         ) from exc
 
 
-__all__ = ["map_bond_coupons"]
+__all__ = ["is_coupon_description", "map_bond_coupons"]

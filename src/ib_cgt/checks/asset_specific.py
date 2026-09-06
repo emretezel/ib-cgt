@@ -18,6 +18,10 @@ Each Tier C invariant is anchored to one rule engine:
   usually an ingestion gap).
 * **C6** — every bond instrument runs cleanly under
   `BondRuleEngine.compute` (the bond twin of C1).
+* **C7** — every stock / bond / future position the trades imply
+  matches the account's latest statement, and every statement
+  position is backed by trades (the calculator's reconciliation,
+  run standalone).
 
 C1 and C6 catch engine-time exceptions; the others are pure
 post-conditions the engines should already enforce. Tier C is
@@ -34,6 +38,7 @@ from datetime import date as date_cls
 from decimal import Decimal
 from typing import Final
 
+from ib_cgt.calculator.positions import PositionStatus
 from ib_cgt.calculator.runs import BondEngineRun, StockEngineRun
 from ib_cgt.checks.framework import (
     CheckContext,
@@ -374,5 +379,57 @@ def _check_futures_open_past_expiry(ctx: CheckContext) -> Finding:
     return Finding(
         triggered=True,
         detail=f"{len(bad)} expired futures contract(s) with open positions",
+        evidence=_truncate(bad),
+    )
+
+
+# ---------------------------------------------------------------------------
+# C7 — trade-derived positions reconcile with the latest statement
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C7",
+    description=(
+        "every stock/bond/future position implied by the trades matches the latest "
+        "statement's open positions, and every statement position is backed by trades"
+    ),
+    tier=Tier.C,
+    scopes={Scope.ALL, Scope.STOCKS, Scope.FUTURES},
+    severity=Severity.ERROR,
+)
+def _check_positions_reconcile(ctx: CheckContext) -> Finding:
+    """Report every instrument whose trades and latest statements disagree.
+
+    The same reconciliation `compute` turns into `position_mismatch`
+    issues, run standalone so a data gap is visible before any tax
+    year is computed. The comparison is per taxpayer (totals across
+    accounts, each as of its own latest statement) so a holding
+    moved between the user's own accounts does not show up twice.
+    Each evidence row names the instrument, both totals and the
+    per-account breakdown so the operator can see at once which
+    side is short.
+    """
+    bad: list[Mapping[str, object]] = []
+    for rec in ctx.position_reconciliations():
+        if rec.status is PositionStatus.MATCH:
+            continue
+        bad.append(
+            {
+                "instrument": rec.instrument.symbol,
+                "currency": rec.instrument.currency,
+                "status": rec.status.value,
+                "trade_qty": str(rec.trade_quantity),
+                "statement_qty": (
+                    str(rec.statement_quantity) if rec.statement_quantity is not None else None
+                ),
+                "accounts": rec.describe_accounts(),
+            }
+        )
+    if not bad:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} position(s) disagree with the latest statement",
         evidence=_truncate(bad),
     )

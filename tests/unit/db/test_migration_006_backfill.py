@@ -20,6 +20,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from importlib.resources import files
 
 import pytest
@@ -27,6 +28,7 @@ import pytest
 from ib_cgt.db import AccountRepo, StatementRepo, apply_migrations, open_memory_connection
 from ib_cgt.db.migrator import _apply_one, _ensure_bookkeeping_table
 from ib_cgt.domain import Account
+from tests.unit.db.legacy_schema import insert_legacy_statement
 
 
 def _seed_account_and_statement(
@@ -42,6 +44,8 @@ def _seed_account_and_statement(
         source_path="/tmp/stmt.html",
         account_id=account_id,
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
 
@@ -138,18 +142,17 @@ def test_backfill_assigns_dense_zero_based_indices_per_statement() -> None:
 
     # Seed parents — both statements share one account.
     AccountRepo(conn).upsert(Account(account_id="U1"))
-    repo = StatementRepo(conn)
-    repo.record(
+    insert_legacy_statement(
+        conn,
         statement_hash="hash-a",
         source_path="/tmp/a.html",
         account_id="U1",
-        trade_count=0,
     )
-    repo.record(
+    insert_legacy_statement(
+        conn,
         statement_hash="hash-b",
         source_path="/tmp/b.html",
         account_id="U1",
-        trade_count=0,
     )
     iid = _seed_instrument(conn)
 

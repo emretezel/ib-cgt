@@ -27,6 +27,7 @@ import pytest
 from ib_cgt.db import (
     AccountRepo,
     FXRateRepo,
+    StatementPositionRepo,
     StatementRepo,
     TradeRepo,
     apply_migrations,
@@ -36,6 +37,7 @@ from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import (
     Account,
     Money,
+    StatementPosition,
     StockInstrument,
     Trade,
     TradeAction,
@@ -59,6 +61,8 @@ def _seed_baseline(conn: sqlite3.Connection) -> None:
         source_path="/tmp/stmt.html",
         account_id="U1004320",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     isf = StockInstrument(symbol="ISF", currency="GBP")
     aapl = StockInstrument(symbol="AAPL", currency="USD")
@@ -122,6 +126,14 @@ def _seed_baseline(conn: sqlite3.Connection) -> None:
         ),
     ]
     TradeRepo(conn).insert_many(trades, source_statement_hash="hash-a")
+    # The statement for U1004320 still lists the 10 AAPL that account
+    # bought on 1 April (the 20 April sale came out of U10049818), so
+    # the trade-derived position reconciles (check C7). U10049818 has
+    # no statement of its own and is therefore not reconciled at all.
+    StatementPositionRepo(conn).insert_many(
+        [StatementPosition(account_id="U1004320", instrument=aapl, quantity=Decimal("10"))],
+        source_statement_hash="hash-a",
+    )
 
     # FX cache: GBP/USD = 1.27 across the whole window.
     rates: list[FXRate] = []

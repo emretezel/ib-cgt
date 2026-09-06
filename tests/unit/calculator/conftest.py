@@ -182,6 +182,8 @@ def seed_accounts_and_statement(conn: sqlite3.Connection) -> None:
         source_path="/tmp/calc.htm",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
 

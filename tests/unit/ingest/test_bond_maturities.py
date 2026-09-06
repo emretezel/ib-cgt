@@ -82,6 +82,8 @@ def _make(
 ) -> ParsedStatement:
     return ParsedStatement(
         account_id="U9999998",
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
         trades=(),
         instruments=tuple(instruments or []),
         corporate_actions=tuple(rows),

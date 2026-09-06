@@ -80,6 +80,7 @@ from ib_cgt.domain import (
     AnyInstrument,
     BondCouponRef,
     BondInstrument,
+    CashEventRef,
     DirectAcquisition,
     DividendKind,
     DividendRef,
@@ -217,6 +218,8 @@ _RESET_TABLES_DATA: tuple[str, ...] = (
     "trades",
     "dividends",
     "bond_coupons",
+    "cash_events",
+    "statement_positions",
     "statements",
     "instruments",  # cascades to {stock,bond,future,fx}_instruments
     "accounts",
@@ -343,9 +346,13 @@ def ingest(
             "-r",
             help=(
                 "If this statement was already imported, delete the prior "
-                "import (cascading to its trades) and re-ingest fresh. "
-                "Useful during development when the parser or mapper "
-                "changes and you want to re-process a fixture."
+                "import (cascading to its trades, dividends, coupons, cash "
+                "events and open positions) and re-ingest fresh. Also "
+                "withdraws any earlier import of a *different* file at the "
+                "same path, so a re-downloaded statement replaces the old "
+                "version instead of sitting beside it. Useful during "
+                "development when the parser or mapper changes and you "
+                "want to re-process a fixture."
             ),
         ),
     ] = False,
@@ -410,7 +417,27 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
         summary += (
             f"; {result.bond_coupons_inserted} new / {result.bond_coupon_count} bond coupon{plural}"
         )
+    if result.cash_event_count:
+        plural = "" if result.cash_event_count == 1 else "s"
+        summary += (
+            f"; {result.cash_events_inserted} new / {result.cash_event_count} cash event{plural}"
+        )
+    if result.position_count:
+        plural = "" if result.position_count == 1 else "s"
+        summary += f"; {result.position_count} open position{plural}"
+    if result.withdrawn_statement_count:
+        plural = "" if result.withdrawn_statement_count == 1 else "s"
+        summary += (
+            f"; withdrew {result.withdrawn_statement_count} earlier version{plural} "
+            "of this statement"
+        )
     _console.print(summary + ".")
+    if result.unresolved_position_symbols:
+        symbols = ", ".join(result.unresolved_position_symbols)
+        _console.print(
+            f"[yellow]Skipped {len(result.unresolved_position_symbols)} open position(s) "
+            f"with no resolvable instrument: {symbols}[/]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1515,8 @@ def _build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
         out[tid] = f"forex {trade.instrument.symbol} {trade.action.value}"
     for tid, trade in inputs.stock_trades:
         out[tid] = f"stock {trade.instrument.symbol} {trade.action.value}"
+    for tid, trade in inputs.bond_trades:
+        out[tid] = f"bond {trade.instrument.symbol} {trade.action.value}"
     for tid, trade in inputs.future_trades:
         out[tid] = f"futures fee {trade.instrument.symbol} {trade.action.value}"
     for synth_id, realisation, _account in inputs.future_realisations:
@@ -1500,6 +1529,8 @@ def _build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
         out[synth_id] = f"dividend {dividend.instrument.symbol} {dividend.kind.value}"
     for synth_id, coupon in inputs.bond_coupons:
         out[synth_id] = f"bond coupon {coupon.instrument.symbol}"
+    for synth_id, event in inputs.cash_events:
+        out[synth_id] = f"{event.kind.value}: {event.description}"
     return out
 
 
@@ -1517,6 +1548,8 @@ def _build_fx_event_date_map(inputs: FXInputs) -> dict[int, date]:
         out[tid] = trade.trade_date
     for tid, trade in inputs.stock_trades:
         out[tid] = trade.trade_date
+    for tid, trade in inputs.bond_trades:
+        out[tid] = trade.trade_date
     for tid, trade in inputs.future_trades:
         out[tid] = trade.trade_date
     for synth_id, realisation, _account in inputs.future_realisations:
@@ -1525,6 +1558,8 @@ def _build_fx_event_date_map(inputs: FXInputs) -> dict[int, date]:
         out[synth_id] = dividend.pay_date
     for synth_id, coupon in inputs.bond_coupons:
         out[synth_id] = coupon.pay_date
+    for synth_id, event in inputs.cash_events:
+        out[synth_id] = event.value_date
     return out
 
 
@@ -1538,11 +1573,12 @@ def _build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
     between runs and aren't citeable, so the renderer never exposes
     them.
 
-    Dividend and coupon events follow the same principle: the
+    Dividend, coupon and cash events follow the same principle: the
     synthetic id is internal plumbing; the user-facing label carries
     the real row id recovered from `inputs.sources` (`Div #N` for
     cash dividends and payment-in-lieu, `WHT #N` for withholding
-    tax, `Cpn #N` for bond coupons).
+    tax, `Cpn #N` for bond coupons, `Cash #N` for interest / transfer
+    / fee rows).
 
     Multi-slice closeouts: when a single close trade drains
     several open slices, multiple realisations share the same
@@ -1553,9 +1589,7 @@ def _build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
     case compact.
     """
     out: dict[int, str] = {}
-    for tid, _trade in inputs.forex_trades:
-        out[tid] = f"#{tid}"
-    for tid, _trade in inputs.stock_trades:
+    for tid, _trade in (*inputs.forex_trades, *inputs.stock_trades, *inputs.bond_trades):
         out[tid] = f"#{tid}"
     for tid, _trade in inputs.future_trades:
         out[tid] = f"#{tid}"
@@ -1589,6 +1623,10 @@ def _build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
         source = inputs.sources[synth_id]
         real_id = source.bond_coupon_id if isinstance(source, BondCouponRef) else synth_id
         out[synth_id] = f"Cpn #{real_id}"
+    for synth_id, _event in inputs.cash_events:
+        source = inputs.sources[synth_id]
+        real_id = source.cash_event_id if isinstance(source, CashEventRef) else synth_id
+        out[synth_id] = f"Cash #{real_id}"
     return out
 
 

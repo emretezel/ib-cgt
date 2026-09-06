@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -93,7 +94,8 @@ def test_parse_raises_when_no_account_and_no_trades() -> None:
 
 def test_parse_title_fallback() -> None:
     html = (
-        b"<html><head><title>U1234567 Activity Statement 2024</title></head>"
+        b"<html><head><title>U1234567 Activity Statement "
+        b"April 6, 2024 - April 5, 2025</title></head>"
         b"<body>no tables</body></html>"
     )
     parsed = parse_statement(html)
@@ -146,7 +148,7 @@ def test_parse_skips_options_with_custodian_suffix() -> None:
         "Limited carried by Interactive Brokers LLC"
     )
     html = f"""<html>
-    <head><title>U5555556 Activity Statement 2018</title></head>
+    <head><title>U5555556 Activity Statement April 6, 2018 - April 5, 2019</title></head>
     <body>
     <div id="tblAccountInfo_U5555556Body">
     <table><tr><td>Account</td><td>U5555556</td></tr></table>
@@ -224,7 +226,7 @@ def test_parse_corporate_actions_normalises_asset_class() -> None:
         "FOO(US0000004444) Merged(Acquisition) for USD 5.00 per Share (FOO, FOO INC, US0000004444)"
     )
     html = f"""<html>
-    <head><title>U5555557 Activity Statement 2018</title></head>
+    <head><title>U5555557 Activity Statement April 6, 2018 - April 5, 2019</title></head>
     <body>
     <div id="tblAccountInfo_U5555557Body">
     <table><tr><td>Account</td><td>U5555557</td></tr></table>
@@ -259,7 +261,7 @@ def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
         "Stocks - Held with Interactive Brokers (U.K.) Limited carried by Interactive Brokers LLC"
     )
     html = f"""<html>
-    <head><title>U5555555 Activity Statement 2018</title></head>
+    <head><title>U5555555 Activity Statement April 6, 2018 - April 5, 2019</title></head>
     <body>
     <div id="tblAccountInfo_U5555555Body">
     <table><tr><td>Account</td><td>U5555555</td></tr></table>
@@ -283,3 +285,184 @@ def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
     assert len(parsed.trades) == 1
     assert parsed.trades[0].asset_class == "Stocks"
     assert parsed.trades[0].symbol == "EOLU B"
+
+
+# ---------------------------------------------------------------------------
+# Statement period (from <title>)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_period_from_title() -> None:
+    """The inclusive period is read from the `<title>` date range."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    assert parsed.period_start == date(2025, 4, 7)
+    assert parsed.period_end == date(2026, 4, 3)
+
+
+def test_parse_period_from_fixture_without_ib_suffix() -> None:
+    """A title without the trailing `- Interactive Brokers` still parses."""
+    parsed = parse_statement(_load("mixed_tiny.htm"))
+    assert parsed.period_start == date(2024, 4, 8)
+    assert parsed.period_end == date(2025, 4, 4)
+
+
+def test_parse_rejects_title_without_period() -> None:
+    """No date range in the title → `StatementParseError`, not a guess."""
+    html = (
+        b"<html><head><title>U1234567 Activity Statement 2024</title></head>"
+        b"<body>no tables</body></html>"
+    )
+    with pytest.raises(StatementParseError, match="statement period"):
+        parse_statement(html)
+
+
+def test_parse_rejects_period_end_before_start() -> None:
+    """A back-to-front range is a corrupt title, not a valid period."""
+    html = (
+        b"<html><head><title>U1234567 Activity Statement "
+        b"April 5, 2025 - April 6, 2024</title></head>"
+        b"<body>no tables</body></html>"
+    )
+    with pytest.raises(StatementParseError):
+        parse_statement(html)
+
+
+# ---------------------------------------------------------------------------
+# Withholding tax under IB's real div id
+# ---------------------------------------------------------------------------
+
+
+def test_parse_withholding_tax_section_under_real_div_id() -> None:
+    """`tblWithholdingTax_<acct>Body` rows are tagged `withholding_tax`.
+
+    The parser originally keyed on the shorter `tblWithholding_` prefix,
+    which IB never emits — every withholding row was silently lost. The
+    fixture carries the real id.
+    """
+    parsed = parse_statement(_load("with_dividends.htm"))
+    wht = [row for row in parsed.dividends if row.section == "withholding_tax"]
+    assert len(wht) == 1
+    assert wht[0].currency == "USD"
+    assert wht[0].date_text == "2024-06-15"
+    assert wht[0].amount_text == "-4.50"
+    assert "US Tax" in wht[0].description
+    # The ordinary dividend rows are unaffected.
+    assert sum(1 for row in parsed.dividends if row.section == "dividends") == 3
+
+
+# ---------------------------------------------------------------------------
+# Open Positions section
+# ---------------------------------------------------------------------------
+
+
+def test_parse_open_positions_rows() -> None:
+    """Every stock / bond / futures row is emitted with its class and currency."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    rows = {(row.asset_class, row.symbol): row for row in parsed.open_positions}
+    assert set(rows) == {
+        ("Stocks", "IEAA"),
+        ("Stocks", "IEMI"),
+        ("Stocks", "TSLA"),
+        ("Bonds", "UKT 0 3/8 10/22/26"),
+        ("Futures", "6LK6"),
+        ("Futures", "CBK6"),
+    }
+    assert rows[("Stocks", "IEAA")].currency == "EUR"
+    assert rows[("Stocks", "IEMI")].currency == "USD"
+    assert rows[("Futures", "6LK6")].currency == "USD"
+
+
+def test_parse_open_positions_keeps_thousand_separators_and_sign() -> None:
+    """Quantities are emitted verbatim — the mapper normalises them."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    rows = {row.symbol: row for row in parsed.open_positions}
+    assert rows["IEAA"].quantity_text == "3,652"
+    assert rows["TSLA"].quantity_text == "-40"
+    assert rows["CBK6"].quantity_text == "-3"
+    assert rows["UKT 0 3/8 10/22/26"].quantity_text == "310,000"
+
+
+def test_parse_open_positions_splits_bond_symbol_cell() -> None:
+    """A bond cell `description<br/>symbol` yields the symbol as the last line."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    bond = next(row for row in parsed.open_positions if row.asset_class == "Bonds")
+    assert bond.symbol == "UKT 0 3/8 10/22/26"
+    assert bond.description == "United Kingdom Gilt UKT 0 3/8 10/22/26"
+    assert bond.currency == "GBP"
+    # Stocks and futures carry a bare symbol and no description.
+    assert all(row.description == "" for row in parsed.open_positions if row is not bond)
+
+
+def test_parse_open_positions_multiplier_is_optional() -> None:
+    """`Mult` is captured where present; the bonds sub-table has no such column."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    rows = {row.symbol: row for row in parsed.open_positions}
+    assert rows["6LK6"].multiplier_text == "100,000"
+    assert rows["IEMI"].multiplier_text == "1"
+
+
+def test_parse_open_positions_normalises_legacy_asset_label() -> None:
+    """`Stocks - Held with …` collapses to `Stocks` exactly as for trades."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    labels = {row.asset_class for row in parsed.open_positions}
+    assert labels == {"Stocks", "Bonds", "Futures"}
+
+
+def test_parse_open_positions_skips_options_subtotals_and_totals() -> None:
+    """Options rows, `subtotal` / `total` rows and the custodian header never surface."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    symbols = [row.symbol for row in parsed.open_positions]
+    assert "TUR 17MAY26 22.0 P" not in symbols
+    assert not any(symbol.startswith("Total") for symbol in symbols)
+    assert len(symbols) == 6
+
+
+def test_parse_open_positions_absent_section_yields_empty_tuple() -> None:
+    """A statement with nothing open (or an older fixture) has no rows."""
+    parsed = parse_statement(_load("mixed_tiny.htm"))
+    assert parsed.open_positions == ()
+
+
+# ---------------------------------------------------------------------------
+# Cash-shaped sections
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cash_rows_tagged_by_section() -> None:
+    """Interest, deposits/withdrawals and fees rows carry their section label."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    by_section: dict[str, list[str]] = {}
+    for row in parsed.cash_rows:
+        by_section.setdefault(row.section, []).append(row.description)
+    assert set(by_section) == {"interest", "deposits_withdrawals", "fees"}
+    assert len(by_section["interest"]) == 5
+    assert len(by_section["deposits_withdrawals"]) == 4
+    assert len(by_section["fees"]) == 2
+
+
+def test_parse_cash_rows_emit_order_is_section_then_document_order() -> None:
+    """Interest rows first, then deposits, then fees — the row-index space."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    sections = [row.section for row in parsed.cash_rows]
+    assert sections == ["interest"] * 5 + ["deposits_withdrawals"] * 4 + ["fees"] * 2
+
+
+def test_parse_cash_rows_keep_currency_sign_and_commas() -> None:
+    """Amounts are verbatim text; the currency comes from the header row."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    rows = {row.description: row for row in parsed.cash_rows}
+    jpy = rows["JPY Credit Interest for May-2025"]
+    assert jpy.currency == "JPY"
+    assert jpy.amount_text == "-15"
+    deposit = rows["Electronic Fund Transfer"]
+    assert deposit.currency == "USD"
+    assert deposit.amount_text == "50,000.00"
+    assert deposit.date_text == "2025-04-11"
+
+
+def test_parse_cash_rows_skip_asset_header_subtotal_and_total() -> None:
+    """The fees section's `Other Fees` header and the aggregate rows are dropped."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    descriptions = [row.description for row in parsed.cash_rows]
+    assert "Other Fees" not in descriptions
+    assert not any(text.startswith("Total") for text in descriptions)

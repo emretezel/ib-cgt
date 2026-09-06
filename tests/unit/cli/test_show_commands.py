@@ -84,6 +84,8 @@ def _seed_trades(conn: sqlite3.Connection) -> dict[str, int]:
         source_path="/tmp/U1.html",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
 
     isf = StockInstrument(symbol="ISF", currency="GBP")

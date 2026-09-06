@@ -22,6 +22,7 @@ from ib_cgt.cli import app
 from ib_cgt.db import (
     AccountRepo,
     FXRateRepo,
+    StatementPositionRepo,
     StatementRepo,
     TradeRepo,
     apply_migrations,
@@ -31,6 +32,7 @@ from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import (
     Account,
     Money,
+    StatementPosition,
     StockInstrument,
     Trade,
     TradeAction,
@@ -59,7 +61,12 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
         apply_migrations(conn)
         AccountRepo(conn).upsert(Account(account_id="U1"))
         StatementRepo(conn).record(
-            statement_hash="h", source_path="/tmp/x", account_id="U1", trade_count=0
+            statement_hash="h",
+            source_path="/tmp/x",
+            account_id="U1",
+            trade_count=0,
+            period_start=date(2024, 4, 6),
+            period_end=date(2025, 4, 5),
         )
         isf = StockInstrument(symbol="ISF", currency="GBP")
         aapl = StockInstrument(symbol="AAPL", currency="USD")
@@ -110,6 +117,12 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
                     fees=Money.of(Decimal("0"), "USD"),
                 ),
             ],
+            source_statement_hash="h",
+        )
+        # The statement still lists the 10 AAPL held on 5 April (sold on
+        # 20 April, after the period end), so C7 reconciles cleanly.
+        StatementPositionRepo(conn).insert_many(
+            [StatementPosition(account_id="U1", instrument=aapl, quantity=Decimal("10"))],
             source_statement_hash="h",
         )
         rates: list[FXRate] = []

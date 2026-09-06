@@ -42,6 +42,8 @@ def _seed(db: sqlite3.Connection) -> None:
         source_path="/fake",
         account_id="U1",
         trade_count=3,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     repo = TradeRepo(db)
     repo.insert_many(

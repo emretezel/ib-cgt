@@ -13,6 +13,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 import pytest
 
@@ -51,6 +52,8 @@ def test_kind_check_rejects_unknown_label(db: sqlite3.Connection) -> None:
         source_path="/tmp/s.htm",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     # Insert a stock instrument so the FK passes.
     db.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
@@ -77,6 +80,8 @@ def test_cascade_delete_on_statement_clears_dividends(db: sqlite3.Connection) ->
         source_path="/tmp/s.htm",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     db.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
     instrument_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])

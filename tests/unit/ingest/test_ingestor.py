@@ -15,8 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from ib_cgt.db import TradeRepo
-from ib_cgt.domain import Money
+from ib_cgt.db import (
+    CashEventRepo,
+    InstrumentRepo,
+    StatementPositionRepo,
+    StatementRepo,
+    TradeRepo,
+)
+from ib_cgt.domain import FutureInstrument, Money
 from ib_cgt.ingest.ingestor import ingest_statement
 
 
@@ -290,22 +296,27 @@ def test_reingest_bond_maturity_is_idempotent(db: sqlite3.Connection) -> None:
 def test_ingest_persists_dividends(db: sqlite3.Connection) -> None:
     """End-to-end: dividends fixture lands rows in the `dividends` table.
 
-    The fixture has 2 USD cash dividends and 1 EUR payment-in-lieu;
-    the parser → mapper → repo path must produce exactly those three
-    rows, distinguishable by `kind` and `currency`.
+    The fixture has 2 USD cash dividends, 1 EUR payment-in-lieu and
+    1 USD withholding-tax row (under IB's real `tblWithholdingTax_`
+    div id); the parser → mapper → repo path must produce exactly
+    those four rows, distinguishable by `kind` and `currency`. The
+    withholding row is parsed after the dividends section, so it has
+    the highest id and sorts last among the 15 June rows.
     """
     fixture = _FIXTURES / "with_dividends.htm"
     result = ingest_statement(fixture, db)
 
-    assert result.dividend_count == 3
-    assert result.dividends_inserted == 3
+    assert result.dividend_count == 4
+    assert result.dividends_inserted == 4
     rows = db.execute(
-        "SELECT kind, currency, amount_native FROM dividends ORDER BY pay_date"
+        "SELECT kind, currency, amount_native FROM dividends ORDER BY pay_date, dividend_id"
     ).fetchall()
     kinds = [r["kind"] for r in rows]
     currencies = [r["currency"] for r in rows]
-    assert kinds == ["cash_dividend", "payment_in_lieu", "cash_dividend"]
-    assert currencies == ["USD", "EUR", "USD"]
+    assert kinds == ["cash_dividend", "withholding_tax", "payment_in_lieu", "cash_dividend"]
+    assert currencies == ["USD", "USD", "EUR", "USD"]
+    # Withholding rows store the absolute amount; direction lives in `kind`.
+    assert rows[1]["amount_native"] == "4.50"
 
 
 def test_reingest_dividends_idempotent(db: sqlite3.Connection) -> None:
@@ -325,7 +336,7 @@ def test_replace_cascades_to_dividends(db: sqlite3.Connection) -> None:
     fixture = _FIXTURES / "with_dividends.htm"
     ingest_statement(fixture, db)
     n_before = db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"]
-    assert n_before == 3
+    assert n_before == 4
     result = ingest_statement(fixture, db, replace=True)
     assert result.replaced is True
     n_after = db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"]
@@ -379,3 +390,153 @@ def test_reingest_with_replace_replays_merger_trade(db: sqlite3.Connection) -> N
         )
     )
     assert second_indices == first_indices
+
+
+# ---------------------------------------------------------------------------
+# Statement period, open positions and cash events
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_records_statement_period(db: sqlite3.Connection) -> None:
+    """The `<title>` period lands on the `statements` row."""
+    result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
+    row = StatementRepo(db).get(result.statement_hash)
+    assert row is not None
+    assert row.period_start == date(2025, 4, 7)
+    assert row.period_end == date(2026, 4, 3)
+    assert row.account_id == "U9999996"
+
+
+def test_ingest_persists_open_positions_and_cash_events(db: sqlite3.Connection) -> None:
+    """Positions and cash events land in their tables; the unresolved row is reported.
+
+    The fixture lists six positions, one of which (`CBK6`) has no
+    instrument-information row and no prior contract in the DB, so it
+    is reported rather than stored. The eight non-coupon, non-internal
+    cash rows become cash events; the coupon goes to `bond_coupons`.
+    """
+    result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
+
+    assert result.position_count == 5
+    assert result.positions_inserted == 5
+    assert result.unresolved_position_symbols == ("CBK6",)
+    assert result.cash_event_count == 8
+    assert result.cash_events_inserted == 8
+    assert result.bond_coupon_count == 1
+    assert result.withdrawn_statement_count == 0
+
+    positions = StatementPositionRepo(db).for_statement(result.statement_hash)
+    assert [(p.instrument.symbol, str(p.quantity)) for _iid, p in positions] == [
+        ("IEAA", "3652"),
+        ("IEMI", "100"),
+        ("TSLA", "-40"),
+        ("UKT 0 3/8 10/22/26", "310000"),
+        ("6LK6", "6"),
+    ]
+    assert all(p.account_id == "U9999996" for _iid, p in positions)
+
+    events = CashEventRepo(db)
+    assert events.count() == 8
+    assert events.distinct_currencies() == ["GBP", "JPY", "USD"]
+    usd = [event for _id, event in events.for_currency("USD")]
+    assert [(e.kind.value, str(e.amount.amount)) for e in usd] == [
+        ("transfer", "50000.00"),
+        ("interest", "12.34"),
+        ("interest", "-3.21"),
+        ("transfer", "2.50"),
+        ("fee", "-1.50"),
+    ]
+
+
+def test_leftover_future_position_resolves_against_known_contract(
+    db: sqlite3.Connection,
+) -> None:
+    """A held-over contract with no FII row resolves via `future_instruments`."""
+    cbk6 = FutureInstrument(
+        symbol="CBK6",
+        currency="USD",
+        contract_multiplier=Decimal("1000"),
+        expiry_date=date(2026, 5, 15),
+    )
+    InstrumentRepo(db).upsert(cbk6)
+
+    result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
+
+    assert result.position_count == 6
+    assert result.unresolved_position_symbols == ()
+    positions = StatementPositionRepo(db).for_statement(result.statement_hash)
+    cbk6_rows = [p for _iid, p in positions if p.instrument.symbol == "CBK6"]
+    assert len(cbk6_rows) == 1
+    assert cbk6_rows[0].instrument == cbk6
+    assert cbk6_rows[0].quantity == Decimal("-3")
+
+
+def test_ambiguous_leftover_future_position_stays_unresolved(db: sqlite3.Connection) -> None:
+    """Two stored contracts sharing the symbol → the row is reported, not guessed."""
+    repo = InstrumentRepo(db)
+    for expiry in (date(2026, 5, 15), date(2027, 5, 14)):
+        repo.upsert(
+            FutureInstrument(
+                symbol="CBK6",
+                currency="USD",
+                contract_multiplier=Decimal("1000"),
+                expiry_date=expiry,
+            )
+        )
+    result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
+    assert result.position_count == 5
+    assert result.unresolved_position_symbols == ("CBK6",)
+
+
+def test_reingest_positions_and_cash_events_idempotent(db: sqlite3.Connection) -> None:
+    fixture = _FIXTURES / "with_open_positions.htm"
+    first = ingest_statement(fixture, db)
+    second = ingest_statement(fixture, db, replace=True)
+    assert second.replaced is True
+    assert StatementPositionRepo(db).count() == first.position_count
+    assert CashEventRepo(db).count() == first.cash_event_count
+
+
+def test_replace_withdraws_earlier_version_at_same_path(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A re-downloaded statement (new bytes, same path) replaces the old one.
+
+    Without `replace` the new hash would be added beside the old
+    import and check A10 would only warn; with it the earlier version
+    at the same path is withdrawn inside the same transaction.
+    """
+    original = (_FIXTURES / "with_open_positions.htm").read_bytes()
+    path = tmp_path / "25_26.htm"
+    path.write_bytes(original)
+    first = ingest_statement(path, db)
+
+    path.write_bytes(original.replace(b"</body>", b"<!-- re-downloaded -->\n</body>"))
+    second = ingest_statement(path, db, replace=True)
+
+    assert second.statement_hash != first.statement_hash
+    assert second.replaced is False  # no prior import of *this* hash
+    assert second.withdrawn_statement_count == 1
+    rows = db.execute(
+        "SELECT statement_hash FROM statements WHERE source_path = ?", (str(path),)
+    ).fetchall()
+    assert [r["statement_hash"] for r in rows] == [second.statement_hash]
+    # The old statement's dependents went with it — no duplicates.
+    assert TradeRepo(db).count() == second.trade_count
+    assert StatementPositionRepo(db).count() == second.position_count
+    assert CashEventRepo(db).count() == second.cash_event_count
+
+
+def test_modified_file_without_replace_is_added_beside_the_old_import(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The historical behaviour is unchanged without the flag (A10 catches it)."""
+    original = (_FIXTURES / "with_open_positions.htm").read_bytes()
+    path = tmp_path / "25_26.htm"
+    path.write_bytes(original)
+    ingest_statement(path, db)
+    path.write_bytes(original.replace(b"</body>", b"<!-- re-downloaded -->\n</body>"))
+    second = ingest_statement(path, db)
+    assert second.withdrawn_statement_count == 0
+    n = db.execute("SELECT COUNT(*) AS n FROM statements WHERE source_path = ?", (str(path),))
+    assert n.fetchone()["n"] == 2

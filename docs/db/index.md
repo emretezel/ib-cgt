@@ -24,7 +24,7 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`14`** (`001_initial.sql` through `014_bond_instruments_isin_natural_key.sql`
+`17`** (`001_initial.sql` through `017_cash_events.sql`
 all applied — see [`schema_migrations.md`](./schema_migrations.md) for
 the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
@@ -42,10 +42,12 @@ deployed.
 | `bond_instruments` | Asset-class child of `instruments` for bonds (ISIN-keyed, with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
 | `future_instruments` | Asset-class child of `instruments` for futures (multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
-| `statements` | One row per imported IB HTML statement (idempotency) | [`statements.md`](./statements.md) |
+| `statements` | One row per imported IB HTML statement (idempotency, covered period) | [`statements.md`](./statements.md) |
+| `statement_positions` | One row per instrument open on a statement's last day (the Open Positions section) | [`statement_positions.md`](./statement_positions.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
 | `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax) | [`dividends.md`](./dividends.md) |
 | `bond_coupons` | One row per bond coupon payment from IB's Interest section | [`bond_coupons.md`](./bond_coupons.md) |
+| `cash_events` | One row per instrument-less cash movement (broker interest, external transfers, fees, interest withholding) | [`cash_events.md`](./cash_events.md) |
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
 | `tax_runs` | One row per `compute --year` invocation | [`tax_runs.md`](./tax_runs.md) |
 | `matched_disposals` | Per-chunk audit trail produced by the calculator | [`matched_disposals.md`](./matched_disposals.md) |
@@ -54,10 +56,12 @@ deployed.
 
 ```
 accounts (account_id) ──┐
-                        ├── statements ── trades ──────── instruments ── {stock,bond,future,fx}_instruments
-                        │             ├─ dividends ──────┘  ▲
-                        │             └─ bond_coupons ──┘   │
-tax_runs ── matched_disposals ───────────────────────────────┘
+                        ├── statements ── trades ──────────── instruments ── {stock,bond,future,fx}_instruments
+                        │             ├─ dividends ──────────┘  ▲
+                        │             ├─ bond_coupons ───────┘  │
+                        │             ├─ statement_positions ─┘  │
+                        │             └─ cash_events              │
+tax_runs ── matched_disposals ───────────────────────────────────┘
 
 fx_rates (standalone cache; no FK in or out)
 ```
@@ -81,6 +85,10 @@ Foreign-key chain in detail:
 - `bond_coupons.account_id`            → `accounts.account_id`
 - `bond_coupons.instrument_id`         → `instruments.instrument_id`
 - `bond_coupons.source_statement_hash` → `statements.statement_hash` `ON DELETE CASCADE`
+- `statement_positions.statement_hash`  → `statements.statement_hash` `ON DELETE CASCADE`
+- `statement_positions.instrument_id`   → `instruments.instrument_id`
+- `cash_events.account_id`             → `accounts.account_id`
+- `cash_events.source_statement_hash`  → `statements.statement_hash` `ON DELETE CASCADE`
 - `stock_instruments.instrument_id`    → `instruments.instrument_id` `ON DELETE CASCADE`
 - `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
 - `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`
@@ -117,6 +125,12 @@ A `Money` value (amount + currency) is always stored as **two adjacent
 columns**, conventionally named `<role>_amount TEXT` and
 `<role>_currency TEXT` (ISO-4217 code). This keeps the currency
 explicit in the row, avoiding a hidden coupling to a parent column.
+
+Amounts are magnitudes, with direction carried by an `action` or
+`kind` column — with one deliberate exception:
+[`cash_events.amount_native`](./cash_events.md) is **signed**, because
+the same kind of movement (a fee, broker interest) goes either way
+and the sign is the only trustworthy direction signal on those rows.
 
 ### Dates and datetimes
 

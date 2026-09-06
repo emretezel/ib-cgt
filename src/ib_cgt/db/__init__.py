@@ -25,9 +25,11 @@ from ib_cgt.db.connection import open_connection, open_memory_connection, transa
 from ib_cgt.db.migrator import apply_migrations
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo, StoredBondCoupon
+from ib_cgt.db.repos.cash_events import CashEventRepo, StoredCashEvent
 from ib_cgt.db.repos.dividends import DividendRepo, StoredDividend
 from ib_cgt.db.repos.fx_rates import FXRate, FXRateRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
+from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo, StatementRow
 from ib_cgt.db.repos.tax_runs import MatchedDisposalRepo, TaxRun, TaxRunRepo
 from ib_cgt.db.repos.trades import StoredTrade, TradeRepo
@@ -35,14 +37,17 @@ from ib_cgt.db.repos.trades import StoredTrade, TradeRepo
 __all__ = [
     "AccountRepo",
     "BondCouponRepo",
+    "CashEventRepo",
     "DividendRepo",
     "FXRate",
     "FXRateRepo",
     "InstrumentRepo",
     "MatchedDisposalRepo",
+    "StatementPositionRepo",
     "StatementRepo",
     "StatementRow",
     "StoredBondCoupon",
+    "StoredCashEvent",
     "StoredDividend",
     "StoredTrade",
     "TaxRun",

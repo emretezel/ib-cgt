@@ -125,6 +125,12 @@ None.
 - [`TradeRepo.for_asset_class(asset_class, *, since=, until=)`](../../src/ib_cgt/db/repos/trades.py)
   — the runner's bulk load for the FX pool inputs (every forex,
   non-GBP stock and non-GBP futures trade).
+- [`TradeRepo.signed_quantity_by_instrument(account_id, *, up_to)`](../../src/ib_cgt/db/repos/trades.py)
+  — the net signed holding per instrument implied by one account's
+  trades up to a date (buys / long opens / short closes add, sells /
+  long closes / short opens subtract; flat instruments omitted; sums
+  in `Decimal`, never in SQL). The trade side of the open-position
+  reconciliation against [`statement_positions`](./statement_positions.md).
 - [`TradeRepo.list_filtered(...)`](../../src/ib_cgt/db/repos/trades.py)
   — flexible CLI listing with optional `account_id` / `symbol` /
   `since` / `limit` filters.

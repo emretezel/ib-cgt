@@ -117,6 +117,8 @@ def _seed_trades(conn: sqlite3.Connection) -> None:
         source_path="/tmp/stmt.html",
         account_id="U1004320",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     isf = _isf()
     aapl = _aapl()
@@ -363,6 +365,8 @@ def test_match_stocks_unmatched_disposal_lands_in_unmatched_block(
             source_path="/tmp/short.html",
             account_id="U1",
             trade_count=0,
+            period_start=date(2024, 4, 6),
+            period_end=date(2025, 4, 5),
         )
         bbby = StockInstrument(symbol="BBBY", currency="USD")
         sell = Trade(

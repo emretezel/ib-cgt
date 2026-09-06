@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from ib_cgt.domain import BondCouponRef, DividendRef, FutureRealisationRef, FXEventSource
+from ib_cgt.domain import (
+    BondCouponRef,
+    CashEventRef,
+    DividendRef,
+    FutureRealisationRef,
+    FXEventSource,
+)
 
 
 def test_refs_are_value_objects() -> None:
@@ -43,3 +49,13 @@ def test_union_members_are_distinguishable() -> None:
     ]
     kinds = [type(s).__name__ for s in sources]
     assert kinds == ["FutureRealisationRef", "DividendRef", "BondCouponRef"]
+
+
+def test_cash_event_ref_is_a_fourth_union_member() -> None:
+    ref = CashEventRef(cash_event_id=5)
+    assert ref == CashEventRef(cash_event_id=5)
+    assert ref != DividendRef(dividend_id=5)
+    sources: list[FXEventSource] = [ref]
+    assert type(sources[0]).__name__ == "CashEventRef"
+    with pytest.raises(ValueError, match="positive row id"):
+        CashEventRef(cash_event_id=0)

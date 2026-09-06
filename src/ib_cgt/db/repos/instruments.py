@@ -144,6 +144,31 @@ class InstrumentRepo:
         """
         return self._find_id_by_natural_key(instrument)
 
+    def find_by_symbol(
+        self, asset_class: AssetClass, symbol: str, currency: str
+    ) -> list[tuple[int, AnyInstrument]]:
+        """Return every stored instrument of `asset_class` with this `(symbol, currency)`.
+
+        A looser lookup than the natural key, for callers that only
+        have the display symbol — the Open Positions mapper resolving a
+        held-over futures contract whose statement lacks an instrument-
+        information row. Futures may legitimately return several rows
+        (one per expiry sharing a root symbol); the caller decides what
+        an ambiguous result means. FX pairs are keyed on the pair symbol.
+        """
+        table = {
+            AssetClass.STOCK: "stock_instruments",
+            AssetClass.BOND: "bond_instruments",
+            AssetClass.FUTURE: "future_instruments",
+            AssetClass.FX: "fx_instruments",
+        }[asset_class]
+        rows = self._conn.execute(
+            f"SELECT instrument_id FROM {table} WHERE symbol = ? AND currency = ? "
+            "ORDER BY instrument_id",
+            (symbol, currency),
+        ).fetchall()
+        return [(int(r["instrument_id"]), self.get(int(r["instrument_id"]))) for r in rows]
+
     def list_stocks(
         self,
         *,

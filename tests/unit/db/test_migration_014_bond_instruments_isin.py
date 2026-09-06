@@ -26,9 +26,10 @@ from importlib.resources import files
 
 import pytest
 
-from ib_cgt.db import AccountRepo, StatementRepo, open_memory_connection
+from ib_cgt.db import AccountRepo, open_memory_connection
 from ib_cgt.db.migrator import _apply_one, _ensure_bookkeeping_table
 from ib_cgt.domain import Account
+from tests.unit.db.legacy_schema import insert_legacy_statement
 
 
 def _apply_through(conn: sqlite3.Connection, last_version: int) -> None:
@@ -50,11 +51,11 @@ def _apply_014(conn: sqlite3.Connection) -> None:
 
 def _seed_parents(conn: sqlite3.Connection) -> None:
     AccountRepo(conn).upsert(Account(account_id="U1"))
-    StatementRepo(conn).record(
+    insert_legacy_statement(
+        conn,
         statement_hash="hash-a",
         source_path="/tmp/a.html",
         account_id="U1",
-        trade_count=0,
     )
 
 

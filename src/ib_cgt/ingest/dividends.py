@@ -18,9 +18,13 @@ Scope (intentionally narrow, mirrors `corporate_actions.py`):
   ``"<SYMBOL>(<ISIN>) Payment In Lieu Of Dividend"`` produce a
   `Dividend(kind=PAYMENT_IN_LIEU)`. Stock-yield-enhancement
   programme rebates appear in this shape.
-* `tblWithholding` rows produce `Dividend(kind=WITHHOLDING_TAX)`
-  with the absolute amount; the section discriminator is
-  authoritative.
+* `tblWithholdingTax` rows whose description names a stock
+  (``"<SYMBOL>(<SECID>) Cash Dividend … - US Tax"``) produce
+  `Dividend(kind=WITHHOLDING_TAX)` with the absolute amount. Rows in
+  that section with no instrument behind them — withholding on
+  broker interest and its cancellation — are left to
+  `ingest/cash_events.py`; the two mappers partition the section
+  through `has_instrument_prefix`.
 * `tblChangeInDividend` rows are accrual *adjustments*, not
   cashflows — they're filtered out here so the FX pool only sees
   actual money movements.
@@ -132,13 +136,17 @@ def map_dividends(parsed: ParsedStatement) -> list[Dividend]:
 def _classify(raw: RawDividendRow) -> DividendKind | None:
     """Return the `DividendKind` for `raw`, or `None` to skip.
 
-    Withholding rows are unconditional WHT (the section header is
-    authoritative). Dividend-section rows split into cash dividend
-    vs payment-in-lieu by description-prefix membership. Anything
-    else inside the dividends section is a loud-fail.
+    Withholding rows are WHT when they name a stock (the section
+    header fixes the kind, the prefix fixes the instrument) and are
+    skipped otherwise — they belong to the cash-event mapper.
+    Dividend-section rows split into cash dividend vs payment-in-lieu
+    by description-prefix membership. Anything else inside the
+    dividends section is a loud-fail.
     """
     if raw.section == _SECTION_WITHHOLDING:
-        return DividendKind.WITHHOLDING_TAX
+        # Withholding on a dividend names the stock; withholding on
+        # broker interest does not and is a cash event, not a dividend.
+        return DividendKind.WITHHOLDING_TAX if has_instrument_prefix(raw.description) else None
     if raw.section != _SECTION_DIVIDENDS:
         # Unknown section label — defensive. The parser only emits
         # the three documented labels; reaching here would mean the
@@ -212,6 +220,15 @@ def _synthesize_one(
 # ---------------------------------------------------------------------------
 
 
+def has_instrument_prefix(description: str) -> bool:
+    """True when `description` opens with IB's `<SYMBOL>(<SECID>)` instrument tag.
+
+    Shared with `ingest/cash_events.py` so the two mappers partition
+    the Withholding Tax section without duplicating the regex.
+    """
+    return _DESCRIPTION_PREFIX_RE.match(description) is not None
+
+
 def _parse_date(text: str, description: str) -> date:
     """Parse IB's `YYYY-MM-DD` dividend-section date cell."""
     try:
@@ -231,4 +248,4 @@ def _parse_decimal(text: str, description: str) -> Decimal:
         raise MappingError(f"Unparseable dividend amount {text!r} on row {description!r}") from exc
 
 
-__all__ = ["map_dividends"]
+__all__ = ["has_instrument_prefix", "map_dividends"]

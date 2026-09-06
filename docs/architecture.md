@@ -120,6 +120,26 @@ where noted.
    Dividends-as-corporate-action, splits, spin-offs, share-for-share
    mergers, and tendered-to-other-stock rows are silently ignored.
 
+   Beyond trades, every ingest records (all inside one transaction,
+   all cascading from the `statements` row):
+   * the **statement period** from the page `<title>` — the only
+     place every vintage prints the range in a fixed shape;
+   * the **Open Positions** section as `statement_positions` — the
+     broker's own end-of-period view, resolved to the same
+     instruments the trades use (a held-over futures contract with
+     no instrument-information row is resolved against contracts
+     already in the DB, and reported if that fails);
+   * **dividends and withholding tax** under IB's real
+     `tblWithholdingTax_` div id (an earlier prefix mismatch silently
+     dropped every withholding row);
+   * the **cash-shaped sections** — Interest (minus the bond coupons
+     `bond_coupons` owns), Deposits & Withdrawals (minus transfers
+     between the taxpayer's own accounts), Fees, and the
+     instrument-less withholding rows — as signed `cash_events`.
+   `ingest --replace` also withdraws an earlier import of a
+   *different* file at the same path, so a re-downloaded statement
+   replaces the old version rather than sitting beside it.
+
 4. **FX rate service** — `ib_cgt.fx` — Frankfurter HTTP client (date-range
    batched), SQLite-backed cache, previous-business-day fallback for
    weekends/holidays (ECB publishes on TARGET business days), bulk preload
@@ -291,22 +311,27 @@ items marked ⬜ are pending.
     pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
     shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
     feeds two pools at once with independent per-leg GBP conversion.
-    The engine consumes **six cashflow sources** per HMRC CG78315
+    The engine consumes **eight cashflow sources** per HMRC CG78315
     ("foreign currency arising from any source"): forex trades,
     non-GBP stock trades' settlement cash, non-GBP dividends (cash
-    dividends, payment-in-lieu, withholding tax — see the new
+    dividends, payment-in-lieu, withholding tax — see the
     `dividends` table at [`docs/db/dividends.md`](db/dividends.md)),
-    non-GBP futures trade fees, futures realisation P&L, and
-    non-GBP bond coupon payments (extracted from IB's `Interest`
-    section — always inflows).
+    non-GBP futures trade fees, futures realisation P&L, non-GBP
+    bond coupon payments (extracted from IB's `Interest` section —
+    always inflows), non-GBP **bond trades'** settlement cash, and
+    non-GBP **cash events** (broker interest, external deposits
+    booked at spot, fees — see
+    [`docs/db/cash_events.md`](db/cash_events.md)).
     Soft-residual mode surfaces any leftover shortfall (e.g. opening
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
     `ib-cgt match fx [--currency CCY]`.
 11. 🟡 **Calculator orchestrator** — the engine runner
     (`ib_cgt.calculator.runner`) is in place and every `match` command
-    and `check` tier runs on it; tax-year filtering and persistence of
-    `tax_run` / `future_realisations` are pending.
+    and `check` tier runs on it; open positions reconcile against the
+    latest statements per taxpayer (`ib_cgt.calculator.positions`,
+    check C7); tax-year filtering and persistence of `tax_run` /
+    `future_realisations` are pending.
 12. ⬜ **Reporting** — console + CSV + JSON renderers.
 13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
@@ -321,7 +346,7 @@ items marked ⬜ are pending.
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
-| 7 | Calculator | `ib_cgt.calculator` | 🟡 engine runner (`run_engines` + per-engine loaders); tax-year computation pending |
+| 7 | Calculator | `ib_cgt.calculator` | 🟡 engine runner (`run_engines` + per-engine loaders) + open-position reconciliation; tax-year computation pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
 | 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |

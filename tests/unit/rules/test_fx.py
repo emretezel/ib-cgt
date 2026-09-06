@@ -22,12 +22,15 @@ Author: Emre Tezel
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from ib_cgt.domain import (
+    BondInstrument,
+    CashEvent,
+    CashEventKind,
     DirectAcquisition,
     Dividend,
     DividendKind,
@@ -828,3 +831,123 @@ def test_compute_treats_withholding_tax_as_disposal() -> None:
     assert md.match_rule is MatchRule.SECTION_104
     assert md.matched_quantity == Decimal("15")
     assert md.matched_cost_gbp == Money.gbp("12")
+
+
+# ---------------------------------------------------------------------------
+# Bond-trade and cash-event integration (the seventh and eighth sources)
+# ---------------------------------------------------------------------------
+
+
+def _cash_event(*, on: date, amount: str, currency: str = "USD") -> CashEvent:
+    """An external deposit (positive) or withdrawal (negative)."""
+    return CashEvent(
+        account_id="U1",
+        kind=CashEventKind.TRANSFER,
+        value_date=on,
+        amount=Money.of(Decimal(amount), currency),
+        description="Electronic Fund Transfer",
+    )
+
+
+def _usd_bond_trade(*, action: TradeAction, on: date, qty: str, price: str, fees: str) -> Trade:
+    corp = BondInstrument(
+        symbol="ACME 5 2030", currency="USD", isin="US000000AA11", is_cgt_exempt=False
+    )
+    return Trade(
+        account_id="U1",
+        instrument=corp,
+        action=action,
+        trade_datetime=datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC),
+        trade_date=on,
+        settlement_date=on,
+        quantity=Decimal(qty),
+        price=Money.of(Decimal(price), "USD"),
+        fees=Money.of(Decimal(fees), "USD"),
+    )
+
+
+def test_compute_matches_a_usd_bond_buy_against_a_usd_deposit_under_s104() -> None:
+    """A deposit at spot seeds the pool; a later bond purchase draws from it.
+
+    The deposit (1,000 USD at 0.80) is more than 30 days before the
+    bond BUY, so the purchase's cash leg (500 x 1 + 5 fees = 505 USD)
+    is a S.104 draw at the pool's average cost, keyed on the bond
+    trade's *real* trade id.
+    """
+    deposit_day = date(2025, 4, 11)
+    buy_day = date(2025, 6, 2)
+    fx = MultiCcyStubFXService(
+        {("USD", deposit_day): Decimal("0.80"), ("USD", buy_day): Decimal("0.75")}
+    )
+    engine = FXRuleEngine(fx)
+    result = engine.compute(
+        "USD",
+        bond_trades=[
+            (
+                42,
+                _usd_bond_trade(action=TradeAction.BUY, on=buy_day, qty="500", price="1", fees="5"),
+            )
+        ],
+        cash_events=[(4 * 10**12, _cash_event(on=deposit_day, amount="1000"))],
+    )
+    assert len(result.matched_disposals) == 1
+    md = result.matched_disposals[0]
+    assert md.disposal_trade_id == 42
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("505")
+    # 505 USD drawn at 0.80 GBP/USD average cost = 404 GBP; proceeds at 0.75.
+    assert md.matched_cost_gbp == Money.gbp("404")
+    assert md.matched_proceeds_gbp == Money.gbp(Decimal("505") * Decimal("0.75"))
+    assert result.final_pool.quantity == Decimal("495")
+    assert result.unmatched_disposals == ()
+
+
+def test_compute_treats_a_bond_sell_as_an_acquisition() -> None:
+    """A bond SELL brings dollars in, covering a later withdrawal by sign."""
+    sell_day = date(2025, 5, 1)
+    withdraw_day = date(2025, 5, 3)
+    fx = MultiCcyStubFXService(
+        {("USD", sell_day): Decimal("0.80"), ("USD", withdraw_day): Decimal("0.82")}
+    )
+    result = FXRuleEngine(fx).compute(
+        "USD",
+        bond_trades=[
+            (
+                7,
+                _usd_bond_trade(
+                    action=TradeAction.SELL, on=sell_day, qty="100", price="1", fees="0"
+                ),
+            )
+        ],
+        cash_events=[(4 * 10**12 + 1, _cash_event(on=withdraw_day, amount="-40"))],
+    )
+    (md,) = result.matched_disposals
+    assert md.disposal_trade_id == 4 * 10**12 + 1
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("40")
+    assert md.matched_cost_gbp == Money.gbp("32")
+    assert result.final_pool.quantity == Decimal("60")
+
+
+def test_compute_ignores_gbp_cash_events_and_gbp_bonds() -> None:
+    gilt = BondInstrument(
+        symbol="UKT 0 1/8 01/30/26", currency="GBP", isin="GB00BL68HJ26", is_cgt_exempt=True
+    )
+    gilt_buy = Trade(
+        account_id="U1",
+        instrument=gilt,
+        action=TradeAction.BUY,
+        trade_datetime=datetime(2025, 5, 1, 12, 0, tzinfo=UTC),
+        trade_date=date(2025, 5, 1),
+        settlement_date=date(2025, 5, 1),
+        quantity=Decimal("1000"),
+        price=Money.gbp("0.98"),
+        fees=Money.gbp("2"),
+    )
+    result = FXRuleEngine(MultiCcyStubFXService({})).compute(
+        "USD",
+        bond_trades=[(1, gilt_buy)],
+        cash_events=[(4 * 10**12, _cash_event(on=date(2025, 5, 6), amount="-1", currency="GBP"))],
+    )
+    assert result.matched_disposals == ()
+    assert result.final_pool.quantity == Decimal("0")

@@ -1,10 +1,11 @@
 """CLI tests for `ib-cgt match fx` and `show match` on the shared runner.
 
-Seeds one USD stock purchase (a disposal of dollars) followed by a
-USD bond coupon eight days later, so the 30-day rule matches part of
-the disposal directly against the coupon — which is how the coupon's
-`Cpn #N` label reaches the rendered table — and leaves the remainder
-in the yellow unmatched-disposals block.
+Seeds one USD stock purchase (a disposal of dollars) followed within
+30 days by a USD external deposit and a USD bond coupon, so the
+30-day rule matches part of the disposal directly against each —
+which is how the `Cash #N` and `Cpn #N` labels reach the rendered
+table — and leaves the remainder in the yellow unmatched-disposals
+block.
 
 Author: Emre Tezel
 """
@@ -25,6 +26,7 @@ from ib_cgt.cli import app
 from ib_cgt.db import (
     AccountRepo,
     BondCouponRepo,
+    CashEventRepo,
     FXRateRepo,
     StatementRepo,
     TradeRepo,
@@ -36,6 +38,8 @@ from ib_cgt.domain import (
     Account,
     BondCoupon,
     BondInstrument,
+    CashEvent,
+    CashEventKind,
     Money,
     StockInstrument,
     Trade,
@@ -57,6 +61,8 @@ def _seed(conn: sqlite3.Connection) -> None:
         source_path="/tmp/fx.htm",
         account_id="U1",
         trade_count=0,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     aapl = StockInstrument(symbol="AAPL", currency="USD")
     TradeRepo(conn).insert_many(
@@ -90,6 +96,18 @@ def _seed(conn: sqlite3.Connection) -> None:
         ],
         source_statement_hash="hash-fx",
     )
+    CashEventRepo(conn).insert_many(
+        [
+            CashEvent(
+                account_id="U1",
+                kind=CashEventKind.TRANSFER,
+                value_date=date(2025, 4, 15),
+                amount=Money.of(Decimal("20"), "USD"),
+                description="Electronic Fund Transfer",
+            )
+        ],
+        source_statement_hash="hash-fx",
+    )
     rates: list[FXRate] = []
     cur = date(2025, 3, 1)
     while cur <= date(2025, 5, 1):
@@ -117,14 +135,16 @@ def test_match_fx_renders_coupon_label_and_unmatched_block(
 ) -> None:
     result = runner.invoke(app, ["match", "fx"])
     assert result.exit_code == 0, result.stdout
-    # 30 USD of the 100 USD spent on AAPL matched the coupon under the
-    # 30-day rule; the coupon is cited by its real row id.
+    # 20 USD (the deposit) + 30 USD (the coupon) of the 100 USD spent on
+    # AAPL matched under the 30-day rule; each is cited by its real row id.
     assert "bed_and_breakfast" in result.stdout
+    assert "acq Cash #1" in result.stdout
+    assert "transfer: Electronic Fund Transfer" in result.stdout
     assert "acq Cpn #1" in result.stdout
     assert "bond coupon ACME 5 2030" in result.stdout
-    # The other 70 USD could not be covered — reported, not raised.
+    # The other 50 USD could not be covered — reported, not raised.
     assert "Unmatched disposals (1)" in result.stdout
-    assert "70.00" in result.stdout
+    assert "50.00" in result.stdout
     assert "Errors" not in result.stdout
 
 
@@ -139,5 +159,6 @@ def test_show_match_uses_the_same_pass(runner: CliRunner, populated_db: Path) ->
     assert result.exit_code == 0, result.stdout
     assert "Disposal #1" in result.stdout
     assert "USD vs GBP" in result.stdout
+    assert "acq Cash #1" in result.stdout
     assert "acq Cpn #1" in result.stdout
     assert "UNMATCHED" in result.stdout

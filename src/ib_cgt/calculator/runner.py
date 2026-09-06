@@ -42,10 +42,10 @@ Synthetic ids
 Non-trade FX cashflows get caller-issued integer ids from disjoint
 high ranges (see `FXInputs`). Allocation order is deterministic for a
 given database: futures in `InstrumentRepo.list_futures` order and
-engine emit order, then dividends and coupons by currency then pay
-date. The persisted-run provenance table and the D1 recompute check
-both rely on that determinism, so any change to the iteration order
-here is a behaviour change, not a refactor.
+engine emit order, then dividends, coupons and cash events by
+currency then date. The persisted-run provenance table and the D1
+recompute check both rely on that determinism, so any change to the
+iteration order here is a behaviour change, not a refactor.
 
 Author: Emre Tezel
 """
@@ -66,11 +66,13 @@ from ib_cgt.calculator.runs import (
     FXInputs,
     StockEngineRun,
 )
-from ib_cgt.db import BondCouponRepo, DividendRepo, InstrumentRepo, TradeRepo
+from ib_cgt.db import BondCouponRepo, CashEventRepo, DividendRepo, InstrumentRepo, TradeRepo
 from ib_cgt.domain import (
     AssetClass,
     BondCoupon,
     BondCouponRef,
+    CashEvent,
+    CashEventRef,
     Dividend,
     DividendRef,
     FutureRealisation,
@@ -128,6 +130,7 @@ _FX_ENGINE_ERRORS: tuple[type[Exception], ...] = (
 _REALISATION_ID_BASE = 10**12
 _DIVIDEND_ID_BASE = 2 * 10**12
 _COUPON_ID_BASE = 3 * 10**12
+_CASH_EVENT_ID_BASE = 4 * 10**12
 
 # Account label used when a realisation's close trade is not among the
 # loaded futures trades (only possible under a date-clipped load).
@@ -310,6 +313,11 @@ def load_fx_inputs(
         for tid, t in trade_repo.for_asset_class(AssetClass.STOCK, since=since, until=until)
         if t.instrument.currency != "GBP"
     )
+    bond_trades = tuple(
+        (tid, t)
+        for tid, t in trade_repo.for_asset_class(AssetClass.BOND, since=since, until=until)
+        if t.instrument.currency != "GBP"
+    )
     future_trades = tuple(
         (tid, t)
         for tid, t in trade_repo.for_asset_class(AssetClass.FUTURE, since=since, until=until)
@@ -349,23 +357,25 @@ def load_fx_inputs(
         if isinstance(trade.instrument, FXInstrument):
             seen.add(trade.instrument.currency_pair.base)
             seen.add(trade.instrument.currency_pair.quote)
-    for _tid, trade in stock_trades:
-        seen.add(trade.instrument.currency)
-    for _tid, trade in future_trades:
+    for _tid, trade in (*stock_trades, *bond_trades, *future_trades):
         seen.add(trade.instrument.currency)
     dividend_repo = DividendRepo(conn)
     coupon_repo = BondCouponRepo(conn)
+    cash_event_repo = CashEventRepo(conn)
     seen.update(dividend_repo.distinct_currencies())
     seen.update(coupon_repo.distinct_currencies())
+    seen.update(cash_event_repo.distinct_currencies())
     seen.discard("GBP")
     currencies = tuple(sorted(seen))
 
-    # Dividends and coupons — loaded per currency in the sorted pool
-    # order so synthetic ids are allocated deterministically.
+    # Dividends, coupons and cash events — loaded per currency in the
+    # sorted pool order so synthetic ids are allocated deterministically.
     dividend_ids = count(_DIVIDEND_ID_BASE)
     dividends: list[tuple[int, Dividend]] = []
     coupon_ids = count(_COUPON_ID_BASE)
     bond_coupons: list[tuple[int, BondCoupon]] = []
+    cash_event_ids = count(_CASH_EVENT_ID_BASE)
+    cash_events: list[tuple[int, CashEvent]] = []
     for currency in currencies:
         for dividend_id, dividend in dividend_repo.for_currency(currency, since=since, until=until):
             synth_id = next(dividend_ids)
@@ -375,14 +385,22 @@ def load_fx_inputs(
             synth_id = next(coupon_ids)
             bond_coupons.append((synth_id, coupon))
             sources[synth_id] = BondCouponRef(bond_coupon_id=coupon_id)
+        for cash_event_id, event in cash_event_repo.for_currency(
+            currency, since=since, until=until
+        ):
+            synth_id = next(cash_event_ids)
+            cash_events.append((synth_id, event))
+            sources[synth_id] = CashEventRef(cash_event_id=cash_event_id)
 
     return FXInputs(
         forex_trades=forex_trades,
         stock_trades=stock_trades,
+        bond_trades=bond_trades,
         future_trades=future_trades,
         future_realisations=tuple(future_realisations),
         dividends=tuple(dividends),
         bond_coupons=tuple(bond_coupons),
+        cash_events=tuple(cash_events),
         sources=MappingProxyType(sources),
         currencies=currencies,
     )
@@ -409,10 +427,12 @@ def run_fx_pools(
                 currency,
                 forex_trades=inputs.forex_trades,
                 stock_trades=inputs.stock_trades,
+                bond_trades=inputs.bond_trades,
                 future_trades=inputs.future_trades,
                 future_realisations=inputs.future_realisations,
                 dividends=inputs.dividends,
                 bond_coupons=inputs.bond_coupons,
+                cash_events=inputs.cash_events,
             )
         except _FX_ENGINE_ERRORS as exc:
             error = exc

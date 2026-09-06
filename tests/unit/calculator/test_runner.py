@@ -19,19 +19,23 @@ from ib_cgt.calculator import (
     run_fx_engine,
     run_stock_engine,
 )
-from ib_cgt.db import StatementRepo, TradeRepo
+from ib_cgt.db import CashEventRepo, FXRateRepo, StatementRepo, TradeRepo
 from ib_cgt.domain import (
     BondCouponRef,
+    CashEvent,
+    CashEventKind,
+    CashEventRef,
     DividendKind,
     DividendRef,
     FutureInstrument,
     FutureRealisationRef,
+    Money,
     TradeAction,
 )
 from ib_cgt.fx import FXService
 from ib_cgt.rules import ExemptBondResult, InconsistentTradeError, MatchingResult
 
-from .conftest import CORP_USD, trade
+from .conftest import CORP_USD, STATEMENT_HASH, trade
 
 
 def _fx_run(outputs: EngineOutputs, currency: str) -> FXEngineRun:
@@ -185,6 +189,8 @@ def test_engine_error_is_captured_per_instrument(
         source_path="/tmp/nq.htm",
         account_id="U1",
         trade_count=1,
+        period_start=date(2024, 4, 6),
+        period_end=date(2025, 4, 5),
     )
     TradeRepo(db).insert_many(
         [trade(nq, TradeAction.CLOSE_LONG, date(2025, 4, 9), "1", "20000")],
@@ -237,3 +243,97 @@ def test_load_fx_inputs_skips_failed_and_gbp_futures(
     contributing = {r.instrument.symbol for _id, r, _a in inputs.future_realisations}
     assert contributing == {"CL", "ES"}
     assert inputs.currencies == ("EUR", "USD")
+
+
+# ---------------------------------------------------------------------------
+# Bond trades and cash events as FX sources
+# ---------------------------------------------------------------------------
+
+
+def test_non_gbp_bond_trades_feed_the_pool_with_real_ids(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """The USD corporate bond's trades reach the USD inputs; the gilt's never do."""
+    inputs = _fx_run(run_engines(db, fx_service), "USD").inputs
+    symbols = {t.instrument.symbol for _id, t in inputs.bond_trades}
+    assert symbols == {CORP_USD.symbol}
+    for trade_id, _t in inputs.bond_trades:
+        assert trade_id < 10**12  # a real `trades` row id, not a synthetic one
+        assert trade_id not in inputs.sources
+
+
+def test_cash_events_reach_the_pool_with_their_own_id_range(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    deposit = CashEvent(
+        account_id="U1",
+        kind=CashEventKind.TRANSFER,
+        value_date=date(2025, 3, 20),
+        amount=Money.of("500", "USD"),
+        description="Electronic Fund Transfer",
+    )
+    interest = CashEvent(
+        account_id="U2",
+        kind=CashEventKind.INTEREST,
+        value_date=date(2025, 4, 3),
+        amount=Money.of("-3.21", "USD"),
+        description="USD Debit Interest for Mar-2025",
+    )
+    CashEventRepo(db).insert_many([deposit, interest], source_statement_hash=STATEMENT_HASH)
+
+    inputs = _fx_run(run_engines(db, fx_service), "USD").inputs
+
+    assert [event for _id, event in inputs.cash_events] == [deposit, interest]
+    for synth_id, _event in inputs.cash_events:
+        assert 4 * 10**12 <= synth_id < 5 * 10**12
+    assert [inputs.sources[i] for i, _e in inputs.cash_events] == [
+        CashEventRef(cash_event_id=1),
+        CashEventRef(cash_event_id=2),
+    ]
+
+
+def test_cash_event_only_currency_gets_a_pool(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """JPY appears nowhere but in a cash event — it must still be discovered."""
+    from ib_cgt.db.repos.fx_rates import FXRate
+
+    FXRateRepo(db).upsert_many(
+        [FXRate(base="GBP", quote="JPY", rate_date=date(2025, 4, 3), rate=Decimal("190"))]
+    )
+    CashEventRepo(db).insert_many(
+        [
+            CashEvent(
+                account_id="U1",
+                kind=CashEventKind.INTEREST,
+                value_date=date(2025, 4, 3),
+                amount=Money.of("-15", "JPY"),
+                description="JPY Credit Interest for Mar-2025",
+            )
+        ],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    outputs = run_engines(db, fx_service)
+    jpy = _fx_run(outputs, "JPY")
+    assert jpy.inputs.currencies == ("EUR", "JPY", "USD")
+    assert jpy.error is None and jpy.result is not None
+    # Nothing ever acquired JPY, so the disposal is a soft residual.
+    assert len(jpy.result.unmatched_disposals) == 1
+
+
+def test_gbp_cash_events_never_create_a_pool(db: sqlite3.Connection, fx_service: FXService) -> None:
+    CashEventRepo(db).insert_many(
+        [
+            CashEvent(
+                account_id="U1",
+                kind=CashEventKind.FEE,
+                value_date=date(2025, 4, 3),
+                amount=Money.gbp("-1"),
+                description="Snapshot Market Data Fee",
+            )
+        ],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    outputs = run_engines(db, fx_service)
+    assert [run.currency for run in outputs.fx] == ["EUR", "USD"]
+    assert _fx_run(outputs, "USD").inputs.cash_events == ()

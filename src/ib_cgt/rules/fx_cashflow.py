@@ -8,11 +8,12 @@ settling in the contract's native currency, stock proceeds settling
 in the listing currency).
 
 This module is the projector layer: pure, stateless functions that
-turn each non-Forex source — non-GBP stock trades, non-GBP futures
-trade fees, futures realised P&L — into the same
-`Acquisition` / `Disposal` shapes the FX engine already feeds into
-the shared `MatchingEngine`. The forex-trade projector also lives
-here so all four projection rules sit in one file.
+turn each non-Forex source — non-GBP stock and bond trades, non-GBP
+futures trade fees, futures realised P&L, dividends, bond coupons,
+and instrument-less cash events — into the same `Acquisition` /
+`Disposal` shapes the FX engine already feeds into the shared
+`MatchingEngine`. The forex-trade projector also lives here so every
+projection rule sits in one file.
 
 Each helper:
 
@@ -42,6 +43,8 @@ from decimal import Decimal
 from ib_cgt.domain import (
     Acquisition,
     BondCoupon,
+    BondInstrument,
+    CashEvent,
     CurrencyPair,
     Disposal,
     Dividend,
@@ -504,6 +507,144 @@ def from_bond_coupon(
         acquisition_date=coupon.pay_date,
         quantity=amount,
         cost_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bond trades — settlement cash in the bond's currency
+# ---------------------------------------------------------------------------
+
+
+def from_bond_trade(
+    trade_id: int,
+    trade: Trade,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | Disposal | None:
+    """Project a non-GBP bond trade's cash leg into an FX-pool event.
+
+    The mirror of `from_stock_trade`: a `BUY` spends
+    `(price * qty + accrued + fees)` of the bond's currency out of the
+    pool — a **disposal**; a `SELL` (a synthesised maturity included)
+    brings `(price * qty + accrued - fees)` in — an **acquisition**.
+    Whether the bond is CGT-exempt is irrelevant here: cash is cash.
+
+    `accrued` is `trade.accrued_interest` when set and zero otherwise.
+    Today it is always zero — the trade mapper never populates the
+    field — and the statement's `Purchase / Sale Accrued Interest`
+    lines reach the pool as cash events instead. Accrued interest must
+    arrive by exactly one route: if the trade field is ever populated,
+    the cash-event mapper must start excluding those lines.
+
+    `fees_gbp` on the projected event is left at zero for the same
+    reason as stocks: the commission belongs to the bond engine's
+    audit, not the pool's. Returns `None` for GBP bonds and for bonds
+    in a currency other than the requested pool.
+    """
+    if not isinstance(trade.instrument, BondInstrument):
+        raise WrongAssetClassError(
+            engine_name="FXRuleEngine",
+            instrument_class=type(trade.instrument).__name__,
+        )
+    if trade.action is not TradeAction.BUY and trade.action is not TradeAction.SELL:
+        raise InconsistentTradeError(
+            instrument_symbol=trade.instrument.symbol,
+            trade_id=trade_id,
+            detail=f"action {trade.action.value!r} is not valid for a bond trade",
+        )
+
+    native_ccy = trade.instrument.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    principal = trade.price.amount * trade.quantity
+    accrued = trade.accrued_interest.amount if trade.accrued_interest is not None else Decimal(0)
+    if trade.action is TradeAction.BUY:
+        # Cash outflow = principal + accrued + fees.
+        native_amount = principal + accrued + trade.fees.amount
+        gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
+        return Disposal(
+            trade_id=trade_id,
+            account_id=trade.account_id,
+            instrument=pool_instrument,
+            disposal_date=trade.trade_date,
+            quantity=native_amount,
+            proceeds_gbp=gbp_value,
+            fees_gbp=Money.gbp(Decimal(0)),
+        )
+    # SELL — cash inflow = principal + accrued - fees.
+    native_amount = principal + accrued - trade.fees.amount
+    gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
+    return Acquisition(
+        trade_id=trade_id,
+        account_id=trade.account_id,
+        instrument=pool_instrument,
+        acquisition_date=trade.trade_date,
+        quantity=native_amount,
+        cost_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cash events — instrument-less movements, direction by sign
+# ---------------------------------------------------------------------------
+
+
+def from_cash_event(
+    synth_id: int,
+    event: CashEvent,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | Disposal | None:
+    """Project an instrument-less cash movement into an FX-pool event.
+
+    Broker interest, external deposits and withdrawals, and fee rows
+    are foreign currency arising from a source like any other (HMRC
+    CG78315). A positive amount is currency arriving in the balance —
+    an **acquisition** at the value-date spot rate; a negative amount
+    is currency leaving — a **disposal** of the absolute amount. The
+    sign is the whole of the direction logic: the same kind of event
+    goes either way, and IB's descriptions cannot be trusted for it.
+
+    An external deposit is booked at spot on the day it arrives. That
+    is a documented simplification — the statements cannot show what
+    the currency cost when it was bought elsewhere — chosen so the
+    pool is not left permanently short of dollars that are plainly
+    there.
+
+    `synth_id` (not the real `cash_event_id`) is what the event's
+    `trade_id` carries; the runner allocates the cash-event range
+    and records the provenance. `fees_gbp` is zero: a fee row *is*
+    the cashflow, not a charge on top of one. Returns `None` for GBP
+    rows and for rows in a currency other than the requested pool.
+    """
+    native_ccy = event.amount.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    magnitude = abs(event.amount.amount)
+    gbp_value = _to_gbp(magnitude, native_ccy, fx, event.value_date)
+    if event.is_inflow:
+        return Acquisition(
+            trade_id=synth_id,
+            account_id=event.account_id,
+            instrument=pool_instrument,
+            acquisition_date=event.value_date,
+            quantity=magnitude,
+            cost_gbp=gbp_value,
+            fees_gbp=Money.gbp(Decimal(0)),
+        )
+    return Disposal(
+        trade_id=synth_id,
+        account_id=event.account_id,
+        instrument=pool_instrument,
+        disposal_date=event.value_date,
+        quantity=magnitude,
+        proceeds_gbp=gbp_value,
         fees_gbp=Money.gbp(Decimal(0)),
     )
 
