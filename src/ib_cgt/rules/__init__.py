@@ -22,7 +22,7 @@ The package contains:
   may feed one or two pools; the engine projects per-pool legs and
   delegates to `MatchingEngine`.
 * `FutureRuleEngine` — per-contract close-out treatment for futures
-  per HMRC HS292. Does *not* use `MatchingEngine`; futures emit a
+  per TCGA 1992 s.143(5)-(6) (HMRC CG56079). Does *not* use `MatchingEngine`; futures emit a
   separate `FutureRealisation` shape because UK share-matching rules
   do not apply to them.
 

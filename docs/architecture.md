@@ -161,7 +161,7 @@ where noted.
    - `FutureRuleEngine` — per-contract realised-gain on close-out; no
      pooling. Emits a separate `FutureRealisation` shape because UK
      share-matching rules (s.104 / s.105 / s.106A) do not apply to
-     individual-investor futures (HMRC HS292) — `MatchedDisposal` and
+     individual-investor futures (TCGA 1992 s.143(5)–(6), HMRC CG56079) — `MatchedDisposal` and
      `MatchRule` stay strictly for the share-matching engines.
    - `FXRuleEngine` — four-rule matching per currency pair vs GBP.
    A shared `MatchingEngine` implements the generic same-day /
@@ -176,9 +176,13 @@ where noted.
    FX, because realised futures P&L is an FX cashflow), with stocks and
    bonds in soft-residual mode so an open short is reported rather than
    raised. The `match` commands, the `check` tiers and the calculator all
-   consume that runner. The tax-year layer on top filters disposals into
-   the target tax year (6 Apr → 5 Apr) and persists the run plus
-   `MatchedDisposal` rows for audit. See [`rules.md`](./rules.md#the-engine-runner).
+   consume that runner. `Calculator` on top runs the whole history once,
+   filters chunks and futures realisations into the target tax year
+   (6 Apr → 5 Apr), reconciles trade-derived positions with the latest
+   statements per taxpayer (`calculator/positions.py`), derives the run's
+   issues and persists everything in one transaction — five tables, "save
+   what worked". See [`rules.md`](./rules.md#persistence) and
+   [`rules.md`](./rules.md#the-engine-runner).
 
 7. **Reporting** — `ib_cgt.report` — consumes a tax run; renders per-asset-
    class summary (count of disposals, total proceeds, cost, gains, losses,
@@ -294,7 +298,7 @@ items marked ⬜ are pending.
    s.105(2) mechanics in isolation; FX-free; itemised pool
    residuals via pro-rata attribution. Consumed by `StockRuleEngine`
    today; will also be consumed by Bond / FX engines later.
-7. ✅ **FutureRuleEngine** — per-contract close-out model (HMRC HS292),
+7. ✅ **FutureRuleEngine** — per-contract close-out model (TCGA 1992 s.143(5)–(6), HMRC CG56079),
    FIFO long/short queues, `FutureRealisation` output (separate from
    `MatchedDisposal`).
 8. ✅ **StockRuleEngine** — four-rule UK matching (same-day / 30-day
@@ -326,12 +330,14 @@ items marked ⬜ are pending.
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
     `ib-cgt match fx [--currency CCY]`.
-11. 🟡 **Calculator orchestrator** — the engine runner
-    (`ib_cgt.calculator.runner`) is in place and every `match` command
-    and `check` tier runs on it; open positions reconcile against the
-    latest statements per taxpayer (`ib_cgt.calculator.positions`,
-    check C7); tax-year filtering and persistence of `tax_run` /
-    `future_realisations` are pending.
+11. ✅ **Calculator orchestrator** — the engine runner
+    (`ib_cgt.calculator.runner`) is the single loader every `match`
+    command and `check` tier runs on; open positions reconcile against
+    the latest statements per taxpayer (`ib_cgt.calculator.positions`,
+    check C7); `Calculator` computes one tax year over the whole
+    history, records issues and persists five tables; CLI
+    `compute --year [--dry-run]`; Tier D checks D1–D6 verify the
+    persisted runs.
 12. ⬜ **Reporting** — console + CSV + JSON renderers.
 13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
@@ -346,9 +352,9 @@ items marked ⬜ are pending.
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
-| 7 | Calculator | `ib_cgt.calculator` | 🟡 engine runner (`run_engines` + per-engine loaders) + open-position reconciliation; tax-year computation pending |
+| 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner, open-position reconciliation, `Calculator.compute` / `persist` / `load` |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` / `check` / `compute` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |

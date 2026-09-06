@@ -134,4 +134,98 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via the Python `sqlite3` module in `-line` style after the
+first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
+system `sqlite3` binary predates STRICT tables).
+
+```
+                      run_id = 1
+           disposal_trade_id = 3339
+               instrument_id = 734
+               disposal_date = 2024-12-03
+                  match_rule = same_day
+            matched_quantity = 2.47
+        matched_proceeds_gbp = 1.953186778427961410722758184
+            matched_cost_gbp = 1.953186778427961410722758185
+matched_acquisition_fees_gbp = 0E+3
+   matched_disposal_fees_gbp = 0
+                  basis_kind = DIRECT
+        acquisition_trade_id = 1000000000432
+        pool_quantity_before = NULL
+      pool_total_cost_before = NULL
+           pool_average_cost = NULL
+      pool_total_fees_before = NULL
+                         seq = 0
+
+                      run_id = 1
+           disposal_trade_id = 3340
+               instrument_id = 734
+               disposal_date = 2024-12-18
+                  match_rule = same_day
+            matched_quantity = 2.47
+        matched_proceeds_gbp = 1.941976570485101029955185156
+            matched_cost_gbp = 1.941976570485101029955185157
+matched_acquisition_fees_gbp = 0E+2
+   matched_disposal_fees_gbp = 0
+                  basis_kind = DIRECT
+        acquisition_trade_id = 1000000000188
+        pool_quantity_before = NULL
+      pool_total_cost_before = NULL
+           pool_average_cost = NULL
+      pool_total_fees_before = NULL
+                         seq = 0
+
+                      run_id = 1
+           disposal_trade_id = 3341
+               instrument_id = 734
+               disposal_date = 2024-12-18
+                  match_rule = same_day
+            matched_quantity = 2.47
+        matched_proceeds_gbp = 1.941976570485101029955185156
+            matched_cost_gbp = 1.941976570485101029955185156
+matched_acquisition_fees_gbp = 0E+2
+   matched_disposal_fees_gbp = 0
+                  basis_kind = DIRECT
+        acquisition_trade_id = 1000000000188
+        pool_quantity_before = NULL
+      pool_total_cost_before = NULL
+           pool_average_cost = NULL
+      pool_total_fees_before = NULL
+                         seq = 0
+
+                      run_id = 1
+           disposal_trade_id = 3342
+               instrument_id = 734
+               disposal_date = 2025-01-07
+                  match_rule = bed_and_breakfast
+            matched_quantity = 2.47
+        matched_proceeds_gbp = 1.970482648583964898284802553
+            matched_cost_gbp = 1.986968063711688520633899123
+matched_acquisition_fees_gbp = 0E+3
+   matched_disposal_fees_gbp = 0
+                  basis_kind = DIRECT
+        acquisition_trade_id = 1000000000456
+        pool_quantity_before = NULL
+      pool_total_cost_before = NULL
+           pool_average_cost = NULL
+      pool_total_fees_before = NULL
+                         seq = 0
+
+                      run_id = 1
+           disposal_trade_id = 3343
+               instrument_id = 734
+               disposal_date = 2025-02-12
+                  match_rule = same_day
+            matched_quantity = 2.47
+        matched_proceeds_gbp = 1.985051836373864823595595917
+            matched_cost_gbp = 1.985051836373864823595595917
+matched_acquisition_fees_gbp = 0E+2
+   matched_disposal_fees_gbp = 0
+                  basis_kind = DIRECT
+        acquisition_trade_id = 1000000001206
+        pool_quantity_before = NULL
+      pool_total_cost_before = NULL
+           pool_average_cost = NULL
+      pool_total_fees_before = NULL
+                         seq = 0
+```

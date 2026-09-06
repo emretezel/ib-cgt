@@ -19,7 +19,7 @@ layer and gives an auditor the pool state at the moment of the draw.
 Futures get their own derived shapes — `FutureRealisation` and
 `OpenPosition` — rather than being shoehorned into `MatchedDisposal`,
 because UK share-matching rules (s.104 / s.105 / s.106A) do not apply
-to individual-investor futures (HMRC HS292): each closeout is a
+to individual-investor futures (TCGA 1992 s.143(5)-(6), HMRC CG56079): each closeout is a
 standalone disposal, paired one-to-one with the trade that opened the
 contract.
 
@@ -449,7 +449,7 @@ class UnmatchedDisposalChunk:
 
 
 # ---------------------------------------------------------------------------
-# FutureRealisation — closed-out futures contract (HMRC HS292)
+# FutureRealisation — closed-out futures contract (TCGA 1992 s.143(5)-(6), CG56079)
 # ---------------------------------------------------------------------------
 
 

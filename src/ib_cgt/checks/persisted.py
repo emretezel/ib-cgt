@@ -1,27 +1,29 @@
-"""Tier D — invariants over persisted matching results.
+"""Tier D — invariants over persisted tax runs.
 
-Dormant today. The shipped CLI's ``match stocks/fx/futures``
-commands are read-only dry-runs; ``matched_disposals`` and
-``tax_runs`` exist in the schema but are never written. When
-``compute --year`` lands and starts populating those tables,
-these checks wake up automatically — the runner skips them
-when ``matched_disposals`` has zero rows.
+`ib-cgt compute --year` writes a run to `tax_runs`, `matched_disposals`,
+`future_realisations`, `fx_event_sources` and `tax_run_issues`. These
+checks confirm that what was written is still true: a fresh engine
+pass reproduces the persisted rows (D1), the header's net gain equals
+the rows (D2), one run per year (D3), every trade-id reference still
+resolves — through `trades` or the run's synthetic-id map (D4), the
+basis columns agree with their discriminator (D5), and the futures
+rows' trade ids resolve (D6).
 
-Most invariants here are pure SQL against the persisted shape;
-the one exception is **D1** ("re-run equality") which needs to
-materialise `MatchedDisposal` records from rows and compare to
-a fresh engine run. D1 is left as a SKIPPED stub so the
-implementation arrives in the same PR as `compute --year`.
+The tier wakes up as soon as a `tax_runs` row exists; before the
+first `compute` every check reports SKIP rather than asserting
+against empty tables.
 
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Final
 
+from ib_cgt.calculator import build_report
 from ib_cgt.checks.framework import (
     CheckContext,
     Finding,
@@ -30,8 +32,18 @@ from ib_cgt.checks.framework import (
     Tier,
     register_check,
 )
+from ib_cgt.db import FutureRealisationRepo, MatchedDisposalRepo, TaxRunIssueRepo, TaxRunRepo
+from ib_cgt.domain import IssueSeverity, TaxYear
 
 _EVIDENCE_LIMIT: Final = 20
+
+# D2 tolerance. Every GBP amount is a `Decimal` computed under the
+# default 28-significant-digit context, and the header's net gain is
+# accumulated in a different order (per-class gains and losses) from
+# the per-row sum here, so the two agree only to ~1e-22 on a run of
+# thousands of rows. A hundred-millionth of a penny is far below any
+# tampering worth catching and far above that context noise.
+_NET_TOLERANCE: Final = Decimal("1e-9")
 
 
 def _has_persisted_rows(ctx: CheckContext) -> bool:
@@ -41,7 +53,7 @@ def _has_persisted_rows(ctx: CheckContext) -> bool:
     asserting against an empty table is meaningless and would
     only add noise to the report.
     """
-    row = ctx.conn.execute("SELECT COUNT(*) FROM matched_disposals").fetchone()
+    row = ctx.conn.execute("SELECT COUNT(*) FROM tax_runs").fetchone()
     return row[0] > 0 if row is not None else False
 
 
@@ -52,7 +64,7 @@ def _rows_to_evidence(
 
 
 # ---------------------------------------------------------------------------
-# D1 — recompute equality (stub until `compute --year` ships)
+# D1 — a fresh engine pass reproduces every persisted run
 # ---------------------------------------------------------------------------
 
 
@@ -64,18 +76,67 @@ def _rows_to_evidence(
     severity=Severity.ERROR,
 )
 def _check_recompute_equality(ctx: CheckContext) -> Finding:
+    """Recompute every persisted year from the checks' cached engine pass.
+
+    Four comparisons per run: the multiset of matched chunks, the
+    multiset of futures realisations, the header's net gain, and the
+    set of instruments carrying an error-kind issue (versus the fresh
+    pass's captured failures). A narrowed context (symbol or date
+    filter) cannot rebuild the pools and skips itself.
+    """
     if not _has_persisted_rows(ctx):
+        return Finding(triggered=False, skipped=True, detail="no persisted tax runs yet")
+    if ctx.is_narrowed:
         return Finding(
             triggered=False,
             skipped=True,
-            detail="no persisted matched_disposals rows yet",
+            detail="narrowed context (symbol / date filter) cannot reproduce a whole-history run",
         )
-    # Implementation deferred until `compute --year` ships and we
-    # know the materialisation path from row → MatchedDisposal.
+    outputs = ctx.engine_outputs()
+    fresh_failures = {(f.instrument.symbol, f.instrument.currency) for f in outputs.failures}
+    runs = TaxRunRepo(ctx.conn)
+    bad: list[Mapping[str, object]] = []
+    years = ctx.conn.execute("SELECT DISTINCT tax_year FROM tax_runs ORDER BY tax_year").fetchall()
+    for row in years:
+        tax_year = TaxYear(int(row["tax_year"]))
+        run = runs.latest_for(tax_year)
+        if run is None:
+            continue
+        fresh = build_report(outputs, tax_year)
+        stored_chunks = Counter(MatchedDisposalRepo(ctx.conn).for_run(run.run_id))
+        stored_realisations = Counter(FutureRealisationRepo(ctx.conn).for_run(run.run_id))
+        stored_failures = {
+            (i.instrument.symbol, i.instrument.currency)
+            for i in TaxRunIssueRepo(ctx.conn).for_run(run.run_id)
+            if i.severity is IssueSeverity.ERROR and i.instrument is not None
+        }
+        differences: list[str] = []
+        if stored_chunks != Counter(fresh.matched_disposals):
+            differences.append("matched_disposals")
+        if stored_realisations != Counter(fresh.future_realisations):
+            differences.append("future_realisations")
+        if run.net_gbp != fresh.net_gbp:
+            differences.append("net_gbp")
+        # Position mismatches are derived from the statements, not the
+        # engines, so only engine-failure kinds are compared here.
+        if not fresh_failures <= stored_failures:
+            differences.append("engine_failures")
+        if differences:
+            bad.append(
+                {
+                    "run_id": run.run_id,
+                    "tax_year": tax_year.label,
+                    "differs_in": ", ".join(differences),
+                    "stored_net_gbp": str(run.net_gbp.amount),
+                    "fresh_net_gbp": str(fresh.net_gbp.amount),
+                }
+            )
+    if not bad:
+        return Finding(triggered=False)
     return Finding(
-        triggered=False,
-        skipped=True,
-        detail="D1 implementation pending — see plan §Tier D",
+        triggered=True,
+        detail=f"{len(bad)} persisted run(s) no longer match a fresh recompute",
+        evidence=_rows_to_evidence(bad),
     )
 
 
@@ -92,35 +153,34 @@ def _check_recompute_equality(ctx: CheckContext) -> Finding:
     severity=Severity.ERROR,
 )
 def _check_tax_run_net_reconciliation(ctx: CheckContext) -> Finding:
+    """The header's net gain equals proceeds minus cost over both row tables.
+
+    Sums are done in Python `Decimal` — the columns are Decimal text
+    and a SQL SUM would go through floating point — and compared
+    within `_NET_TOLERANCE` (see the note on the constant).
+    """
     if not _has_persisted_rows(ctx):
         return Finding(triggered=False, skipped=True, detail="no persisted rows yet")
-    # `net_gbp` is stored as a Decimal text column; SUM-cast in SQL
-    # returns a float and is unsafe for penny-precision compares. The
-    # tax_runs table is small enough that a Python-side compare is fine.
-    rows = ctx.conn.execute(
-        "SELECT tr.run_id, tr.net_gbp AS stored_net, "
-        "       md.proceeds_sum AS proceeds_sum, "
-        "       md.cost_sum AS cost_sum "
-        "FROM tax_runs tr "
-        "JOIN ( "
-        "  SELECT run_id, "
-        "         GROUP_CONCAT(matched_proceeds_gbp, '|') AS proceeds_sum, "
-        "         GROUP_CONCAT(matched_cost_gbp, '|') AS cost_sum "
-        "  FROM matched_disposals GROUP BY run_id "
-        ") md ON md.run_id = tr.run_id"
-    ).fetchall()
     bad: list[Mapping[str, object]] = []
-    for r in rows:
-        stored = Decimal(str(r["stored_net"]))
-        proceeds_total = sum(
-            (Decimal(s) for s in str(r["proceeds_sum"]).split("|")), start=Decimal(0)
-        )
-        cost_total = sum((Decimal(s) for s in str(r["cost_sum"]).split("|")), start=Decimal(0))
-        derived = proceeds_total - cost_total
-        if stored != derived:
+    for run in ctx.conn.execute("SELECT run_id, net_gbp FROM tax_runs ORDER BY run_id"):
+        run_id = int(run["run_id"])
+        derived = Decimal(0)
+        for r in ctx.conn.execute(
+            "SELECT matched_proceeds_gbp AS p, matched_cost_gbp AS c "
+            "FROM matched_disposals WHERE run_id = ?",
+            (run_id,),
+        ):
+            derived += Decimal(str(r["p"])) - Decimal(str(r["c"]))
+        for r in ctx.conn.execute(
+            "SELECT proceeds_gbp AS p, cost_gbp AS c FROM future_realisations WHERE run_id = ?",
+            (run_id,),
+        ):
+            derived += Decimal(str(r["p"])) - Decimal(str(r["c"]))
+        stored = Decimal(str(run["net_gbp"]))
+        if abs(stored - derived) > _NET_TOLERANCE:
             bad.append(
                 {
-                    "run_id": int(r["run_id"]),
+                    "run_id": run_id,
                     "stored_net_gbp": str(stored),
                     "derived_net_gbp": str(derived),
                 }
@@ -129,7 +189,7 @@ def _check_tax_run_net_reconciliation(ctx: CheckContext) -> Finding:
         return Finding(triggered=False)
     return Finding(
         triggered=True,
-        detail=f"{len(bad)} tax_runs row(s) with net_gbp not matching their disposals",
+        detail=f"{len(bad)} tax_runs row(s) with net_gbp not matching their rows",
         evidence=_rows_to_evidence(bad),
     )
 
@@ -169,7 +229,7 @@ def _check_tax_runs_unique_per_year(ctx: CheckContext) -> Finding:
 
 @register_check(
     name="D4",
-    description="matched_disposals trade-id references still resolve in trades",
+    description="matched_disposals trade-id references resolve in trades or fx_event_sources",
     tier=Tier.D,
     scopes={Scope.ALL},
     severity=Severity.ERROR,
@@ -181,14 +241,21 @@ def _check_persisted_trade_ids(ctx: CheckContext) -> Finding:
     # FKs (audit stability — a deleted statement should not orphan
     # matched_disposals rows). This check confirms the "still resolve"
     # property without enforcing referential cascade.
+    # A synthetic FX event id (>= 10**12) is not a trade; it resolves
+    # through the run's own `fx_event_sources` map instead.
     bad: list[Mapping[str, object]] = []
     rows = ctx.conn.execute(
         "SELECT md.run_id, md.disposal_trade_id, md.acquisition_trade_id "
         "FROM matched_disposals md "
         "LEFT JOIN trades td ON td.trade_id = md.disposal_trade_id "
+        "LEFT JOIN fx_event_sources sd "
+        "       ON sd.run_id = md.run_id AND sd.event_id = md.disposal_trade_id "
         "LEFT JOIN trades ta ON ta.trade_id = md.acquisition_trade_id "
-        "WHERE td.trade_id IS NULL "
-        "   OR (md.acquisition_trade_id IS NOT NULL AND ta.trade_id IS NULL)"
+        "LEFT JOIN fx_event_sources sa "
+        "       ON sa.run_id = md.run_id AND sa.event_id = md.acquisition_trade_id "
+        "WHERE (td.trade_id IS NULL AND sd.event_id IS NULL) "
+        "   OR (md.acquisition_trade_id IS NOT NULL "
+        "       AND ta.trade_id IS NULL AND sa.event_id IS NULL)"
     ).fetchall()
     for r in rows:
         bad.append(
@@ -255,5 +322,45 @@ def _check_persisted_basis_consistency(ctx: CheckContext) -> Finding:
     return Finding(
         triggered=True,
         detail=f"{len(bad)} matched_disposals row(s) with basis/columns mismatch",
+        evidence=_rows_to_evidence(bad),
+    )
+
+
+# ---------------------------------------------------------------------------
+# D6 — future_realisations trade ids still resolve in trades
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="D6",
+    description="future_realisations open/close trade ids still resolve in trades",
+    tier=Tier.D,
+    scopes={Scope.ALL, Scope.FUTURES},
+    severity=Severity.ERROR,
+)
+def _check_persisted_realisation_trade_ids(ctx: CheckContext) -> Finding:
+    """The futures twin of D4: both trade ids of every realisation are live."""
+    if not _has_persisted_rows(ctx):
+        return Finding(triggered=False, skipped=True, detail="no persisted rows yet")
+    rows = ctx.conn.execute(
+        "SELECT fr.run_id, fr.open_trade_id, fr.close_trade_id "
+        "FROM future_realisations fr "
+        "LEFT JOIN trades o ON o.trade_id = fr.open_trade_id "
+        "LEFT JOIN trades c ON c.trade_id = fr.close_trade_id "
+        "WHERE o.trade_id IS NULL OR c.trade_id IS NULL"
+    ).fetchall()
+    if not rows:
+        return Finding(triggered=False)
+    bad = [
+        {
+            "run_id": int(r["run_id"]),
+            "open_trade_id": int(r["open_trade_id"]),
+            "close_trade_id": int(r["close_trade_id"]),
+        }
+        for r in rows
+    ]
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} future_realisations row(s) reference missing trade_id(s)",
         evidence=_rows_to_evidence(bad),
     )

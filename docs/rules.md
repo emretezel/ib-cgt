@@ -16,7 +16,7 @@ rules don't reduce to a common algorithm:
   matches, 30-day forward matches, the pooled holding, and any
   later acquisitions, with a strict precedence order. The shared
   `MatchingEngine` implements this algorithm once for all three.
-- **Futures** — individual-investor treatment per HMRC HS292: each
+- **Futures** — individual-investor treatment per TCGA 1992 s.143(5)–(6) (HMRC CG56079): each
   closed contract is its own disposal, paired with the trade that
   opened it. There is no pool, no same-day rule, no 30-day rule. The
   `FutureRuleEngine` handles this independently.
@@ -313,7 +313,7 @@ result = engine.compute(instrument, trades)
 
 ### Why futures don't fit `MatchedDisposal`
 
-UK CGT for individual-investor futures (HMRC HS292) doesn't apply
+UK CGT for individual-investor futures (TCGA 1992 s.143(5)–(6), HMRC CG56079) doesn't apply
 same-day, 30-day, or S.104 matching. Each closed contract is a
 standalone disposal, paired one-to-one (or one-to-many on partial
 closes) with the open trade that established it. The notional gain is
@@ -344,7 +344,7 @@ A single close trade may close N open slices: the engine emits N
 | SHORT | close trade    | open-leg @ open-date FX rate   | close-leg @ close-date FX rate|
 
 Either way, `gain_gbp = proceeds_gbp − cost_gbp` reads naturally and
-the disposal date for tax purposes is `close_date` (HS292: the gain
+the disposal date for tax purposes is `close_date` (CG56079: the gain
 crystallises at closeout).
 
 ### Fee allocation
@@ -378,18 +378,40 @@ time, but the engine guards against malformed in-memory inputs too).
 
 ## Persistence
 
-UK matching outputs persist to `matched_disposals` (one row per
-chunk, basis-discriminated DIRECT vs POOL). See
-[`docs/db/matched_disposals.md`](./db/matched_disposals.md).
+`ib-cgt compute --year` (`ib_cgt.calculator.Calculator`) runs every
+engine over the **whole** history, keeps the chunks and futures
+realisations dated inside the year, and writes one run in a single
+transaction, replacing any earlier run for the same year:
 
-`FutureRealisation` does not yet have a SQL table. The persistence
-story for futures will come with the calculator orchestrator
-(component 11): a parallel `future_realisations` table is the
-expected shape, but it isn't built in this milestone.
+| Table | Rows |
+|---|---|
+| [`tax_runs`](./db/tax_runs.md) | The header: year, timestamp, net gain over both row tables. |
+| [`matched_disposals`](./db/matched_disposals.md) | One row per chunk (stocks, non-exempt bonds, FX pools), DIRECT vs POOL basis. |
+| [`future_realisations`](./db/future_realisations.md) | One row per closed-out futures slice. |
+| [`fx_event_sources`](./db/fx_event_sources.md) | The synthetic FX event ids the chunks cite, resolved to their dividend / coupon / cash event / realisation. |
+| [`tax_run_issues`](./db/tax_run_issues.md) | What the run could not do (errors) and what it wants noticed (warnings). |
 
-`UnmatchedAcquisition` and `OpenPosition` are not persisted at all —
-they are computed fresh on every engine call. Persisting them is
-deferred until the reporting layer needs them across runs.
+Whole history, then filter: UK matching is path-dependent (a S.104
+average cost on a 2025 disposal depends on every acquisition since the
+first statement, and the 30-day rule reaches past the year end), so
+the engines are never fed a single year's trades. The rows go into
+the report in a canonical order — chunks by disposal id, realisations
+by close date then close trade — which is also the order the repos
+read them back in, so `Calculator.load(year)` reproduces
+`compute(year)` exactly and check D1 can compare the two.
+
+**"Save what worked."** One instrument or currency pool failing does
+not blank the run: its rows are absent and the failure is an
+error-severity issue. So is every position the latest statements do
+not confirm (§Open positions and residuals). The CLI exits 1 iff an
+error-severity issue exists; warnings — a confirmed open short, an FX
+pool residual, a history that stops before the year end or inside the
+30-day look-ahead, an empty year — never fail a run. There is no
+`--strict`.
+
+`UnmatchedAcquisition` and `OpenPosition` are not persisted — they
+are computed fresh on every engine call and the `match` commands
+render them from the live pass.
 
 ## Error model
 

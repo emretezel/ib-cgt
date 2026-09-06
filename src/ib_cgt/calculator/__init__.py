@@ -20,6 +20,12 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+from ib_cgt.calculator.calculator import (
+    Calculator,
+    TaxYearComputation,
+    build_report,
+    referenced_fx_sources,
+)
 from ib_cgt.calculator.positions import (
     AccountPosition,
     PositionReconciliation,
@@ -49,6 +55,7 @@ from ib_cgt.calculator.runs import (
 __all__ = [
     "AccountPosition",
     "BondEngineRun",
+    "Calculator",
     "EngineFailure",
     "EngineOutputs",
     "FXEngineRun",
@@ -57,9 +64,12 @@ __all__ = [
     "PositionReconciliation",
     "PositionStatus",
     "StockEngineRun",
+    "TaxYearComputation",
+    "build_report",
     "instrument_reconciles",
     "load_fx_inputs",
     "reconcile_positions",
+    "referenced_fx_sources",
     "run_bond_engine",
     "run_engines",
     "run_future_engine",

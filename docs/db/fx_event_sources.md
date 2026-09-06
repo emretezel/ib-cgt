@@ -97,4 +97,53 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is empty until the first `ib-cgt compute --year`.
+Captured via the Python `sqlite3` module in `-line` style after the
+first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
+system `sqlite3` binary predates STRICT tables).
+
+```
+        run_id = 1
+      event_id = 1000000000000
+          kind = FUTURE_REALISATION
+ open_trade_id = 4759
+close_trade_id = 4764
+   dividend_id = NULL
+bond_coupon_id = NULL
+ cash_event_id = NULL
+
+        run_id = 1
+      event_id = 1000000000001
+          kind = FUTURE_REALISATION
+ open_trade_id = 4760
+close_trade_id = 4765
+   dividend_id = NULL
+bond_coupon_id = NULL
+ cash_event_id = NULL
+
+        run_id = 1
+      event_id = 1000000000002
+          kind = FUTURE_REALISATION
+ open_trade_id = 4761
+close_trade_id = 4769
+   dividend_id = NULL
+bond_coupon_id = NULL
+ cash_event_id = NULL
+
+        run_id = 1
+      event_id = 1000000000003
+          kind = FUTURE_REALISATION
+ open_trade_id = 4762
+close_trade_id = 4770
+   dividend_id = NULL
+bond_coupon_id = NULL
+ cash_event_id = NULL
+
+        run_id = 1
+      event_id = 1000000000004
+          kind = FUTURE_REALISATION
+ open_trade_id = 4763
+close_trade_id = 4771
+   dividend_id = NULL
+bond_coupon_id = NULL
+ cash_event_id = NULL
+```

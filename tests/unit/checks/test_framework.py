@@ -56,6 +56,7 @@ _EXPECTED_CHECK_IDS = {
     "D3",
     "D4",
     "D5",
+    "D6",
 }
 
 

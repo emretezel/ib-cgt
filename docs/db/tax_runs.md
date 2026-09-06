@@ -91,4 +91,18 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is currently empty.
+Captured via the Python `sqlite3` module in `-line` style after the
+first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
+system `sqlite3` binary predates STRICT tables).
+
+```
+     run_id = 1
+   tax_year = 2024
+computed_at = 2026-09-06T23:17:02.857204+00:00
+    net_gbp = -65575.29462422834695378897446
+
+     run_id = 2
+   tax_year = 2025
+computed_at = 2026-09-06T23:18:06.264652+00:00
+    net_gbp = 158791.5819912538200485556807
+```

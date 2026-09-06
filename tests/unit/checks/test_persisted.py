@@ -1,203 +1,215 @@
-"""Tier D — persisted-result invariants. Dormant by default; wakes
-up when matched_disposals is populated.
+"""Tier D check tests — persisted tax runs written by `Calculator.persist`.
 
-Since `compute --year` doesn't ship yet, these tests insert
-matched_disposals + tax_runs rows directly to verify the SQL
-checks fire when persisted state is corrupt.
+The checks baseline (one reconciled statement, a same-day ISF round
+trip, a cross-account AAPL pool) is extended with a USD dividend and
+its withholding tax — a same-day FX match whose ids are synthetic —
+and a closed ES contract, so a persisted 2024/25 run carries every
+row kind the tier inspects. Each test then either leaves the run
+alone (OK) or corrupts one thing (FAIL / SKIP).
+
+Author: Emre Tezel
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pytest
 
-from ib_cgt.checks import Scope, Status, run_all
-from ib_cgt.db import (
-    AccountRepo,
-    FXRateRepo,
-    StatementRepo,
-    TradeRepo,
-    apply_migrations,
-    open_connection,
-)
+from ib_cgt.calculator import Calculator
+from ib_cgt.checks import CheckResult, Scope, Status, run_all
+from ib_cgt.db import DividendRepo, StatementRepo, TradeRepo
 from ib_cgt.domain import (
-    Account,
+    Dividend,
+    DividendKind,
+    FutureInstrument,
     Money,
     StockInstrument,
+    TaxYear,
     Trade,
     TradeAction,
 )
-from ib_cgt.fx import FrankfurterClient, FXService
+from ib_cgt.fx import FXService
 
-_UK = ZoneInfo("Europe/London")
+ACCOUNT = "U1004320"
+AAPL = StockInstrument(symbol="AAPL", currency="USD")
+ES = FutureInstrument(
+    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+)
+
+
+def _check(results: Sequence[CheckResult], name: str) -> CheckResult:
+    matches = [r for r in results if r.name == name]
+    assert len(matches) == 1, f"check {name} not found exactly once"
+    return matches[0]
+
+
+def _future_trade(action: TradeAction, on: date, qty: str, price: str) -> Trade:
+    return Trade(
+        account_id=ACCOUNT,
+        instrument=ES,
+        action=action,
+        trade_datetime=datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC),
+        trade_date=on,
+        settlement_date=on,
+        quantity=Decimal(qty),
+        price=Money.of(price, "USD"),
+        fees=Money.of("2", "USD"),
+    )
 
 
 @pytest.fixture
-def persisted_db(tmp_path: Path) -> sqlite3.Connection:
-    """Open + migrate a fresh DB for the persisted-tier tests."""
-    db_path = tmp_path / "ibcgt.sqlite"
-    conn = open_connection(db_path)
-    apply_migrations(conn)
-    return conn
-
-
-def _seed_minimal_trade(conn: sqlite3.Connection) -> int:
-    """Insert one stock trade so matched_disposals can FK against it."""
-    AccountRepo(conn).upsert(Account(account_id="U1"))
-    StatementRepo(conn).record(
-        statement_hash="h",
-        source_path="/tmp/x",
-        account_id="U1",
-        trade_count=0,
-        period_start=date(2024, 4, 6),
-        period_end=date(2025, 4, 5),
-    )
-    instrument = StockInstrument(symbol="ABC", currency="GBP")
-    TradeRepo(conn).insert_many(
+def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Connection:
+    """The baseline plus a dividend / WHT pair and an ES round trip, computed and persisted."""
+    DividendRepo(db).insert_many(
         [
-            Trade(
-                account_id="U1",
-                instrument=instrument,
-                action=TradeAction.BUY,
-                trade_datetime=datetime(2025, 4, 1, 12, 0, tzinfo=_UK),
-                trade_date=date(2025, 4, 1),
-                settlement_date=date(2025, 4, 1),
-                quantity=Decimal("10"),
-                price=Money.of(Decimal("100"), "GBP"),
-                fees=Money.of(Decimal("0"), "GBP"),
+            Dividend(
+                account_id=ACCOUNT,
+                instrument=AAPL,
+                kind=DividendKind.CASH_DIVIDEND,
+                pay_date=date(2025, 4, 3),
+                amount=Money.of("50", "USD"),
+                description="AAPL(US0378331005) Cash Dividend USD 0.25 per Share",
             ),
-            Trade(
-                account_id="U1",
-                instrument=instrument,
-                action=TradeAction.SELL,
-                trade_datetime=datetime(2025, 4, 2, 12, 0, tzinfo=_UK),
-                trade_date=date(2025, 4, 2),
-                settlement_date=date(2025, 4, 2),
-                quantity=Decimal("10"),
-                price=Money.of(Decimal("120"), "GBP"),
-                fees=Money.of(Decimal("0"), "GBP"),
+            Dividend(
+                account_id=ACCOUNT,
+                instrument=AAPL,
+                kind=DividendKind.WITHHOLDING_TAX,
+                pay_date=date(2025, 4, 3),
+                amount=Money.of("7.50", "USD"),
+                description="AAPL(US0378331005) Cash Dividend USD 0.25 per Share - US Tax",
             ),
         ],
-        source_statement_hash="h",
+        source_statement_hash="hash-a",
     )
-    row = conn.execute("SELECT MIN(trade_id) FROM trades").fetchone()
-    return int(row[0])
-
-
-def _insert_tax_run(conn: sqlite3.Connection, *, year: int, net: str) -> int:
-    """Insert a tax_runs row, return run_id."""
-    cur = conn.execute(
-        "INSERT INTO tax_runs (tax_year, computed_at, net_gbp) VALUES (?, ?, ?)",
-        (year, "2026-01-01T00:00:00+00:00", net),
+    # Trade identity is (statement, row index): the futures pair needs
+    # its own, older statement so hash-a stays the account's latest.
+    StatementRepo(db).record(
+        statement_hash="hash-es",
+        source_path="/tmp/es.html",
+        account_id=ACCOUNT,
+        trade_count=2,
+        period_start=date(2023, 4, 6),
+        period_end=date(2024, 4, 5),
     )
-    conn.commit()
-    last_id = cur.lastrowid
-    assert last_id is not None
-    return int(last_id)
+    TradeRepo(db).insert_many(
+        [
+            _future_trade(TradeAction.OPEN_LONG, date(2025, 4, 1), "1", "5000"),
+            _future_trade(TradeAction.CLOSE_LONG, date(2025, 4, 3), "1", "5010"),
+        ],
+        source_statement_hash="hash-es",
+    )
+    calc = Calculator(db, fx_service)
+    calc.persist(calc.compute(TaxYear(2024)))
+    return db
 
 
-def _insert_md_direct(
-    conn: sqlite3.Connection,
-    *,
-    run_id: int,
-    disposal_id: int,
-    acq_id: int,
-    seq: int,
-    proceeds: str,
-    cost: str,
-    instrument_id: int,
+def _tier_d(db: sqlite3.Connection, fx_service: FXService, **kwargs: str) -> list[CheckResult]:
+    report = run_all(db, fx=fx_service, scope=Scope.ALL, **kwargs)
+    return [r for r in report.results if r.name.startswith("D")]
+
+
+def test_tier_d_is_clean_on_a_fresh_run(
+    persisted_db: sqlite3.Connection, fx_service: FXService
 ) -> None:
-    conn.execute(
-        "INSERT INTO matched_disposals "
-        "(run_id, disposal_trade_id, instrument_id, disposal_date, match_rule, "
-        " matched_quantity, matched_proceeds_gbp, matched_cost_gbp, "
-        " matched_acquisition_fees_gbp, matched_disposal_fees_gbp, "
-        " basis_kind, acquisition_trade_id, seq) "
-        "VALUES (?, ?, ?, '2025-04-02', 'same_day', '10', ?, ?, '0', '0', "
-        "        'DIRECT', ?, ?)",
-        (run_id, disposal_id, instrument_id, proceeds, cost, acq_id, seq),
-    )
-    conn.commit()
+    results = _tier_d(persisted_db, fx_service)
+    assert {r.name for r in results} == {"D1", "D2", "D3", "D4", "D5", "D6"}
+    assert all(r.status is Status.OK for r in results), [
+        (r.name, r.status, r.detail) for r in results
+    ]
 
 
-def _stub_fx(conn: sqlite3.Connection) -> FXService:
-    """Build a stub FXService bound to the conn's empty fx_rates cache."""
-    return FXService(FXRateRepo(conn), FrankfurterClient(base_url="https://example.invalid"))
+def test_tier_d_skips_without_a_run(db: sqlite3.Connection, fx_service: FXService) -> None:
+    results = _tier_d(db, fx_service)
+    assert all(r.status is Status.SKIPPED for r in results)
 
 
-def test_D2_passes_when_net_matches(persisted_db: sqlite3.Connection) -> None:
-    """Net_gbp matches sum(proceeds - cost) -> D2 OK."""
-    buy_id = _seed_minimal_trade(persisted_db)
-    sell_id = buy_id + 1
-    instrument_id = int(
-        persisted_db.execute("SELECT instrument_id FROM trades LIMIT 1").fetchone()[0]
-    )
-    run_id = _insert_tax_run(persisted_db, year=2025, net="200")
-    _insert_md_direct(
-        persisted_db,
-        run_id=run_id,
-        disposal_id=sell_id,
-        acq_id=buy_id,
-        seq=0,
-        proceeds="1200",
-        cost="1000",
-        instrument_id=instrument_id,
-    )
-    report = run_all(persisted_db, fx=_stub_fx(persisted_db), scope=Scope.ALL)
-    d2 = next(r for r in report.results if r.name == "D2")
-    assert d2.status is Status.OK, f"D2 status: {d2.detail}"
-
-
-def test_D2_fires_when_net_mismatches(persisted_db: sqlite3.Connection) -> None:
-    """Net_gbp diverging from sum(proceeds - cost) -> D2 FAIL."""
-    buy_id = _seed_minimal_trade(persisted_db)
-    sell_id = buy_id + 1
-    instrument_id = int(
-        persisted_db.execute("SELECT instrument_id FROM trades LIMIT 1").fetchone()[0]
-    )
-    run_id = _insert_tax_run(persisted_db, year=2025, net="999")  # wrong
-    _insert_md_direct(
-        persisted_db,
-        run_id=run_id,
-        disposal_id=sell_id,
-        acq_id=buy_id,
-        seq=0,
-        proceeds="1200",
-        cost="1000",
-        instrument_id=instrument_id,
-    )
-    report = run_all(persisted_db, fx=_stub_fx(persisted_db), scope=Scope.ALL)
-    d2 = next(r for r in report.results if r.name == "D2")
-    assert d2.status is Status.FAIL
-
-
-def test_D5_fires_on_basis_columns_mismatch(persisted_db: sqlite3.Connection) -> None:
-    """A DIRECT row with pool_quantity_before set trips D5."""
-    buy_id = _seed_minimal_trade(persisted_db)
-    sell_id = buy_id + 1
-    instrument_id = int(
-        persisted_db.execute("SELECT instrument_id FROM trades LIMIT 1").fetchone()[0]
-    )
-    run_id = _insert_tax_run(persisted_db, year=2025, net="200")
-    # DIRECT but with pool_* fields populated — invalid.
-    persisted_db.execute(
-        "INSERT INTO matched_disposals "
-        "(run_id, disposal_trade_id, instrument_id, disposal_date, match_rule, "
-        " matched_quantity, matched_proceeds_gbp, matched_cost_gbp, "
-        " matched_acquisition_fees_gbp, matched_disposal_fees_gbp, "
-        " basis_kind, acquisition_trade_id, "
-        " pool_quantity_before, pool_total_cost_before, pool_average_cost, "
-        " pool_total_fees_before, seq) "
-        "VALUES (?, ?, ?, '2025-04-02', 'same_day', '10', '1200', '1000', "
-        "        '0', '0', 'DIRECT', ?, '5', '500', '100', '0', 0)",
-        (run_id, sell_id, instrument_id, buy_id),
-    )
+def test_D1_fails_when_a_persisted_chunk_is_altered(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    persisted_db.execute("UPDATE matched_disposals SET matched_cost_gbp = '999' WHERE seq = 0")
     persisted_db.commit()
-    report = run_all(persisted_db, fx=_stub_fx(persisted_db), scope=Scope.ALL)
-    d5 = next(r for r in report.results if r.name == "D5")
-    assert d5.status is Status.FAIL
+    d1 = _check(_tier_d(persisted_db, fx_service), "D1")
+    assert d1.status is Status.FAIL
+    assert d1.evidence is not None
+    assert "matched_disposals" in str(d1.evidence[0]["differs_in"])
+
+
+def test_D1_fails_when_a_realisation_is_missing(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    persisted_db.execute("DELETE FROM future_realisations")
+    persisted_db.commit()
+    d1 = _check(_tier_d(persisted_db, fx_service), "D1")
+    assert d1.status is Status.FAIL
+    assert d1.evidence is not None
+    assert "future_realisations" in str(d1.evidence[0]["differs_in"])
+
+
+def test_D1_skips_when_the_context_is_narrowed(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    d1 = _check(_tier_d(persisted_db, fx_service, symbol="AAPL"), "D1")
+    assert d1.status is Status.SKIPPED
+    assert "narrowed" in (d1.detail or "")
+
+
+def test_D2_fails_when_the_header_net_drifts(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    persisted_db.execute("UPDATE tax_runs SET net_gbp = '0.01'")
+    persisted_db.commit()
+    assert _check(_tier_d(persisted_db, fx_service), "D2").status is Status.FAIL
+
+
+def test_D2_counts_futures_realisations(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """Zeroing a realisation's proceeds breaks the header sum — D2 sees the futures rows."""
+    persisted_db.execute("UPDATE future_realisations SET proceeds_gbp = '0'")
+    persisted_db.commit()
+    assert _check(_tier_d(persisted_db, fx_service), "D2").status is Status.FAIL
+
+
+def test_D4_resolves_synthetic_ids_through_fx_event_sources(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """The WHT-vs-dividend chunk carries two synthetic ids; both resolve via the map."""
+    synthetic = persisted_db.execute(
+        "SELECT COUNT(*) FROM matched_disposals WHERE disposal_trade_id >= 1000000000000"
+    ).fetchone()[0]
+    assert synthetic >= 1
+    assert _check(_tier_d(persisted_db, fx_service), "D4").status is Status.OK
+    persisted_db.execute("DELETE FROM fx_event_sources")
+    persisted_db.commit()
+    d4 = _check(_tier_d(persisted_db, fx_service), "D4")
+    assert d4.status is Status.FAIL
+
+
+def test_D6_fails_when_a_realisation_trade_id_dangles(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    assert _check(_tier_d(persisted_db, fx_service), "D6").status is Status.OK
+    persisted_db.execute("PRAGMA foreign_keys = OFF")
+    persisted_db.execute("UPDATE future_realisations SET open_trade_id = 424242")
+    persisted_db.commit()
+    d6 = _check(_tier_d(persisted_db, fx_service), "D6")
+    assert d6.status is Status.FAIL
+    assert d6.evidence is not None
+    assert d6.evidence[0]["open_trade_id"] == 424242
+
+
+def test_tier_d_wakes_on_a_futures_only_run(
+    persisted_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """A run with realisations but no chunks still has a `tax_runs` row — the tier runs."""
+    persisted_db.execute("DELETE FROM matched_disposals")
+    persisted_db.execute("DELETE FROM fx_event_sources")
+    persisted_db.commit()
+    results = _tier_d(persisted_db, fx_service)
+    assert _check(results, "D2").status is Status.FAIL  # the header no longer adds up
+    assert _check(results, "D6").status is Status.OK
+    assert not any(r.status is Status.SKIPPED for r in results)

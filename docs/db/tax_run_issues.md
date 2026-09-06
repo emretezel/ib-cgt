@@ -88,4 +88,38 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is empty until the first `ib-cgt compute --year`.
+Captured via the Python `sqlite3` module in `-line` style after the
+first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
+system `sqlite3` binary predates STRICT tables).
+
+```
+       run_id = 1
+          seq = 0
+         kind = position_mismatch
+instrument_id = 1
+      message = not_on_statement: trades imply -2500, latest statements list none (U1004320: trades -2500, statement none)
+
+       run_id = 1
+          seq = 1
+         kind = position_mismatch
+instrument_id = 18
+      message = not_on_statement: trades imply -300, latest statements list none (U1004320: trades -300, statement none)
+
+       run_id = 1
+          seq = 2
+         kind = position_mismatch
+instrument_id = 32
+      message = not_on_statement: trades imply -400, latest statements list none (U1004320: trades -400, statement none)
+
+       run_id = 1
+          seq = 3
+         kind = position_mismatch
+instrument_id = 33
+      message = not_on_statement: trades imply -100, latest statements list none (U1004320: trades -100, statement none)
+
+       run_id = 1
+          seq = 4
+         kind = position_mismatch
+instrument_id = 34
+      message = not_on_statement: trades imply -160, latest statements list none (U1004320: trades -160, statement none)
+```

@@ -104,3 +104,24 @@ mode) appears in a yellow `UNMATCHED` row at the bottom.
 5. If the matched quantity looks small, run `ib-cgt show match
    --disposal <id>` to see the full chunk sequence and any
    un-covered residual.
+
+## `ib-cgt compute --year 2024/25 [--dry-run]`
+
+The persisted counterpart of the `match` dry runs. It computes the
+year from the same engine pass the `match` commands render, so every
+chunk in `matched_disposals` and every row in `future_realisations`
+can be found in `match stocks` / `match bonds` / `match fx` /
+`match futures` output with the same ids and the same labels — the
+`Cpn #N` / `Cash #N` / `P&L #A→#B` notation is resolved for a
+persisted run through `fx_event_sources`. The command prints the
+per-class summary, the warnings and (in red) the errors, then either
+`Persisted run #N …` or `Dry run — nothing persisted`, and exits 1
+iff an error-severity issue exists. The issues themselves are in
+`tax_run_issues` and come back with `Calculator.load`.
+
+`ib-cgt check all` then runs Tier D: D1 recomputes every persisted
+year from a fresh engine pass and compares chunks, realisations, the
+net gain and the recorded engine failures; D2 re-adds the header from
+its rows; D4 / D6 confirm every trade id (or synthetic id) still
+resolves. A `FAIL` there means the database changed under a run —
+re-run `compute` for the year.

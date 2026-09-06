@@ -136,7 +136,7 @@ class _OpenSlice:
 
 
 class FutureRuleEngine:
-    """Per-contract close-out engine for futures (HMRC HS292)."""
+    """Per-contract close-out engine for futures (TCGA 1992 s.143(5)-(6), HMRC CG56079)."""
 
     asset_class = AssetClass.FUTURE
 

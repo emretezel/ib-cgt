@@ -108,4 +108,93 @@ None.
 
 ## Sample (first 5 rows)
 
-Table is empty until the first `ib-cgt compute --year`.
+Captured via the Python `sqlite3` module in `-line` style after the
+first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
+system `sqlite3` binary predates STRICT tables).
+
+```
+          run_id = 1
+   open_trade_id = 2161
+  close_trade_id = 3575
+   instrument_id = 332
+            side = SHORT
+       open_date = 2024-03-20
+      close_date = 2024-04-08
+        quantity = 1
+gross_pnl_native = -78.0000
+ open_fee_native = 0.41
+close_fee_native = 0.41
+    open_fx_rate = 1.2692
+   close_fx_rate = 1.2615
+    proceeds_gbp = -61.83115338882282996432818074
+        cost_gbp = 0.6480480430964842953182439177
+             seq = 0
+
+          run_id = 1
+   open_trade_id = 3042
+  close_trade_id = 4359
+   instrument_id = 372
+            side = LONG
+       open_date = 2024-03-04
+      close_date = 2024-04-08
+        quantity = 1
+gross_pnl_native = -489.0000
+ open_fee_native = 0.62
+close_fee_native = 0.62
+    open_fx_rate = 1.2673
+   close_fx_rate = 1.2615
+    proceeds_gbp = -387.6337693222354340071343639
+        cost_gbp = 0.9807074684073571199881003237
+             seq = 0
+
+          run_id = 1
+   open_trade_id = 1685
+  close_trade_id = 4795
+   instrument_id = 271
+            side = LONG
+       open_date = 2024-02-21
+      close_date = 2024-04-08
+        quantity = 1
+gross_pnl_native = 92500.0000
+ open_fee_native = 40
+close_fee_native = 40
+    open_fx_rate = 189.35
+   close_fx_rate = 191.65
+    proceeds_gbp = 482.6506652752413253326376207
+        cost_gbp = 0.4199628109703710587754350139
+             seq = 0
+
+          run_id = 1
+   open_trade_id = 2356
+  close_trade_id = 3785
+   instrument_id = 339
+            side = SHORT
+       open_date = 2024-03-25
+      close_date = 2024-04-09
+        quantity = 1
+gross_pnl_native = -43.7500
+ open_fee_native = 0.41
+close_fee_native = 0.41
+    open_fx_rate = 1.2643
+   close_fx_rate = 1.2686
+    proceeds_gbp = -34.48683588207472804666561564
+        cost_gbp = 0.6474810401390249105335077076
+             seq = 0
+
+          run_id = 1
+   open_trade_id = 3249
+  close_trade_id = 4536
+   instrument_id = 398
+            side = SHORT
+       open_date = 2024-02-20
+      close_date = 2024-04-09
+        quantity = 1
+gross_pnl_native = 96.25000
+ open_fee_native = 1.90
+close_fee_native = 1.90
+    open_fx_rate = 1.261
+   close_fx_rate = 1.2686
+    proceeds_gbp = 75.87103894056440170266435441
+        cost_gbp = 3.004454697448516432346321940
+             seq = 0
+```
