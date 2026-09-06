@@ -6,19 +6,20 @@ Each Tier C invariant is anchored to one rule engine:
   `StockRuleEngine.compute`. Captures the engine errors the
   read-only `match stocks` CLI swallows for display so the
   operator sees them as outright failures.
-* **C3** — FX cross-pool symmetry: a non-GBP/non-GBP forex
-  trade must appear in both pools' input streams.
+* **C3** — FX cross-pool symmetry and sign semantics: a
+  non-GBP/non-GBP forex trade must appear in both pools' input
+  streams, and its base-currency leg must be the opposite type
+  (Acquisition vs Disposal) of its quote-currency leg.
 * **C4** — futures realisation closure: every closed slice's
   quantity sums match the originating trade's quantity, and the
   per-contract net of opens and closes equals the engine's
   `open_positions` figure.
 * **C5** — futures position carried past expiry (warning only;
   usually an ingestion gap).
-* **C6** — FX sign semantics: a forex trade's projected leg
-  for the base currency is the opposite type (Acquisition vs
-  Disposal) of its leg for the quote currency.
+* **C6** — every bond instrument runs cleanly under
+  `BondRuleEngine.compute` (the bond twin of C1).
 
-C1 catches engine-time exceptions; the others are pure
+C1 and C6 catch engine-time exceptions; the others are pure
 post-conditions the engines should already enforce. Tier C is
 where you find out that an engine bug exists for the *whole*
 instrument, not just a single chunk.
@@ -33,6 +34,7 @@ from datetime import date as date_cls
 from decimal import Decimal
 from typing import Final
 
+from ib_cgt.calculator.runs import BondEngineRun, StockEngineRun
 from ib_cgt.checks.framework import (
     CheckContext,
     Finding,
@@ -47,7 +49,6 @@ from ib_cgt.domain import (
     FXInstrument,
     TradeAction,
 )
-from ib_cgt.rules import UnmatchedDisposalError
 from ib_cgt.rules.fx_cashflow import from_forex_trade, make_pool_instrument
 
 _EVIDENCE_LIMIT: Final = 20
@@ -72,41 +73,61 @@ def _truncate(rows: Iterable[Mapping[str, object]]) -> tuple[Mapping[str, object
     severity=Severity.ERROR,
 )
 def _check_stocks_run_clean(ctx: CheckContext) -> Finding:
-    """Flag genuine engine failures; silently skip incomplete-history cases.
+    """Flag every captured engine failure for stocks.
 
-    `UnmatchedDisposalError` is the engine's signal for "trade history
-    is missing the buys that cover this disposal" — common when the
-    user has only ingested recent statements. Per project convention
-    (acquisitions before the import window are out of scope), we
-    treat that error as expected and do not surface it. Other engine
-    errors (`WrongAssetClassError`, `InconsistentTradeError`,
-    `RateNotFoundError`) remain hard failures.
+    The runner drives the engine in soft-residual mode, so an
+    uncovered disposal (an open short, or a sale the history cannot
+    cover) is no longer an exception — it surfaces as an
+    `UnmatchedDisposalChunk` and is judged against the statement's
+    open positions elsewhere. Anything that *does* raise here
+    (`WrongAssetClassError`, `InconsistentTradeError`,
+    `RateNotFoundError`) is a genuine failure.
     """
+    return _runs_clean_finding(ctx.stock_runs(), noun="stock")
+
+
+def _runs_clean_finding(runs: Iterable[StockEngineRun | BondEngineRun], *, noun: str) -> Finding:
+    """Shared body of C1 / C6: one evidence row per run that captured an error."""
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.error is None:
-            continue
-        if isinstance(replay.error, UnmatchedDisposalError):
+    for run in runs:
+        if run.error is None:
             continue
         bad.append(
             {
-                "instrument": replay.instrument.symbol,
-                "currency": replay.instrument.currency,
-                "error_type": type(replay.error).__name__,
-                "error_message": str(replay.error),
+                "instrument": run.instrument.symbol,
+                "currency": run.instrument.currency,
+                "error_type": type(run.error).__name__,
+                "error_message": str(run.error),
             }
         )
     if not bad:
         return Finding(triggered=False)
     return Finding(
         triggered=True,
-        detail=f"{len(bad)} stock instrument(s) failed engine replay",
+        detail=f"{len(bad)} {noun} instrument(s) failed engine run",
         evidence=_truncate(bad),
     )
 
 
 # ---------------------------------------------------------------------------
-# C3 + C6 — FX cross-pool symmetry & sign semantics
+# C6 — every bond instrument runs cleanly
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C6",
+    description="every bond instrument runs cleanly under BondRuleEngine.compute",
+    tier=Tier.C,
+    scopes={Scope.ALL},
+    severity=Severity.ERROR,
+)
+def _check_bonds_run_clean(ctx: CheckContext) -> Finding:
+    """Mirror of C1 for the bond engine (exempt and non-exempt alike)."""
+    return _runs_clean_finding(ctx.bond_runs(), noun="bond")
+
+
+# ---------------------------------------------------------------------------
+# C3 — FX cross-pool symmetry & sign semantics
 # ---------------------------------------------------------------------------
 
 
@@ -124,8 +145,8 @@ def _check_fx_cross_pool_symmetry(ctx: CheckContext) -> Finding:
     leg type for the base and quote currencies — and that
     cross-currency trades feed *both* pools, not just one.
 
-    Reads the forex_trades list from the FX replay (any pool will do —
-    they all carry the same input list) and replays the projector
+    Reads the forex_trades list from the FX run (any pool will do —
+    they all carry the same input bundle) and re-runs the projector
     against each (trade, base) and (trade, quote) pair. The trade's
     `action` (BUY / SELL) drives the expected event direction:
 
@@ -134,12 +155,12 @@ def _check_fx_cross_pool_symmetry(ctx: CheckContext) -> Finding:
 
     A single-leg trade (one side is GBP) only feeds one pool.
     """
-    fx_replays = ctx.fx_replays()
-    if not fx_replays:
+    fx_runs = ctx.fx_runs()
+    if not fx_runs:
         return Finding(triggered=False)
 
-    # All FX replays share the same forex_trades list — pick the first.
-    forex_trades = fx_replays[0].forex_trades
+    # Every FX run shares the same input bundle — pick the first.
+    forex_trades = fx_runs[0].inputs.forex_trades
 
     bad: list[Mapping[str, object]] = []
     for trade_id, trade in forex_trades:
@@ -241,30 +262,30 @@ def _check_future_realisation_closure(ctx: CheckContext) -> Finding:
              + sum(open_positions.quantity_remaining) for that side
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.future_replays():
-        if replay.result is None:
+    for run in ctx.future_runs():
+        if run.result is None:
             continue
         for side, open_action, close_action in (
             ("LONG", TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG),
             ("SHORT", TradeAction.OPEN_SHORT, TradeAction.CLOSE_SHORT),
         ):
             opened = sum(
-                (t.quantity for _tid, t in replay.trades if t.action is open_action),
+                (t.quantity for _tid, t in run.trades if t.action is open_action),
                 start=Decimal(0),
             )
             closed_by_engine = sum(
-                (r.quantity for r in replay.result.realisations if r.side == side),
+                (r.quantity for r in run.result.realisations if r.side == side),
                 start=Decimal(0),
             )
             still_open = sum(
-                (op.quantity_remaining for op in replay.result.open_positions if op.side == side),
+                (op.quantity_remaining for op in run.result.open_positions if op.side == side),
                 start=Decimal(0),
             )
             if opened != closed_by_engine + still_open:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
-                        "expiry": replay.instrument.expiry_date.isoformat(),
+                        "instrument": run.instrument.symbol,
+                        "expiry": run.instrument.expiry_date.isoformat(),
                         "side": side,
                         "sum_opened": str(opened),
                         "sum_closed": str(closed_by_engine),
@@ -276,10 +297,10 @@ def _check_future_realisation_closure(ctx: CheckContext) -> Finding:
             # realisation per drained slice; the sum must equal the
             # close trade's qty).
             close_qty: dict[int, Decimal] = {
-                tid: t.quantity for tid, t in replay.trades if t.action is close_action
+                tid: t.quantity for tid, t in run.trades if t.action is close_action
             }
             realised_by_close: dict[int, Decimal] = {}
-            for r in replay.result.realisations:
+            for r in run.result.realisations:
                 if r.side != side:
                     continue
                 realised_by_close[r.close_trade_id] = (
@@ -290,7 +311,7 @@ def _check_future_realisation_closure(ctx: CheckContext) -> Finding:
                 if drained > original:
                     bad.append(
                         {
-                            "instrument": replay.instrument.symbol,
+                            "instrument": run.instrument.symbol,
                             "side": side,
                             "close_trade_id": close_tid,
                             "close_qty": str(original),
@@ -328,21 +349,21 @@ def _check_futures_open_past_expiry(ctx: CheckContext) -> Finding:
     """
     today = date_cls.today()
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.future_replays():
-        if replay.result is None:
+    for run in ctx.future_runs():
+        if run.result is None:
             continue
-        if replay.instrument.expiry_date >= today:
+        if run.instrument.expiry_date >= today:
             continue
-        if not replay.result.open_positions:
+        if not run.result.open_positions:
             continue
         bad.append(
             {
-                "instrument": replay.instrument.symbol,
-                "expiry": replay.instrument.expiry_date.isoformat(),
-                "open_positions": len(replay.result.open_positions),
+                "instrument": run.instrument.symbol,
+                "expiry": run.instrument.expiry_date.isoformat(),
+                "open_positions": len(run.result.open_positions),
                 "total_open_qty": str(
                     sum(
-                        (op.quantity_remaining for op in replay.result.open_positions),
+                        (op.quantity_remaining for op in run.result.open_positions),
                         start=Decimal(0),
                     )
                 ),

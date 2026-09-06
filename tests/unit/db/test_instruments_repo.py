@@ -275,3 +275,23 @@ def test_duplicate_future_does_not_create_duplicate_row(
     assert id_first == id_second
     assert db.execute("SELECT COUNT(*) AS n FROM instruments").fetchone()["n"] == 1
     assert db.execute("SELECT COUNT(*) AS n FROM future_instruments").fetchone()["n"] == 1
+
+
+def test_upsert_joins_an_enclosing_transaction(db: sqlite3.Connection) -> None:
+    """A failing outer unit of work must undo the parent + child inserts.
+
+    `upsert` opens its own transaction when called standalone; inside
+    a caller's `transaction()` it must join rather than raise SQLite's
+    "cannot start a transaction within a transaction", and the caller's
+    rollback must remove both rows it wrote.
+    """
+    from ib_cgt.db import transaction
+
+    repo = InstrumentRepo(db)
+    new = StockInstrument(symbol="NEW", currency="USD")
+    with pytest.raises(RuntimeError), transaction(db):
+        repo.upsert(new)
+        raise RuntimeError("boom")
+    assert repo.find_id(new) is None
+    assert db.execute("SELECT COUNT(*) FROM instruments").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM stock_instruments").fetchone()[0] == 0

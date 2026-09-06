@@ -30,7 +30,7 @@ from ib_cgt.db.codecs import (
     text_to_dt,
 )
 from ib_cgt.db.repos.instruments import InstrumentRepo
-from ib_cgt.domain import AssetClass, TaxYear, Trade, TradeAction
+from ib_cgt.domain import AssetClass, Trade, TradeAction
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -273,21 +273,6 @@ class TradeRepo:
         )
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [(int(r["trade_id"]), self._row_to_trade(r)) for r in rows]
-
-    def distinct_instruments_in(self, year: TaxYear) -> list[int]:
-        """Return instrument ids touched by any trade within `year`.
-
-        Drives the calculator's outer loop — we only reconstruct S.104
-        pools for instruments that actually have activity in the target
-        tax year. The underlying index is `ix_trades_trade_date`.
-        """
-        rows = self._conn.execute(
-            "SELECT DISTINCT instrument_id FROM trades "
-            "WHERE trade_date BETWEEN ? AND ? "
-            "ORDER BY instrument_id",
-            (date_to_text(year.start_date), date_to_text(year.end_date)),
-        ).fetchall()
-        return [int(r["instrument_id"]) for r in rows]
 
     def count(self) -> int:
         """Return the total row count — test-support helper."""

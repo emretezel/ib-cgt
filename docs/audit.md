@@ -23,6 +23,16 @@ In `match fx` output:
   closeout).
 - `acq #N→...` reads as: this acquisition came from a futures P&L
   cashflow.
+- `Div #N` / `WHT #N` — a cash dividend (or payment-in-lieu) /
+  withholding-tax row, cited by its `dividends.dividend_id`.
+- `Cpn #N` — a bond coupon, cited by its `bond_coupons.bond_coupon_id`.
+  Coupons reach the pools through the shared engine runner, so they
+  appear in `match fx` exactly as `compute` will see them.
+
+The synthetic integer ids the FX engine works with internally are
+never printed; the runner's provenance map
+(`FXInputs.sources`, see `docs/rules.md#the-engine-runner`) resolves
+each one back to the citeable label above.
 
 ## `ib-cgt show trade <trade_id>`
 

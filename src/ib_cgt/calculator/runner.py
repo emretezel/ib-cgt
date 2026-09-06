@@ -1,0 +1,479 @@
+"""Engine runner — load from the database, run every rule engine.
+
+This is the one place that knows how to turn the persisted trade /
+dividend / coupon history into rule-engine inputs and back into
+per-instrument results. The `match` CLI commands, the `check` tiers,
+and the calculator all consume it, so the four engines always see the
+same inputs regardless of which command asked.
+
+Per-engine entry points (`run_stock_engine`, `run_bond_engine`,
+`run_future_engine`, `run_fx_engine`) exist so a narrowed command
+(`match stocks --symbol AAPL`, `check fx`) pays only for the engine it
+needs; `run_engines` composes them for the whole-history pass the
+calculator performs.
+
+Ordering constraint
+-------------------
+
+The FX engine consumes `FutureRealisation` objects — a closed futures
+contract settles its profit or loss in the contract's currency, which
+is an acquisition or disposal of that currency on the close date.
+Only the futures engine produces those objects, so the futures pass
+must precede the FX pass. `load_fx_inputs` takes the futures runs as a
+required argument, `run_fx_engine` runs the futures engine itself when
+the caller has none to offer, and `run_engines` fixes the order
+outright: futures → stocks → bonds → FX. FX is a pure sink — nothing
+consumes its output — so it is the last stage by construction.
+
+Soft residuals
+--------------
+
+Stocks and bonds run with ``soft_residuals=True``: a disposal the four
+matching rules cannot cover (an open short, or a sale of units the
+history never saw bought) is returned in
+`MatchingResult.unmatched_disposals` rather than raised. Whether that
+residual is expected (the account's latest statement confirms the
+short is still open) or a data gap is decided downstream by the
+calculator's position reconciliation — the runner only reports.
+
+Synthetic ids
+-------------
+
+Non-trade FX cashflows get caller-issued integer ids from disjoint
+high ranges (see `FXInputs`). Allocation order is deterministic for a
+given database: futures in `InstrumentRepo.list_futures` order and
+engine emit order, then dividends and coupons by currency then pay
+date. The persisted-run provenance table and the D1 recompute check
+both rely on that determinism, so any change to the iteration order
+here is a behaviour change, not a refactor.
+
+Author: Emre Tezel
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Sequence
+from datetime import date
+from itertools import count
+from types import MappingProxyType
+
+from ib_cgt.calculator.runs import (
+    BondEngineRun,
+    EngineOutputs,
+    FutureEngineRun,
+    FXEngineRun,
+    FXInputs,
+    StockEngineRun,
+)
+from ib_cgt.db import BondCouponRepo, DividendRepo, InstrumentRepo, TradeRepo
+from ib_cgt.domain import (
+    AssetClass,
+    BondCoupon,
+    BondCouponRef,
+    Dividend,
+    DividendRef,
+    FutureRealisation,
+    FutureRealisationRef,
+    FXEventSource,
+    FXInstrument,
+)
+from ib_cgt.fx import RateNotFoundError
+from ib_cgt.rules import (
+    BondResult,
+    BondRuleEngine,
+    FutureResult,
+    FutureRuleEngine,
+    FXRuleEngine,
+    InconsistentTradeError,
+    MatchingResult,
+    StockRuleEngine,
+    UnmatchedDisposalError,
+    WrongAssetClassError,
+)
+from ib_cgt.rules.futures import FXConverter
+
+# The engine-time exceptions each pass captures per instrument. Anything
+# outside these tuples is a programming error and propagates so the
+# operator sees it loud and clear. The stock / bond tuples keep
+# `UnmatchedDisposalError` even though soft-residual mode means the
+# engines no longer raise it — a future strict-mode caller must not
+# turn a data gap into a crash.
+_STOCK_ENGINE_ERRORS: tuple[type[Exception], ...] = (
+    WrongAssetClassError,
+    InconsistentTradeError,
+    UnmatchedDisposalError,
+    RateNotFoundError,
+)
+_BOND_ENGINE_ERRORS: tuple[type[Exception], ...] = _STOCK_ENGINE_ERRORS
+_FUTURE_ENGINE_ERRORS: tuple[type[Exception], ...] = (
+    WrongAssetClassError,
+    InconsistentTradeError,
+    RateNotFoundError,
+)
+# The FX engine additionally raises `ValueError` for a malformed or GBP
+# currency code and for instrument-identity mismatches on projected
+# events; both are data problems worth reporting per pool.
+_FX_ENGINE_ERRORS: tuple[type[Exception], ...] = (
+    WrongAssetClassError,
+    InconsistentTradeError,
+    UnmatchedDisposalError,
+    RateNotFoundError,
+    ValueError,
+)
+
+# Disjoint synthetic-id ranges for the non-trade FX sources (see the
+# module docstring). Real `trades.trade_id` values are small integers,
+# so nothing can collide.
+_REALISATION_ID_BASE = 10**12
+_DIVIDEND_ID_BASE = 2 * 10**12
+_COUPON_ID_BASE = 3 * 10**12
+
+# Account label used when a realisation's close trade is not among the
+# loaded futures trades (only possible under a date-clipped load).
+_UNKNOWN_ACCOUNT = "U?"
+
+
+# ---------------------------------------------------------------------------
+# Stocks / bonds / futures — one engine call per instrument
+# ---------------------------------------------------------------------------
+
+
+def run_stock_engine(
+    conn: sqlite3.Connection,
+    fx: FXConverter,
+    *,
+    symbol: str | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[StockEngineRun, ...]:
+    """Run `StockRuleEngine` over every stock instrument, capturing errors.
+
+    Cross-account by design: S.104 pools span every account belonging
+    to the taxpayer, so the trades for an instrument are loaded with
+    no account filter.
+
+    Args:
+        conn: Open, migrated connection.
+        fx: FX converter shared by the engines (real `FXService` or a
+            deterministic stub).
+        symbol: Restrict to one stock symbol (audit narrowing).
+        since: Inclusive lower bound on `trade_date`. Clipping the
+            history breaks S.104 pool reconstruction — debugging only.
+        until: Inclusive upper bound on `trade_date`; same caveat.
+
+    Returns:
+        One `StockEngineRun` per instrument, in `list_stocks` order.
+    """
+    engine = StockRuleEngine(fx)
+    trade_repo = TradeRepo(conn)
+    out: list[StockEngineRun] = []
+    for instrument_id, instrument in InstrumentRepo(conn).list_stocks(symbol=symbol):
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id, account_id=None, since=since, until=until
+        )
+        result: MatchingResult | None = None
+        error: Exception | None = None
+        try:
+            result = engine.compute(instrument, trades, soft_residuals=True)
+        except _STOCK_ENGINE_ERRORS as exc:
+            error = exc
+        out.append(
+            StockEngineRun(
+                instrument_id=instrument_id,
+                instrument=instrument,
+                trades=tuple(trades),
+                result=result,
+                error=error,
+            )
+        )
+    return tuple(out)
+
+
+def run_bond_engine(
+    conn: sqlite3.Connection,
+    fx: FXConverter,
+    *,
+    symbol: str | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[BondEngineRun, ...]:
+    """Run `BondRuleEngine` over every bond instrument, capturing errors.
+
+    Same cross-account contract as `run_stock_engine`. Exempt bonds
+    (gilts / QCBs) come back with an `ExemptBondResult`; non-exempt
+    bonds with a soft-residual `MatchingResult`.
+    """
+    engine = BondRuleEngine(fx)
+    trade_repo = TradeRepo(conn)
+    out: list[BondEngineRun] = []
+    for instrument_id, instrument in InstrumentRepo(conn).list_bonds(symbol=symbol):
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id, account_id=None, since=since, until=until
+        )
+        result: BondResult | None = None
+        error: Exception | None = None
+        try:
+            result = engine.compute(instrument, trades, soft_residuals=True)
+        except _BOND_ENGINE_ERRORS as exc:
+            error = exc
+        out.append(
+            BondEngineRun(
+                instrument_id=instrument_id,
+                instrument=instrument,
+                trades=tuple(trades),
+                result=result,
+                error=error,
+            )
+        )
+    return tuple(out)
+
+
+def run_future_engine(
+    conn: sqlite3.Connection,
+    fx: FXConverter,
+    *,
+    symbol: str | None = None,
+    account_id: str | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[FutureEngineRun, ...]:
+    """Run `FutureRuleEngine` over every futures contract, capturing errors.
+
+    Every contract is run, GBP-denominated ones included — a GBP
+    future is a tax event like any other; it is only excluded later
+    from the FX pool inputs. `account_id` exists for the audit CLI's
+    per-account view: futures are not pooled, so narrowing by account
+    is harmless here, unlike for stocks and bonds.
+
+    Returns:
+        One `FutureEngineRun` per contract, in `list_futures` order
+        (symbol, then expiry) — the order the FX synthetic ids are
+        allocated in.
+    """
+    engine = FutureRuleEngine(fx)
+    trade_repo = TradeRepo(conn)
+    out: list[FutureEngineRun] = []
+    for instrument_id, instrument in InstrumentRepo(conn).list_futures(symbol=symbol):
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id, account_id=account_id, since=since, until=until
+        )
+        result: FutureResult | None = None
+        error: Exception | None = None
+        try:
+            result = engine.compute(instrument, trades)
+        except _FUTURE_ENGINE_ERRORS as exc:
+            error = exc
+        out.append(
+            FutureEngineRun(
+                instrument_id=instrument_id,
+                instrument=instrument,
+                trades=tuple(trades),
+                result=result,
+                error=error,
+            )
+        )
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# FX — one engine call per non-GBP currency pool
+# ---------------------------------------------------------------------------
+
+
+def load_fx_inputs(
+    conn: sqlite3.Connection,
+    *,
+    future_runs: Sequence[FutureEngineRun],
+    since: date | None = None,
+    until: date | None = None,
+) -> FXInputs:
+    """Assemble every FX cashflow source from the database plus futures results.
+
+    Args:
+        conn: Open, migrated connection.
+        future_runs: The futures engine's output — required, because
+            realised futures P&L is an FX cashflow and only the
+            futures engine can produce it. Runs that failed or whose
+            contract is GBP-denominated contribute nothing.
+        since: Inclusive lower bound applied to every dated source.
+        until: Inclusive upper bound applied to every dated source.
+
+    Returns:
+        The shared `FXInputs` bundle, including the sorted list of
+        non-GBP currencies that have at least one event.
+    """
+    trade_repo = TradeRepo(conn)
+    forex_trades = tuple(trade_repo.for_asset_class(AssetClass.FX, since=since, until=until))
+    stock_trades = tuple(
+        (tid, t)
+        for tid, t in trade_repo.for_asset_class(AssetClass.STOCK, since=since, until=until)
+        if t.instrument.currency != "GBP"
+    )
+    future_trades = tuple(
+        (tid, t)
+        for tid, t in trade_repo.for_asset_class(AssetClass.FUTURE, since=since, until=until)
+        if t.instrument.currency != "GBP"
+    )
+
+    sources: dict[int, FXEventSource] = {}
+
+    # Futures realisations — the P&L cashflow of every closed slice of
+    # a non-GBP contract. The account is looked up from the close
+    # trade because `FutureRealisation` carries no account field.
+    account_of_trade: dict[int, str] = {tid: t.account_id for tid, t in future_trades}
+    realisation_ids = count(_REALISATION_ID_BASE)
+    future_realisations: list[tuple[int, FutureRealisation, str]] = []
+    for run in future_runs:
+        if run.result is None or run.instrument.currency == "GBP":
+            continue
+        for realisation in run.result.realisations:
+            synth_id = next(realisation_ids)
+            future_realisations.append(
+                (
+                    synth_id,
+                    realisation,
+                    account_of_trade.get(realisation.close_trade_id, _UNKNOWN_ACCOUNT),
+                )
+            )
+            sources[synth_id] = FutureRealisationRef(
+                open_trade_id=realisation.open_trade_id,
+                close_trade_id=realisation.close_trade_id,
+            )
+
+    # Pool discovery: every non-GBP currency touched by any source. The
+    # dividend / coupon tables are consulted directly so a currency
+    # with cashflows but no trades in the window still gets a pool.
+    seen: set[str] = set()
+    for _tid, trade in forex_trades:
+        if isinstance(trade.instrument, FXInstrument):
+            seen.add(trade.instrument.currency_pair.base)
+            seen.add(trade.instrument.currency_pair.quote)
+    for _tid, trade in stock_trades:
+        seen.add(trade.instrument.currency)
+    for _tid, trade in future_trades:
+        seen.add(trade.instrument.currency)
+    dividend_repo = DividendRepo(conn)
+    coupon_repo = BondCouponRepo(conn)
+    seen.update(dividend_repo.distinct_currencies())
+    seen.update(coupon_repo.distinct_currencies())
+    seen.discard("GBP")
+    currencies = tuple(sorted(seen))
+
+    # Dividends and coupons — loaded per currency in the sorted pool
+    # order so synthetic ids are allocated deterministically.
+    dividend_ids = count(_DIVIDEND_ID_BASE)
+    dividends: list[tuple[int, Dividend]] = []
+    coupon_ids = count(_COUPON_ID_BASE)
+    bond_coupons: list[tuple[int, BondCoupon]] = []
+    for currency in currencies:
+        for dividend_id, dividend in dividend_repo.for_currency(currency, since=since, until=until):
+            synth_id = next(dividend_ids)
+            dividends.append((synth_id, dividend))
+            sources[synth_id] = DividendRef(dividend_id=dividend_id)
+        for coupon_id, coupon in coupon_repo.for_currency(currency, since=since, until=until):
+            synth_id = next(coupon_ids)
+            bond_coupons.append((synth_id, coupon))
+            sources[synth_id] = BondCouponRef(bond_coupon_id=coupon_id)
+
+    return FXInputs(
+        forex_trades=forex_trades,
+        stock_trades=stock_trades,
+        future_trades=future_trades,
+        future_realisations=tuple(future_realisations),
+        dividends=tuple(dividends),
+        bond_coupons=tuple(bond_coupons),
+        sources=MappingProxyType(sources),
+        currencies=currencies,
+    )
+
+
+def run_fx_pools(
+    fx: FXConverter,
+    inputs: FXInputs,
+    currencies: Sequence[str],
+) -> tuple[FXEngineRun, ...]:
+    """Run `FXRuleEngine` once per requested currency over a shared input bundle.
+
+    Pure with respect to the database — `show match` uses this to
+    recompute just the pools one disposal could touch without
+    reloading anything.
+    """
+    engine = FXRuleEngine(fx)
+    out: list[FXEngineRun] = []
+    for currency in currencies:
+        result: MatchingResult | None = None
+        error: Exception | None = None
+        try:
+            result = engine.compute(
+                currency,
+                forex_trades=inputs.forex_trades,
+                stock_trades=inputs.stock_trades,
+                future_trades=inputs.future_trades,
+                future_realisations=inputs.future_realisations,
+                dividends=inputs.dividends,
+                bond_coupons=inputs.bond_coupons,
+            )
+        except _FX_ENGINE_ERRORS as exc:
+            error = exc
+        out.append(FXEngineRun(currency=currency, inputs=inputs, result=result, error=error))
+    return tuple(out)
+
+
+def run_fx_engine(
+    conn: sqlite3.Connection,
+    fx: FXConverter,
+    *,
+    future_runs: Sequence[FutureEngineRun] | None = None,
+    currency: str | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[FXEngineRun, ...]:
+    """Load the FX inputs and run every (or one) non-GBP currency pool.
+
+    Args:
+        conn: Open, migrated connection.
+        fx: FX converter shared by the engines.
+        future_runs: A complete, un-narrowed futures pass to take
+            realisations from. Pass `None` to have the runner perform
+            that pass itself — the only correct choice when the caller's
+            own futures pass was narrowed by symbol or account, because
+            pools are global.
+        currency: Restrict to one pool. A currency no source touches
+            yields an empty tuple rather than an error.
+        since: Inclusive lower bound applied to every dated source.
+        until: Inclusive upper bound applied to every dated source.
+
+    Returns:
+        One `FXEngineRun` per pool, in sorted currency order.
+    """
+    if future_runs is None:
+        future_runs = run_future_engine(conn, fx, since=since, until=until)
+    inputs = load_fx_inputs(conn, future_runs=future_runs, since=since, until=until)
+    if currency is None:
+        currencies: tuple[str, ...] = inputs.currencies
+    else:
+        currencies = tuple(c for c in inputs.currencies if c == currency)
+    return run_fx_pools(fx, inputs, currencies)
+
+
+# ---------------------------------------------------------------------------
+# Whole-history pass
+# ---------------------------------------------------------------------------
+
+
+def run_engines(conn: sqlite3.Connection, fx: FXConverter) -> EngineOutputs:
+    """Run all four engines over the entire history, futures first.
+
+    No filters by design: S.104 pools and the 30-day rule need every
+    trade the taxpayer ever made, and the FX pools need every futures
+    realisation. This is the pass the calculator performs once per
+    computation and then slices by tax year.
+    """
+    futures = run_future_engine(conn, fx)
+    stocks = run_stock_engine(conn, fx)
+    bonds = run_bond_engine(conn, fx)
+    # FX last: it consumes the futures realisations produced above and
+    # nothing consumes its output.
+    fx_runs = run_fx_engine(conn, fx, future_runs=futures)
+    return EngineOutputs(stocks=stocks, bonds=bonds, futures=futures, fx=fx_runs)

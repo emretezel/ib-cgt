@@ -103,6 +103,18 @@ class BondCouponRepo:
     # Read
     # ------------------------------------------------------------------
 
+    def distinct_currencies(self) -> list[str]:
+        """Return every currency that has at least one coupon row, sorted.
+
+        Same role as `DividendRepo.distinct_currencies`: FX-pool
+        discovery must see coupon-only currencies too. GBP is not
+        filtered here; the caller decides what to pool.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT currency FROM bond_coupons ORDER BY currency"
+        ).fetchall()
+        return [str(r["currency"]) for r in rows]
+
     def for_currency(
         self,
         currency: str,

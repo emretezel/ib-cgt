@@ -122,3 +122,22 @@ def test_count_helper(db: sqlite3.Connection) -> None:
     assert repo.count() == 0
     repo.insert_many([_make_div()], source_statement_hash="hash-1")
     assert repo.count() == 1
+
+
+def test_distinct_currencies_is_sorted_and_deduplicated(db: sqlite3.Connection) -> None:
+    _seed_statement(db)
+    repo = DividendRepo(db)
+    repo.insert_many(
+        [
+            _make_div(currency="USD"),
+            _make_div(symbol="VOD", currency="GBP", pay_date=date(2024, 5, 2)),
+            _make_div(symbol="ASML", currency="EUR", pay_date=date(2024, 5, 3)),
+            _make_div(symbol="MSFT", currency="USD", pay_date=date(2024, 5, 4)),
+        ],
+        source_statement_hash="hash-1",
+    )
+    assert repo.distinct_currencies() == ["EUR", "GBP", "USD"]
+
+
+def test_distinct_currencies_empty_table(db: sqlite3.Connection) -> None:
+    assert DividendRepo(db).distinct_currencies() == []

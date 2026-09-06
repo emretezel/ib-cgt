@@ -21,7 +21,7 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
-from ib_cgt.db.connection import open_connection, open_memory_connection
+from ib_cgt.db.connection import open_connection, open_memory_connection, transaction
 from ib_cgt.db.migrator import apply_migrations
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo, StoredBondCoupon
@@ -51,4 +51,5 @@ __all__ = [
     "apply_migrations",
     "open_connection",
     "open_memory_connection",
+    "transaction",
 ]

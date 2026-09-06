@@ -39,10 +39,10 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from itertools import count
 from pathlib import Path
 from typing import Annotated
 
@@ -50,10 +50,22 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from ib_cgt.calculator import (
+    BondEngineRun,
+    FutureEngineRun,
+    FXEngineRun,
+    FXInputs,
+    StockEngineRun,
+    load_fx_inputs,
+    run_bond_engine,
+    run_future_engine,
+    run_fx_engine,
+    run_fx_pools,
+    run_stock_engine,
+)
 from ib_cgt.checks import CheckReport, CheckResult, Scope, Status, run_all
 from ib_cgt.config import resolve_db_path, resolve_fx_base_url
 from ib_cgt.db import (
-    DividendRepo,
     FXRateRepo,
     InstrumentRepo,
     StatementRepo,
@@ -62,13 +74,15 @@ from ib_cgt.db import (
     TradeRepo,
     apply_migrations,
     open_connection,
+    transaction,
 )
 from ib_cgt.domain import (
-    AssetClass,
+    AnyInstrument,
+    BondCouponRef,
     BondInstrument,
     DirectAcquisition,
-    Dividend,
     DividendKind,
+    DividendRef,
     FutureInstrument,
     FutureRealisation,
     FXInstrument,
@@ -86,16 +100,10 @@ from ib_cgt.domain import (
 from ib_cgt.fx import FrankfurterClient, FXService, RateNotFoundError
 from ib_cgt.ingest import IngestResult, ingest_statement
 from ib_cgt.rules import (
-    BondResult,
-    BondRuleEngine,
     ExemptBondResult,
-    FutureResult,
     FutureRuleEngine,
-    FXRuleEngine,
     InconsistentTradeError,
     MatchingResult,
-    StockRuleEngine,
-    UnmatchedDisposalError,
     WrongAssetClassError,
 )
 
@@ -167,6 +175,19 @@ app.add_typer(bonds_app, name="bonds")
 _console = Console()
 
 
+def _build_fx_service(conn: sqlite3.Connection) -> FXService:
+    """The production FX converter: the SQLite rate cache in front of Frankfurter.
+
+    Every command that runs an engine or previews a rate builds the
+    same service; centralising it here keeps the base-URL resolution
+    and the cache wiring in one place.
+    """
+    return FXService(
+        FXRateRepo(conn),
+        FrankfurterClient(base_url=resolve_fx_base_url()),
+    )
+
+
 # ---------------------------------------------------------------------------
 # `db` subgroup
 # ---------------------------------------------------------------------------
@@ -195,6 +216,7 @@ _RESET_TABLES_DATA: tuple[str, ...] = (
     "tax_runs",  # cascades to matched_disposals
     "trades",
     "dividends",
+    "bond_coupons",
     "statements",
     "instruments",  # cascades to {stock,bond,future,fx}_instruments
     "accounts",
@@ -269,7 +291,10 @@ def _execute_reset(
         targets.append("fx_rates")
 
     cleared: dict[str, int] = {}
-    with conn:
+    # One transaction for the whole wipe: a failure part-way (e.g. a
+    # table missing after a botched migration) leaves every table as
+    # it was rather than half-emptied.
+    with transaction(conn):
         for table in targets:
             # Capture the count before the delete so the summary is
             # accurate even on a fresh DB where every count is zero.
@@ -339,10 +364,7 @@ def ingest(
         # haven't been synced for the merger's date+currencies, the
         # synthesis raises `RateNotFoundError`; the operator runs
         # `ib-cgt fx sync` to populate the cache and retries.
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
+        fx_service = _build_fx_service(conn)
         result = ingest_statement(path, conn, replace=replace, fx_service=fx_service)
     finally:
         conn.close()
@@ -640,9 +662,10 @@ def match_futures(
 
     Walks every futures instrument that matches the filters, runs
     `FutureRuleEngine.compute` against its trade history using the
-    real `FXService`, and prints the resulting realisations and open
-    positions. Nothing is written to the database — this command is a
-    read-only audit tool.
+    real `FXService` (via the calculator's shared runner, so the
+    figures are exactly what `compute` would persist), and prints the
+    resulting realisations and open positions. Nothing is written to
+    the database — this command is a read-only audit tool.
     """
     since_date = _parse_iso_date(since, "--since")
     until_date = _parse_iso_date(until, "--until")
@@ -653,28 +676,22 @@ def match_futures(
         # Defensive — same as `ingest`. A fresh DB file would otherwise
         # surface as a confusing "no such table" error.
         apply_migrations(conn)
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
-        engine = FutureRuleEngine(fx_service)
-        instruments = InstrumentRepo(conn).list_futures(symbol=symbol)
-        results = _run_match_futures(
-            conn=conn,
-            engine=engine,
-            instruments=instruments,
-            account=account,
+        runs = run_future_engine(
+            conn,
+            _build_fx_service(conn),
+            symbol=symbol,
+            account_id=account,
             since=since_date,
             until=until_date,
         )
     finally:
         conn.close()
 
-    if not instruments:
+    if not runs:
         _console.print("[yellow]No futures instruments match the given filters.[/]")
         return
 
-    _render_match_futures(results, db_path)
+    _render_match_futures(runs, db_path)
 
 
 def _parse_iso_date(value: str | None, flag_name: str) -> date | None:
@@ -689,43 +706,14 @@ def _parse_iso_date(value: str | None, flag_name: str) -> date | None:
         raise typer.BadParameter(f"invalid {flag_name} value {value!r}: {exc}") from exc
 
 
-# A per-instrument outcome — either a successful `FutureResult` or the
-# exception the engine raised. The CLI walks instruments rather than
-# aborting on the first failure, so error isolation is the whole
-# point of carrying both shapes through the same channel.
-_MatchFuturesRow = tuple[FutureInstrument, FutureResult | None, Exception | None]
+def _trade_dates(trades: Sequence[tuple[int, Trade]]) -> dict[int, date]:
+    """Trade-id → trade-date map for the renderers' "Acq Date" columns.
 
-
-def _run_match_futures(
-    *,
-    conn: sqlite3.Connection,
-    engine: FutureRuleEngine,
-    instruments: list[tuple[int, FutureInstrument]],
-    account: str | None,
-    since: date | None,
-    until: date | None,
-) -> list[_MatchFuturesRow]:
-    """Run the futures engine per-instrument with per-instrument error capture."""
-    trade_repo = TradeRepo(conn)
-    out: list[_MatchFuturesRow] = []
-    for instrument_id, instrument in instruments:
-        trades = trade_repo.for_instrument_with_ids(
-            instrument_id,
-            account_id=account,
-            since=since,
-            until=until,
-        )
-        # Catch only the engine and FX errors that this command is
-        # specifically designed to surface — anything else (programmer
-        # error, IO error) should still propagate so the operator
-        # sees it loud and clear.
-        try:
-            result = engine.compute(instrument, trades)
-        except (WrongAssetClassError, InconsistentTradeError, RateNotFoundError) as exc:
-            out.append((instrument, None, exc))
-            continue
-        out.append((instrument, result, None))
-    return out
+    Cheap to build from the trades a run already carries, so each
+    renderer derives it on the spot rather than threading a side map
+    through every call.
+    """
+    return {trade_id: trade.trade_date for trade_id, trade in trades}
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +721,7 @@ def _run_match_futures(
 # ---------------------------------------------------------------------------
 
 
-def _render_match_futures(rows: list[_MatchFuturesRow], db_path: Path) -> None:
+def _render_match_futures(runs: Sequence[FutureEngineRun], db_path: Path) -> None:
     """Render the realisations, open-positions, summary, and errors blocks.
 
     Errors are deliberately printed last — collected together at the
@@ -741,13 +729,13 @@ def _render_match_futures(rows: list[_MatchFuturesRow], db_path: Path) -> None:
     per-instrument realisations sections — so the operator can scan
     every failure in one place after a multi-instrument run.
     """
-    _render_match_futures_realisations(rows)
-    _render_match_futures_open_positions(rows)
-    _render_match_futures_summary(rows, db_path)
-    _render_match_futures_errors(rows)
+    _render_match_futures_realisations(runs)
+    _render_match_futures_open_positions(runs)
+    _render_match_futures_summary(runs, db_path)
+    _render_match_futures_errors(runs)
 
 
-def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
+def _render_match_futures_realisations(runs: Sequence[FutureEngineRun]) -> None:
     """Print a per-instrument section: bold header then a Rich realisations table.
 
     Per-instrument sections (rather than one combined table) keep the
@@ -760,13 +748,15 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
     cost, and the colour-coded gain.
     """
     _console.print("[bold]Futures realisations (dry-run)[/]")
-    for instrument, result, error in rows:
+    for run in runs:
         # Errors are surfaced together at the end of the output by
         # `_render_match_futures_errors`; skip them here so this
         # section only contains successful per-instrument tables.
-        if error is not None:
+        if run.error is not None:
             continue
+        result = run.result
         assert result is not None  # mypy — error/result are mutually exclusive
+        instrument = run.instrument
         divider = _instrument_divider(instrument)
         _console.print(f"\n[bold cyan]{divider}[/]")
         if not result.realisations:
@@ -805,13 +795,13 @@ def _render_match_futures_realisations(rows: list[_MatchFuturesRow]) -> None:
         _console.print(table)
 
 
-def _render_match_futures_open_positions(rows: list[_MatchFuturesRow]) -> None:
+def _render_match_futures_open_positions(runs: Sequence[FutureEngineRun]) -> None:
     """One flat table of every still-open slice across all instruments."""
     open_positions = [
-        (instrument, position)
-        for instrument, result, error in rows
-        if error is None and result is not None
-        for position in result.open_positions
+        (run.instrument, position)
+        for run in runs
+        if run.error is None and run.result is not None
+        for position in run.result.open_positions
     ]
     if not open_positions:
         _console.print("[dim]No open positions remain after matching.[/]")
@@ -837,27 +827,25 @@ def _render_match_futures_open_positions(rows: list[_MatchFuturesRow]) -> None:
     _console.print(table)
 
 
-def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -> None:
+def _render_match_futures_summary(runs: Sequence[FutureEngineRun], db_path: Path) -> None:
     """Small summary: instrument counts, totals, total realised gain."""
-    error_count = sum(1 for _, _, error in rows if error is not None)
+    error_count = sum(1 for run in runs if run.error is not None)
     realisation_count = sum(
-        len(result.realisations)
-        for _, result, error in rows
-        if error is None and result is not None
+        len(run.result.realisations) for run in runs if run.error is None and run.result is not None
     )
     open_count = sum(
-        len(result.open_positions)
-        for _, result, error in rows
-        if error is None and result is not None
+        len(run.result.open_positions)
+        for run in runs
+        if run.error is None and run.result is not None
     )
     # Aggregate gain via Money so currency invariants stay enforced —
     # every realisation is GBP per `FutureRealisation.__post_init__`,
     # so the running total stays GBP without explicit checks here.
     total_gain = Money.gbp(Decimal("0"))
-    for _, result, error in rows:
-        if error is not None or result is None:
+    for run in runs:
+        if run.error is not None or run.result is None:
             continue
-        for realisation in result.realisations:
+        for realisation in run.result.realisations:
             total_gain = total_gain + realisation.gain_gbp
 
     table = Table(
@@ -867,7 +855,7 @@ def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -
     )
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("Instruments processed", str(len(runs)))
     table.add_row("…with errors", str(error_count))
     table.add_row("Realisations", str(realisation_count))
     table.add_row("Open positions", str(open_count))
@@ -880,7 +868,7 @@ def _render_match_futures_summary(rows: list[_MatchFuturesRow], db_path: Path) -
     _console.print(table)
 
 
-def _render_match_futures_errors(rows: list[_MatchFuturesRow]) -> None:
+def _render_match_futures_errors(runs: Sequence[FutureEngineRun]) -> None:
     """Print every per-instrument error in one block at the end of the output.
 
     Each failing instrument gets a single bullet line — the same
@@ -888,7 +876,7 @@ def _render_match_futures_errors(rows: list[_MatchFuturesRow]) -> None:
     captured exception's message. Returns silently when no rows
     failed so a clean run produces no trailing block at all.
     """
-    error_rows = [(instrument, error) for instrument, _, error in rows if error is not None]
+    error_rows = [(run.instrument, run.error) for run in runs if run.error is not None]
     if not error_rows:
         return
     _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
@@ -994,6 +982,43 @@ def _format_fx_rate(rate: Decimal) -> str:
     return f"{rate:.4f}"
 
 
+def _render_instrument_unmatched_disposals(
+    chunks: Sequence[tuple[AnyInstrument, UnmatchedDisposalChunk]],
+) -> None:
+    """Yellow warning block for soft-residual unmatched disposals (stocks / bonds).
+
+    The runner drives the stock and bond engines in soft-residual
+    mode, so a disposal the four rules cannot cover — a still-open
+    short, or a sale of units the history never saw bought — lands
+    here instead of aborting the instrument. Whether that is expected
+    is decided by `compute` against the statement's open positions;
+    this block just makes it impossible to miss. Silent when there is
+    nothing to show, so the common case prints no extra section.
+    """
+    if not chunks:
+        return
+    _console.print(
+        f"\n[bold yellow]Unmatched disposals ({len(chunks)}) — open short or incomplete history[/]"
+    )
+    table = Table(header_style="bold yellow", show_lines=False)
+    table.add_column("Symbol")
+    table.add_column("Currency")
+    table.add_column("Disp ID", justify="right")
+    table.add_column("Disp Date")
+    table.add_column("Qty Remaining", justify="right")
+    table.add_column("Proceeds Remaining (GBP)", justify="right")
+    for instrument, chunk in chunks:
+        table.add_row(
+            instrument.symbol,
+            instrument.currency,
+            str(chunk.disposal_trade_id),
+            chunk.disposal_date.isoformat(),
+            _format_qty_2dp(chunk.quantity_remaining),
+            _format_money_2dp(chunk.proceeds_remaining_gbp),
+        )
+    _console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # `match stocks`
 # ---------------------------------------------------------------------------
@@ -1040,9 +1065,9 @@ def match_stocks(
     `StockRuleEngine.compute` against its trade history (across all
     accounts — UK CGT pools span every account belonging to the
     taxpayer) using the real `FXService`, and prints the resulting
-    matched-disposal chunks, pool residuals, and final-pool
-    aggregates. Nothing is written to the database — this command
-    is a read-only audit tool.
+    matched-disposal chunks, unmatched residuals, pool residuals, and
+    final-pool aggregates. Nothing is written to the database — this
+    command is a read-only audit tool.
 
     Note that there is intentionally no ``--account`` flag: filtering
     by account would silently break the matching invariants for
@@ -1058,85 +1083,21 @@ def match_stocks(
         # Defensive — same as `ingest`. A fresh DB file would otherwise
         # surface as a confusing "no such table" error.
         apply_migrations(conn)
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
-        engine = StockRuleEngine(fx_service)
-        instruments = InstrumentRepo(conn).list_stocks(symbol=symbol)
-        results = _run_match_stocks(
-            conn=conn,
-            engine=engine,
-            instruments=instruments,
+        runs = run_stock_engine(
+            conn,
+            _build_fx_service(conn),
+            symbol=symbol,
             since=since_date,
             until=until_date,
         )
     finally:
         conn.close()
 
-    if not instruments:
+    if not runs:
         _console.print("[yellow]No stock instruments match the given filters.[/]")
         return
 
-    _render_match_stocks(results, db_path)
-
-
-# A per-instrument outcome — either a successful `MatchingResult`,
-# the trade-id → trade-date map needed by the renderer for direct-
-# match basis dates, or the exception the engine raised. The CLI
-# walks instruments rather than aborting on the first failure, so
-# error isolation is the point of carrying all three through one
-# channel.
-_MatchStocksRow = tuple[
-    StockInstrument,
-    MatchingResult | None,
-    dict[int, date],
-    Exception | None,
-]
-
-
-def _run_match_stocks(
-    *,
-    conn: sqlite3.Connection,
-    engine: StockRuleEngine,
-    instruments: list[tuple[int, StockInstrument]],
-    since: date | None,
-    until: date | None,
-) -> list[_MatchStocksRow]:
-    """Run the stock engine per-instrument with per-instrument error capture.
-
-    Builds a `{trade_id: trade_date}` map per instrument so the
-    renderer can show the basis acquisition's date alongside its
-    trade id (which makes short round-trips readable: the row pairs
-    the sell-short Disp Date with the buy-to-cover Acq Date).
-    """
-    trade_repo = TradeRepo(conn)
-    out: list[_MatchStocksRow] = []
-    for instrument_id, instrument in instruments:
-        # Cross-account: account_id=None pulls every trade for this
-        # instrument across every account. Per the module docstring,
-        # filtering by account here would break the S.104 pool.
-        trades = trade_repo.for_instrument_with_ids(
-            instrument_id,
-            account_id=None,
-            since=since,
-            until=until,
-        )
-        # Trade-id → trade-date map for the renderer's "Acq Date"
-        # column (cheap; the trades are already in memory).
-        date_map = {trade_id: trade.trade_date for trade_id, trade in trades}
-        try:
-            result = engine.compute(instrument, trades)
-        except (
-            WrongAssetClassError,
-            InconsistentTradeError,
-            UnmatchedDisposalError,
-            RateNotFoundError,
-        ) as exc:
-            out.append((instrument, None, date_map, exc))
-            continue
-        out.append((instrument, result, date_map, None))
-    return out
+    _render_match_stocks(runs, db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1144,16 +1105,17 @@ def _run_match_stocks(
 # ---------------------------------------------------------------------------
 
 
-def _render_match_stocks(rows: list[_MatchStocksRow], db_path: Path) -> None:
-    """Render matched-disposals, residuals, final-pool, summary, errors."""
-    _render_match_stocks_disposals(rows)
-    _render_match_stocks_residuals(rows)
-    _render_match_stocks_final_pools(rows)
-    _render_match_stocks_summary(rows, db_path)
-    _render_match_stocks_errors(rows)
+def _render_match_stocks(runs: Sequence[StockEngineRun], db_path: Path) -> None:
+    """Render matched-disposals, unmatched, residuals, final-pool, summary, errors."""
+    _render_match_stocks_disposals(runs)
+    _render_match_stocks_unmatched_disposals(runs)
+    _render_match_stocks_residuals(runs)
+    _render_match_stocks_final_pools(runs)
+    _render_match_stocks_summary(runs, db_path)
+    _render_match_stocks_errors(runs)
 
 
-def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
+def _render_match_stocks_disposals(runs: Sequence[StockEngineRun]) -> None:
     """Per-instrument section: bold header then a Rich matched-disposals table.
 
     Columns, in display order:
@@ -1168,17 +1130,19 @@ def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
     from `Proceeds`, and `Acq Fees` is already inside `Cost`.
     """
     _console.print("[bold]Stock matched disposals (dry-run)[/]")
-    for instrument, result, date_map, error in rows:
-        if error is not None:
+    for run in runs:
+        if run.error is not None:
             # Errors land in the trailing block — same pattern as
             # `match futures`.
             continue
+        result = run.result
         assert result is not None  # mypy — error/result are mutually exclusive
-        divider = _stock_divider(instrument)
+        divider = _stock_divider(run.instrument)
         _console.print(f"\n[bold cyan]{divider}[/]")
         if not result.matched_disposals:
             _console.print("  [dim](no matched disposals)[/]")
             continue
+        date_map = _trade_dates(run.trades)
         table = Table(header_style="bold", show_lines=False)
         table.add_column("Disp ID", justify="right")
         table.add_column("Disp Date")
@@ -1196,13 +1160,25 @@ def _render_match_stocks_disposals(rows: list[_MatchStocksRow]) -> None:
         _console.print(table)
 
 
-def _render_match_stocks_residuals(rows: list[_MatchStocksRow]) -> None:
+def _render_match_stocks_unmatched_disposals(runs: Sequence[StockEngineRun]) -> None:
+    """Yellow block of every soft-residual unmatched disposal across stocks."""
+    _render_instrument_unmatched_disposals(
+        [
+            (run.instrument, chunk)
+            for run in runs
+            if run.error is None and run.result is not None
+            for chunk in run.result.unmatched_disposals
+        ]
+    )
+
+
+def _render_match_stocks_residuals(runs: Sequence[StockEngineRun]) -> None:
     """One flat table of every UnmatchedAcquisition across all instruments."""
     residuals: list[tuple[StockInstrument, UnmatchedAcquisition]] = [
-        (instrument, ua)
-        for instrument, result, _, error in rows
-        if error is None and result is not None
-        for ua in result.unmatched_acquisitions
+        (run.instrument, ua)
+        for run in runs
+        if run.error is None and run.result is not None
+        for ua in run.result.unmatched_acquisitions
     ]
     if not residuals:
         _console.print("[dim]No pool residuals after matching.[/]")
@@ -1231,16 +1207,16 @@ def _render_match_stocks_residuals(rows: list[_MatchStocksRow]) -> None:
     _console.print(table)
 
 
-def _render_match_stocks_final_pools(rows: list[_MatchStocksRow]) -> None:
+def _render_match_stocks_final_pools(runs: Sequence[StockEngineRun]) -> None:
     """Per-instrument final-pool aggregate — one flat table.
 
     Skips instruments whose pool is empty (the typical post-match
     state for an instrument that fully closed every position).
     """
     pools: list[tuple[StockInstrument, TaxLot]] = [
-        (instrument, result.final_pool)
-        for instrument, result, _, error in rows
-        if error is None and result is not None and result.final_pool.quantity > 0
+        (run.instrument, run.result.final_pool)
+        for run in runs
+        if run.error is None and run.result is not None and run.result.final_pool.quantity > 0
     ]
     if not pools:
         return
@@ -1266,19 +1242,19 @@ def _render_match_stocks_final_pools(rows: list[_MatchStocksRow]) -> None:
     _console.print(table)
 
 
-def _render_match_stocks_summary(rows: list[_MatchStocksRow], db_path: Path) -> None:
+def _render_match_stocks_summary(runs: Sequence[StockEngineRun], db_path: Path) -> None:
     """Small summary: counts and total realised gain across all instruments."""
-    error_count = sum(1 for _, _, _, error in rows if error is not None)
+    error_count = sum(1 for run in runs if run.error is not None)
     md_count = sum(
-        len(result.matched_disposals)
-        for _, result, _, error in rows
-        if error is None and result is not None
+        len(run.result.matched_disposals)
+        for run in runs
+        if run.error is None and run.result is not None
     )
     total_gain = Money.gbp(Decimal("0"))
-    for _, result, _, error in rows:
-        if error is not None or result is None:
+    for run in runs:
+        if run.error is not None or run.result is None:
             continue
-        for md in result.matched_disposals:
+        for md in run.result.matched_disposals:
             total_gain = total_gain + md.gain_gbp
 
     table = Table(
@@ -1288,7 +1264,7 @@ def _render_match_stocks_summary(rows: list[_MatchStocksRow], db_path: Path) -> 
     )
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("Instruments processed", str(len(runs)))
     table.add_row("…with errors", str(error_count))
     table.add_row("Matched disposal chunks", str(md_count))
     gain_style = "green" if total_gain.amount >= 0 else "red"
@@ -1299,9 +1275,9 @@ def _render_match_stocks_summary(rows: list[_MatchStocksRow], db_path: Path) -> 
     _console.print(table)
 
 
-def _render_match_stocks_errors(rows: list[_MatchStocksRow]) -> None:
+def _render_match_stocks_errors(runs: Sequence[StockEngineRun]) -> None:
     """Print every per-instrument error in one block at the end."""
-    error_rows = [(instrument, error) for instrument, _, _, error in rows if error is not None]
+    error_rows = [(run.instrument, run.error) for run in runs if run.error is not None]
     if not error_rows:
         return
     _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
@@ -1415,11 +1391,12 @@ def match_fx(
     """Dry-run the FX rule engine per non-GBP currency pool.
 
     Loads every ingested forex trade, every non-GBP stock trade,
-    every non-GBP futures trade, and runs `FutureRuleEngine` to
-    derive realisations. The four cashflow streams are fed into
-    `FXRuleEngine.compute(ccy, …)` per non-GBP currency so the
-    pool reflects every foreign-currency cash movement IB reports
-    (HMRC CG78315 — "foreign currency arising from any source").
+    every non-GBP futures trade, every dividend and coupon, and runs
+    `FutureRuleEngine` to derive realisations. The cashflow streams
+    are fed into `FXRuleEngine.compute(ccy, …)` per non-GBP currency
+    (via the calculator's shared runner) so the pool reflects every
+    foreign-currency cash movement IB reports (HMRC CG78315 —
+    "foreign currency arising from any source").
 
     A cross-currency forex trade like ``EUR.USD`` contributes one
     leg to *each* of the two non-GBP pools it touches. Stock
@@ -1452,364 +1429,145 @@ def match_fx(
         # Defensive — same as `ingest`. A fresh DB file would otherwise
         # surface as a confusing "no such table" error.
         apply_migrations(conn)
-        audit = _load_fx_audit_data(conn, since=since_date, until=until_date)
-        engine = FXRuleEngine(audit.fx_service)
-
-        currencies = _resolve_fx_pool_currencies(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            dividends=audit.dividends,
-            requested=currency,
-        )
-        source_descriptions = _build_fx_source_descriptions(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-        )
-        date_map = _build_fx_event_date_map(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-        )
-        id_label_map = _build_fx_id_label_map(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-            dividend_real_id=audit.dividend_real_id,
-        )
-        results = _run_match_fx(
-            engine=engine,
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-            currencies=currencies,
-            date_map=date_map,
-            source_descriptions=source_descriptions,
-            id_label_map=id_label_map,
+        runs = run_fx_engine(
+            conn,
+            _build_fx_service(conn),
+            currency=currency,
+            since=since_date,
+            until=until_date,
         )
     finally:
         conn.close()
 
-    if not currencies:
+    if not runs:
         if currency is not None:
             _console.print(f"[yellow]Currency '{currency}' has no events in the date range.[/]")
         else:
             _console.print("[yellow]No FX-relevant trades found — nothing to match.[/]")
         return
 
-    _render_match_fx(results, db_path)
+    _render_match_fx(runs, db_path)
 
 
-# Per-currency outcome carried through the renderer. `source_descriptions`
-# augments the trade-id-keyed `date_map` with human-readable labels
-# (e.g. "futures P&L close=…" for a synthetic id from a realisation).
-# `id_label_map` is the *short* form used in narrow ID columns —
-# `#5685` for real trade ids and `P&L #A→#B[i]` for futures
-# realisations — so the table is citeable across runs.
-_MatchFxRow = tuple[
-    str,
-    MatchingResult | None,
-    dict[int, date],
-    dict[int, str],
-    dict[int, str],
-    Exception | None,
-]
+@dataclass(frozen=True, slots=True)
+class _FxLabels:
+    """The three id-keyed side maps the FX renderers read.
 
-
-def _resolve_fx_pool_currencies(
-    *,
-    forex_trades: list[tuple[int, Trade]],
-    stock_trades: list[tuple[int, Trade]],
-    future_trades: list[tuple[int, Trade]],
-    dividends: list[tuple[int, Dividend]],
-    requested: str | None,
-) -> list[str]:
-    """Return the list of non-GBP currency pools to render, in stable order.
-
-    When the user passes ``--currency``, we honour that single pool
-    (validated against the seen set so the renderer doesn't run an
-    engine call that's guaranteed to be empty). Otherwise we walk
-    every source and collect the union of currencies that appear,
-    minus GBP — sorted alphabetically so the output is stable
-    run-to-run. Dividends are surveyed so a pool with dividend-only
-    activity (e.g. a still-held historical position dripping cash
-    dividends with no trades in the window) still renders.
+    Every FX run in a pass shares one `FXInputs` bundle, so the
+    labels are built once per pass from that bundle rather than
+    threaded through each row. `date_map` feeds the "Acq Date"
+    column, `source_descriptions` the "Disp Source" / "Acq Source"
+    columns, and `id_label_map` the narrow citeable id cells.
     """
-    seen: set[str] = set()
-    for _trade_id, trade in forex_trades:
-        instrument = trade.instrument
-        if not isinstance(instrument, FXInstrument):
-            continue
-        seen.add(instrument.currency_pair.base)
-        seen.add(instrument.currency_pair.quote)
-    for _trade_id, trade in stock_trades:
-        seen.add(trade.instrument.currency)
-    for _trade_id, trade in future_trades:
-        seen.add(trade.instrument.currency)
-    for _synth, dividend in dividends:
-        seen.add(dividend.amount.currency)
-    seen.discard("GBP")
-    if requested is None:
-        return sorted(seen)
-    if requested not in seen:
-        return []
-    return [requested]
+
+    date_map: dict[int, date]
+    source_descriptions: dict[int, str]
+    id_label_map: dict[int, str]
+
+    @classmethod
+    def from_inputs(cls, inputs: FXInputs) -> _FxLabels:
+        """Derive every side map from one shared input bundle."""
+        return cls(
+            date_map=_build_fx_event_date_map(inputs),
+            source_descriptions=_build_fx_source_descriptions(inputs),
+            id_label_map=_build_fx_id_label_map(inputs),
+        )
 
 
-def _build_fx_source_descriptions(
-    *,
-    forex_trades: list[tuple[int, Trade]],
-    stock_trades: list[tuple[int, Trade]],
-    future_trades: list[tuple[int, Trade]],
-    future_realisations: list[tuple[int, FutureRealisation, str]],
-    dividends: list[tuple[int, Dividend]],
-) -> dict[int, str]:
-    """Build the trade-id → source-label map used by the FX renderer.
+def _build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
+    """Build the event-id → source-label map used by the FX renderer.
 
     Forex / stock / futures-fee events use the real `trades.trade_id`
-    (globally unique). Realisation P&L events use the synthetic IDs
-    the orchestrator generated (`itertools.count(10**12)`). Dividend
-    events use a separate synthetic-ID range
-    (`itertools.count(2 * 10**12)`) — same collision-avoidance
-    motivation as realisations, just keyed on a different table.
-    Multiple realisations can share a `close_trade_id`; the
-    synthetic ID is what disambiguates them.
+    (globally unique). Realisation P&L, dividend and coupon events
+    use the synthetic ids the runner allocated from disjoint high
+    ranges; the label carries enough of the source to be readable
+    without the id.
     """
     out: dict[int, str] = {}
-    for tid, trade in forex_trades:
+    for tid, trade in inputs.forex_trades:
         out[tid] = f"forex {trade.instrument.symbol} {trade.action.value}"
-    for tid, trade in stock_trades:
+    for tid, trade in inputs.stock_trades:
         out[tid] = f"stock {trade.instrument.symbol} {trade.action.value}"
-    for tid, trade in future_trades:
+    for tid, trade in inputs.future_trades:
         out[tid] = f"futures fee {trade.instrument.symbol} {trade.action.value}"
-    for synth_id, realisation, _account in future_realisations:
+    for synth_id, realisation, _account in inputs.future_realisations:
         side = "P&L"
         out[synth_id] = (
             f"futures {side} {realisation.instrument.symbol} "
             f"open={realisation.open_trade_id} close={realisation.close_trade_id}"
         )
-    for synth_id, dividend in dividends:
+    for synth_id, dividend in inputs.dividends:
         out[synth_id] = f"dividend {dividend.instrument.symbol} {dividend.kind.value}"
+    for synth_id, coupon in inputs.bond_coupons:
+        out[synth_id] = f"bond coupon {coupon.instrument.symbol}"
     return out
 
 
-def _build_fx_event_date_map(
-    *,
-    forex_trades: list[tuple[int, Trade]],
-    stock_trades: list[tuple[int, Trade]],
-    future_trades: list[tuple[int, Trade]],
-    future_realisations: list[tuple[int, FutureRealisation, str]],
-    dividends: list[tuple[int, Dividend]],
-) -> dict[int, date]:
+def _build_fx_event_date_map(inputs: FXInputs) -> dict[int, date]:
     """Map every event id (real or synthetic) to its event date.
 
     The renderer's "Acq Date" column reads this directly. Real
     trade events use `trade_date`; futures-realisation events use
-    `close_date` (the date the P&L cashflow lands); dividend events
-    use `pay_date` (the date the cash hits the foreign-currency
-    balance).
+    `close_date` (the date the P&L cashflow lands); dividend and
+    coupon events use `pay_date` (the date the cash hits the
+    foreign-currency balance).
     """
     out: dict[int, date] = {}
-    for tid, trade in forex_trades:
+    for tid, trade in inputs.forex_trades:
         out[tid] = trade.trade_date
-    for tid, trade in stock_trades:
+    for tid, trade in inputs.stock_trades:
         out[tid] = trade.trade_date
-    for tid, trade in future_trades:
+    for tid, trade in inputs.future_trades:
         out[tid] = trade.trade_date
-    for synth_id, realisation, _account in future_realisations:
+    for synth_id, realisation, _account in inputs.future_realisations:
         out[synth_id] = realisation.close_date
-    for synth_id, dividend in dividends:
+    for synth_id, dividend in inputs.dividends:
         out[synth_id] = dividend.pay_date
+    for synth_id, coupon in inputs.bond_coupons:
+        out[synth_id] = coupon.pay_date
     return out
 
 
-@dataclass(frozen=True, slots=True)
-class _FxAuditData:
-    """Bundle of data needed to feed the FX engine, plus its FX service.
+def _build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
+    """Build the short id label map used in narrow `Disp ID` / `Acq ID` cells.
 
-    Both `match fx` and `show match --disposal` need to load every
-    forex / stock / futures trade and derive futures realisations
-    via `FutureRuleEngine`. Bundling those into one DTO keeps both
-    commands' bodies tidy and ensures they always feed the engine
-    the *same* set of inputs.
-
-    `dividends` carries `(synth_id, Dividend)` pairs ready for
-    `FXRuleEngine.compute(..., dividends=...)`. The synth IDs are
-    allocated from a high range (`itertools.count(2 * 10**12)`) so
-    they don't collide with `trades.trade_id` values or with
-    futures-realisation synth IDs (`10**12`-range). The map back
-    from synth ID to real `dividend_id` lives on `dividend_real_id`
-    so the renderer can show citeable labels like ``"Div #N"``.
-    """
-
-    forex_trades: list[tuple[int, Trade]]
-    stock_trades: list[tuple[int, Trade]]
-    future_trades: list[tuple[int, Trade]]
-    future_realisations: list[tuple[int, FutureRealisation, str]]
-    dividends: list[tuple[int, Dividend]]
-    dividend_real_id: dict[int, int]
-    fx_service: FXService
-
-
-def _load_fx_audit_data(
-    conn: sqlite3.Connection,
-    *,
-    since: date | None = None,
-    until: date | None = None,
-) -> _FxAuditData:
-    """Load the four cashflow sources + run `FutureRuleEngine` per instrument.
-
-    Same semantics `match fx` already uses: forex trades carried
-    whole, non-GBP stock + futures trades filtered in Python, and
-    the futures realisation list materialised by computing per
-    futures instrument. Per-futures-instrument errors are
-    swallowed — this loader's job is to assemble inputs for the FX
-    engine, not to diagnose futures-engine failures (that's what
-    `match futures` is for).
-    """
-    fx_service = FXService(
-        FXRateRepo(conn),
-        FrankfurterClient(base_url=resolve_fx_base_url()),
-    )
-    future_engine = FutureRuleEngine(fx_service)
-
-    trade_repo = TradeRepo(conn)
-    forex_trades = trade_repo.for_asset_class(AssetClass.FX, since=since, until=until)
-    stock_trades = [
-        (tid, t)
-        for tid, t in trade_repo.for_asset_class(AssetClass.STOCK, since=since, until=until)
-        if t.instrument.currency != "GBP"
-    ]
-    future_trades = [
-        (tid, t)
-        for tid, t in trade_repo.for_asset_class(AssetClass.FUTURE, since=since, until=until)
-        if t.instrument.currency != "GBP"
-    ]
-
-    future_realisations: list[tuple[int, FutureRealisation, str]] = []
-    synth_id_gen = count(10**12)
-    future_trade_account: dict[int, str] = {tid: t.account_id for tid, t in future_trades}
-    for instrument_id, instrument in InstrumentRepo(conn).list_futures():
-        if instrument.currency == "GBP":
-            continue
-        inst_trades = trade_repo.for_instrument_with_ids(instrument_id, since=since, until=until)
-        try:
-            future_result = future_engine.compute(instrument, inst_trades)
-        except (
-            WrongAssetClassError,
-            InconsistentTradeError,
-            RateNotFoundError,
-        ):
-            continue
-        for r in future_result.realisations:
-            future_realisations.append(
-                (
-                    next(synth_id_gen),
-                    r,
-                    future_trade_account.get(r.close_trade_id, "U?"),
-                )
-            )
-
-    # Dividends — load every non-GBP cashflow row across the whole
-    # corpus and assign synth IDs from a separate high range so the
-    # `id_label_map` machinery can resolve them without colliding
-    # with trade IDs or futures-realisation synth IDs.
-    dividends: list[tuple[int, Dividend]] = []
-    dividend_real_id: dict[int, int] = {}
-    dividend_synth_gen = count(2 * 10**12)
-    div_repo = DividendRepo(conn)
-    seen_currencies: set[str] = set()
-    for _tid, t in stock_trades:
-        seen_currencies.add(t.instrument.currency)
-    for _tid, t in future_trades:
-        seen_currencies.add(t.instrument.currency)
-    for _tid, t in forex_trades:
-        if isinstance(t.instrument, FXInstrument):
-            seen_currencies.add(t.instrument.currency_pair.base)
-            seen_currencies.add(t.instrument.currency_pair.quote)
-    seen_currencies.discard("GBP")
-    # The dividends-section can also reference instruments the user
-    # never traded in the date window (e.g. a dividend on a still-held
-    # historical position), so widen the currency set by a separate
-    # query rather than relying purely on the trade-side intersection.
-    dividend_currencies = conn.execute(
-        "SELECT DISTINCT currency FROM dividends WHERE currency != 'GBP'"
-    ).fetchall()
-    seen_currencies.update(str(r["currency"]) for r in dividend_currencies)
-    for ccy in sorted(seen_currencies):
-        for did, dividend in div_repo.for_currency(ccy, since=since, until=until):
-            synth = next(dividend_synth_gen)
-            dividends.append((synth, dividend))
-            dividend_real_id[synth] = did
-
-    return _FxAuditData(
-        forex_trades=forex_trades,
-        stock_trades=stock_trades,
-        future_trades=future_trades,
-        future_realisations=future_realisations,
-        dividends=dividends,
-        dividend_real_id=dividend_real_id,
-        fx_service=fx_service,
-    )
-
-
-def _build_fx_id_label_map(
-    *,
-    forex_trades: list[tuple[int, Trade]],
-    stock_trades: list[tuple[int, Trade]],
-    future_trades: list[tuple[int, Trade]],
-    future_realisations: list[tuple[int, FutureRealisation, str]],
-    dividends: list[tuple[int, Dividend]],
-    dividend_real_id: dict[int, int],
-) -> dict[int, str]:
-    """Build the short ID label map used in narrow `Disp ID` / `Acq ID` cells.
-
-    Real trade IDs (forex / stock / futures-fee events) format as
+    Real trade ids (forex / stock / futures-fee events) format as
     `#N` so the column stays compact. Futures-realisation events
     use a stable `P&L #A→#B` notation derived from the open and
-    close trade IDs of the realisation — synthetic engine IDs
-    (`10**12 + N`) shift between runs and aren't citeable, so the
-    renderer never exposes them.
+    close trade ids of the realisation — synthetic engine ids shift
+    between runs and aren't citeable, so the renderer never exposes
+    them.
 
-    Dividend events follow the same principle: the synth ID
-    (`2 * 10**12 + N`) is internal plumbing; the user-facing label
-    carries the real `dividend_id` (`Div #N` for cash dividends and
-    payment-in-lieu, `WHT #N` for withholding-tax) which they can
-    cite in a future ``ib-cgt show dividend <id>`` audit command.
+    Dividend and coupon events follow the same principle: the
+    synthetic id is internal plumbing; the user-facing label carries
+    the real row id recovered from `inputs.sources` (`Div #N` for
+    cash dividends and payment-in-lieu, `WHT #N` for withholding
+    tax, `Cpn #N` for bond coupons).
 
     Multi-slice closeouts: when a single close trade drains
     several open slices, multiple realisations share the same
     `(open, close)` close-trade key. Disambiguate with `[i]`
-    suffixed in the order the futures engine emitted them
-    (orchestrator already preserves that order in
-    `future_realisations`). Single-realisation closes get no
-    suffix to keep the common case compact.
+    suffixed in the order the futures engine emitted them (the
+    runner preserves that order in `future_realisations`).
+    Single-realisation closes get no suffix to keep the common
+    case compact.
     """
     out: dict[int, str] = {}
-    for tid, _trade in forex_trades:
+    for tid, _trade in inputs.forex_trades:
         out[tid] = f"#{tid}"
-    for tid, _trade in stock_trades:
+    for tid, _trade in inputs.stock_trades:
         out[tid] = f"#{tid}"
-    for tid, _trade in future_trades:
+    for tid, _trade in inputs.future_trades:
         out[tid] = f"#{tid}"
 
     # Group realisations by close_trade_id so we can emit `[i]`
     # only when ambiguous. A first pass counts; a second pass
     # assigns indices.
     close_count: dict[int, int] = {}
-    for _synth_id, realisation, _account in future_realisations:
+    for _synth_id, realisation, _account in inputs.future_realisations:
         close_count[realisation.close_trade_id] = close_count.get(realisation.close_trade_id, 0) + 1
     next_index: dict[int, int] = {}
-    for synth_id, realisation, _account in future_realisations:
+    for synth_id, realisation, _account in inputs.future_realisations:
         close_id = realisation.close_trade_id
         open_id = realisation.open_trade_id
         if close_count[close_id] > 1:
@@ -1819,51 +1577,18 @@ def _build_fx_id_label_map(
         else:
             out[synth_id] = f"P&L #{open_id}→#{close_id}"
 
-    # Dividends — `Div #N` for inflows, `WHT #N` for withholding.
-    # The real `dividend_id` is carried in the side map so the
-    # cell stays citeable across runs.
-    for synth_id, dividend in dividends:
-        real_id = dividend_real_id[synth_id]
+    # Dividends — `Div #N` for inflows, `WHT #N` for withholding —
+    # and coupons — `Cpn #N`. The real row id comes from the runner's
+    # provenance map so the cell stays citeable across runs.
+    for synth_id, dividend in inputs.dividends:
+        source = inputs.sources[synth_id]
+        real_id = source.dividend_id if isinstance(source, DividendRef) else synth_id
         prefix = "WHT" if dividend.kind is DividendKind.WITHHOLDING_TAX else "Div"
         out[synth_id] = f"{prefix} #{real_id}"
-    return out
-
-
-def _run_match_fx(
-    *,
-    engine: FXRuleEngine,
-    forex_trades: list[tuple[int, Trade]],
-    stock_trades: list[tuple[int, Trade]],
-    future_trades: list[tuple[int, Trade]],
-    future_realisations: list[tuple[int, FutureRealisation, str]],
-    dividends: list[tuple[int, Dividend]],
-    currencies: list[str],
-    date_map: dict[int, date],
-    source_descriptions: dict[int, str],
-    id_label_map: dict[int, str],
-) -> list[_MatchFxRow]:
-    """Run the FX engine per currency with per-currency error capture."""
-    out: list[_MatchFxRow] = []
-    for ccy in currencies:
-        try:
-            result = engine.compute(
-                ccy,
-                forex_trades=forex_trades,
-                stock_trades=stock_trades,
-                future_trades=future_trades,
-                future_realisations=future_realisations,
-                dividends=dividends,
-            )
-        except (
-            WrongAssetClassError,
-            InconsistentTradeError,
-            UnmatchedDisposalError,
-            RateNotFoundError,
-            ValueError,
-        ) as exc:
-            out.append((ccy, None, date_map, source_descriptions, id_label_map, exc))
-            continue
-        out.append((ccy, result, date_map, source_descriptions, id_label_map, None))
+    for synth_id, _coupon in inputs.bond_coupons:
+        source = inputs.sources[synth_id]
+        real_id = source.bond_coupon_id if isinstance(source, BondCouponRef) else synth_id
+        out[synth_id] = f"Cpn #{real_id}"
     return out
 
 
@@ -1872,17 +1597,18 @@ def _run_match_fx(
 # ---------------------------------------------------------------------------
 
 
-def _render_match_fx(rows: list[_MatchFxRow], db_path: Path) -> None:
+def _render_match_fx(runs: Sequence[FXEngineRun], db_path: Path) -> None:
     """Render matched-disposals, unmatched-warnings, residuals, final-pool, summary, errors."""
-    _render_match_fx_disposals(rows)
-    _render_match_fx_unmatched_disposals(rows)
-    _render_match_fx_residuals(rows)
-    _render_match_fx_final_pools(rows)
-    _render_match_fx_summary(rows, db_path)
-    _render_match_fx_errors(rows)
+    labels = _FxLabels.from_inputs(runs[0].inputs)
+    _render_match_fx_disposals(runs, labels)
+    _render_match_fx_unmatched_disposals(runs, labels)
+    _render_match_fx_residuals(runs, labels)
+    _render_match_fx_final_pools(runs)
+    _render_match_fx_summary(runs, db_path)
+    _render_match_fx_errors(runs)
 
 
-def _render_match_fx_disposals(rows: list[_MatchFxRow]) -> None:
+def _render_match_fx_disposals(runs: Sequence[FXEngineRun], labels: _FxLabels) -> None:
     """Per-currency section: bold header then a Rich matched-disposals table.
 
     Columns mirror `match stocks` exactly — same fee-pairing /
@@ -1890,11 +1616,12 @@ def _render_match_fx_disposals(rows: list[_MatchFxRow]) -> None:
     to retrain across asset classes.
     """
     _console.print("[bold]FX matched disposals (dry-run)[/]")
-    for currency, result, date_map, source_descriptions, id_label_map, error in rows:
-        if error is not None:
+    for run in runs:
+        if run.error is not None:
             continue
+        result = run.result
         assert result is not None  # mypy — error/result are mutually exclusive
-        divider = _fx_divider(currency)
+        divider = _fx_divider(run.currency)
         _console.print(f"\n[bold cyan]{divider}[/]")
         if not result.matched_disposals:
             _console.print("  [dim](no matched disposals)[/]")
@@ -1914,13 +1641,11 @@ def _render_match_fx_disposals(rows: list[_MatchFxRow]) -> None:
         table.add_column("Acq Fees (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
         for md in result.matched_disposals:
-            table.add_row(
-                *_fx_matched_disposal_to_cells(md, date_map, source_descriptions, id_label_map)
-            )
+            table.add_row(*_fx_matched_disposal_to_cells(md, labels))
         _console.print(table)
 
 
-def _render_match_fx_unmatched_disposals(rows: list[_MatchFxRow]) -> None:
+def _render_match_fx_unmatched_disposals(runs: Sequence[FXEngineRun], labels: _FxLabels) -> None:
     """Yellow warning block for soft-residual unmatched disposals.
 
     Surfaces the FX engine's `unmatched_disposals` in a per-pool
@@ -1929,12 +1654,12 @@ def _render_match_fx_unmatched_disposals(rows: list[_MatchFxRow]) -> None:
     and the proportional GBP value of the disposal that couldn't
     be matched.
     """
-    chunks: list[tuple[str, dict[int, str], dict[int, str], UnmatchedDisposalChunk]] = []
-    for currency, result, _date_map, source_descriptions, id_label_map, error in rows:
-        if error is not None or result is None:
-            continue
-        for chunk in result.unmatched_disposals:
-            chunks.append((currency, source_descriptions, id_label_map, chunk))
+    chunks: list[tuple[str, UnmatchedDisposalChunk]] = [
+        (run.currency, chunk)
+        for run in runs
+        if run.error is None and run.result is not None
+        for chunk in run.result.unmatched_disposals
+    ]
     if not chunks:
         return
 
@@ -1949,12 +1674,12 @@ def _render_match_fx_unmatched_disposals(rows: list[_MatchFxRow]) -> None:
     table.add_column("Disp Date")
     table.add_column("Qty Remaining", justify="right")
     table.add_column("Proceeds Remaining (GBP)", justify="right")
-    for currency, source_descriptions, id_label_map, chunk in chunks:
+    for currency, chunk in chunks:
         tid = chunk.disposal_trade_id
         table.add_row(
             currency,
-            id_label_map.get(tid, f"#{tid}"),
-            source_descriptions.get(tid, "—"),
+            labels.id_label_map.get(tid, f"#{tid}"),
+            labels.source_descriptions.get(tid, "—"),
             chunk.disposal_date.isoformat(),
             _format_qty_2dp(chunk.quantity_remaining),
             _format_money_2dp(chunk.proceeds_remaining_gbp),
@@ -1962,13 +1687,13 @@ def _render_match_fx_unmatched_disposals(rows: list[_MatchFxRow]) -> None:
     _console.print(table)
 
 
-def _render_match_fx_residuals(rows: list[_MatchFxRow]) -> None:
+def _render_match_fx_residuals(runs: Sequence[FXEngineRun], labels: _FxLabels) -> None:
     """One flat table of every UnmatchedAcquisition across all currency pools."""
-    residuals: list[tuple[str, dict[int, str], dict[int, str], UnmatchedAcquisition]] = [
-        (currency, source_descriptions, id_label_map, ua)
-        for currency, result, _date_map, source_descriptions, id_label_map, error in rows
-        if error is None and result is not None
-        for ua in result.unmatched_acquisitions
+    residuals: list[tuple[str, UnmatchedAcquisition]] = [
+        (run.currency, ua)
+        for run in runs
+        if run.error is None and run.result is not None
+        for ua in run.result.unmatched_acquisitions
     ]
     if not residuals:
         _console.print("[dim]No pool residuals after matching.[/]")
@@ -1985,11 +1710,11 @@ def _render_match_fx_residuals(rows: list[_MatchFxRow]) -> None:
     table.add_column("Acq Date")
     table.add_column("Qty Remaining", justify="right")
     table.add_column("Cost Remaining (GBP)", justify="right")
-    for currency, source_descriptions, id_label_map, ua in residuals:
+    for currency, ua in residuals:
         table.add_row(
             currency,
-            id_label_map.get(ua.trade_id, f"#{ua.trade_id}"),
-            source_descriptions.get(ua.trade_id, "—"),
+            labels.id_label_map.get(ua.trade_id, f"#{ua.trade_id}"),
+            labels.source_descriptions.get(ua.trade_id, "—"),
             ua.acquisition_date.isoformat(),
             _format_qty_2dp(ua.quantity_remaining),
             _format_money_2dp(ua.cost_remaining_gbp),
@@ -1997,12 +1722,12 @@ def _render_match_fx_residuals(rows: list[_MatchFxRow]) -> None:
     _console.print(table)
 
 
-def _render_match_fx_final_pools(rows: list[_MatchFxRow]) -> None:
+def _render_match_fx_final_pools(runs: Sequence[FXEngineRun]) -> None:
     """Per-currency final-pool aggregate. Skips empty pools."""
     pools: list[tuple[str, TaxLot]] = [
-        (currency, result.final_pool)
-        for currency, result, _date_map, _src, _id_map, error in rows
-        if error is None and result is not None and result.final_pool.quantity > 0
+        (run.currency, run.result.final_pool)
+        for run in runs
+        if run.error is None and run.result is not None and run.result.final_pool.quantity > 0
     ]
     if not pools:
         return
@@ -2026,24 +1751,24 @@ def _render_match_fx_final_pools(rows: list[_MatchFxRow]) -> None:
     _console.print(table)
 
 
-def _render_match_fx_summary(rows: list[_MatchFxRow], db_path: Path) -> None:
+def _render_match_fx_summary(runs: Sequence[FXEngineRun], db_path: Path) -> None:
     """Small summary: counts and total realised gain across all pools."""
-    error_count = sum(1 for _, _, _, _, _, error in rows if error is not None)
+    error_count = sum(1 for run in runs if run.error is not None)
     md_count = sum(
-        len(result.matched_disposals)
-        for _, result, _, _, _, error in rows
-        if error is None and result is not None
+        len(run.result.matched_disposals)
+        for run in runs
+        if run.error is None and run.result is not None
     )
     pools_with_residual = sum(
         1
-        for _, result, _, _, _, error in rows
-        if error is None and result is not None and result.unmatched_disposals
+        for run in runs
+        if run.error is None and run.result is not None and run.result.unmatched_disposals
     )
     total_gain = Money.gbp(Decimal("0"))
-    for _, result, _, _, _, error in rows:
-        if error is not None or result is None:
+    for run in runs:
+        if run.error is not None or run.result is None:
             continue
-        for md in result.matched_disposals:
+        for md in run.result.matched_disposals:
             total_gain = total_gain + md.gain_gbp
 
     table = Table(
@@ -2053,7 +1778,7 @@ def _render_match_fx_summary(rows: list[_MatchFxRow], db_path: Path) -> None:
     )
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Currencies processed", str(len(rows)))
+    table.add_row("Currencies processed", str(len(runs)))
     table.add_row("…with errors", str(error_count))
     table.add_row("…with residual disposals", str(pools_with_residual))
     table.add_row("Matched disposal chunks", str(md_count))
@@ -2065,9 +1790,9 @@ def _render_match_fx_summary(rows: list[_MatchFxRow], db_path: Path) -> None:
     _console.print(table)
 
 
-def _render_match_fx_errors(rows: list[_MatchFxRow]) -> None:
+def _render_match_fx_errors(runs: Sequence[FXEngineRun]) -> None:
     """Print every per-currency error in one block at the end."""
-    error_rows = [(currency, error) for currency, _, _, _, _, error in rows if error is not None]
+    error_rows = [(run.currency, run.error) for run in runs if run.error is not None]
     if not error_rows:
         return
     _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
@@ -2075,31 +1800,25 @@ def _render_match_fx_errors(rows: list[_MatchFxRow]) -> None:
         _console.print(f"  [bold cyan]{_fx_divider(currency)}[/] [red]→ {error}[/]")
 
 
-def _fx_matched_disposal_to_cells(
-    md: MatchedDisposal,
-    date_map: dict[int, date],
-    source_descriptions: dict[int, str],
-    id_label_map: dict[int, str],
-) -> tuple[str, ...]:
+def _fx_matched_disposal_to_cells(md: MatchedDisposal, labels: _FxLabels) -> tuple[str, ...]:
     """FX-specific projection of a `MatchedDisposal` row.
 
     Adds two columns the stocks renderer doesn't have — Disp Source
     and Acq Source — so the auditor can immediately see whether each
-    leg came from a forex trade, a stock trade, a futures fee, or a
-    futures realisation P&L. ID columns consume `id_label_map` so a
-    futures-realisation event renders as `P&L #A→#B[i]` instead of
-    the run-unstable synthetic int.
+    leg came from a forex trade, a stock trade, a futures fee, a
+    futures realisation P&L, a dividend, or a coupon. ID columns
+    consume `labels.id_label_map` so a futures-realisation event
+    renders as `P&L #A→#B[i]` instead of the run-unstable synthetic
+    int.
     """
     proceeds = md.matched_proceeds_gbp
     proceeds_style = "green" if proceeds.amount >= 0 else "red"
     gain = md.gain_gbp
     gain_style = "green" if gain.amount >= 0 else "red"
-    basis_text, acq_source_text, acq_date_text = _fx_basis_cells(
-        md.basis, date_map, source_descriptions, id_label_map
-    )
+    basis_text, acq_source_text, acq_date_text = _fx_basis_cells(md.basis, labels)
     disp_id = md.disposal_trade_id
-    disp_source = source_descriptions.get(disp_id, "—")
-    disp_label = id_label_map.get(disp_id, f"#{disp_id}")
+    disp_source = labels.source_descriptions.get(disp_id, "—")
+    disp_label = labels.id_label_map.get(disp_id, f"#{disp_id}")
     return (
         disp_label,
         disp_source,
@@ -2119,9 +1838,7 @@ def _fx_matched_disposal_to_cells(
 
 def _fx_basis_cells(
     basis: DirectAcquisition | TaxLotSnapshot,
-    date_map: dict[int, date],
-    source_descriptions: dict[int, str],
-    id_label_map: dict[int, str],
+    labels: _FxLabels,
 ) -> tuple[str, str, str]:
     """Return `(basis_text, source_text, acq_date_text)` for the FX basis columns.
 
@@ -2131,10 +1848,10 @@ def _fx_basis_cells(
     """
     if isinstance(basis, DirectAcquisition):
         acq_id = basis.acquisition_trade_id
-        acq_date = date_map.get(acq_id)
+        acq_date = labels.date_map.get(acq_id)
         date_text = acq_date.isoformat() if acq_date is not None else "—"
-        source_text = source_descriptions.get(acq_id, "—")
-        label = id_label_map.get(acq_id, f"#{acq_id}")
+        source_text = labels.source_descriptions.get(acq_id, "—")
+        label = labels.id_label_map.get(acq_id, f"#{acq_id}")
         return f"acq {label}", source_text, date_text
     pool_text = (
         f"S.104 pool: qty={_format_qty_2dp(basis.quantity_before)}, "
@@ -2199,9 +1916,9 @@ def match_bonds(
     * **Exempt bonds** (gilts / QCBs) surface in a yellow "no CGT"
       table with their native-currency buy / sell aggregates.
       No FX conversion, no S.104 pool, no `MatchedDisposal` rows.
-    * **Non-exempt bonds** produce the same five sections
-      `match stocks` does — matched-disposal table, pool residuals,
-      final S.104 pools, summary, errors.
+    * **Non-exempt bonds** produce the same sections `match stocks`
+      does — matched-disposal table, unmatched residuals, pool
+      residuals, final S.104 pools, summary, errors.
 
     Nothing is written to the database — this command is a read-only
     audit tool. As with `match stocks`, there is intentionally no
@@ -2224,83 +1941,21 @@ def match_bonds(
         # (uniform calculator-injection contract). Reusing the real
         # `FXService` keeps the non-exempt path live for any
         # corporate / foreign-issuer bond the user may later trade.
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
-        engine = BondRuleEngine(fx_service)
-        instruments = InstrumentRepo(conn).list_bonds(symbol=symbol)
-        results = _run_match_bonds(
-            conn=conn,
-            engine=engine,
-            instruments=instruments,
+        runs = run_bond_engine(
+            conn,
+            _build_fx_service(conn),
+            symbol=symbol,
             since=since_date,
             until=until_date,
         )
     finally:
         conn.close()
 
-    if not instruments:
+    if not runs:
         _console.print("[yellow]No bond instruments match the given filters.[/]")
         return
 
-    _render_match_bonds(results, db_path)
-
-
-# Per-instrument outcome — either a successful `BondResult`
-# (`MatchingResult` for non-exempt, `ExemptBondResult` for gilts /
-# QCBs), the trade-id → trade-date map needed by the renderer for
-# direct-match basis dates, or the exception the engine raised.
-# Mirrors `_MatchStocksRow`'s shape so error-isolation logic is
-# uniform across `match` commands.
-_MatchBondsRow = tuple[
-    BondInstrument,
-    BondResult | None,
-    dict[int, date],
-    Exception | None,
-]
-
-
-def _run_match_bonds(
-    *,
-    conn: sqlite3.Connection,
-    engine: BondRuleEngine,
-    instruments: list[tuple[int, BondInstrument]],
-    since: date | None,
-    until: date | None,
-) -> list[_MatchBondsRow]:
-    """Run the bond engine per-instrument with per-instrument error capture.
-
-    Builds a `{trade_id: trade_date}` map per instrument so the
-    renderer can show the basis acquisition's date alongside its
-    trade id (only relevant for the non-exempt branch — the exempt
-    branch never produces `MatchedDisposal` rows).
-    """
-    trade_repo = TradeRepo(conn)
-    out: list[_MatchBondsRow] = []
-    for instrument_id, instrument in instruments:
-        # Cross-account: account_id=None pulls every trade for this
-        # bond across every account. Per the docstring, filtering
-        # by account would break the S.104 pool for non-exempt bonds.
-        trades = trade_repo.for_instrument_with_ids(
-            instrument_id,
-            account_id=None,
-            since=since,
-            until=until,
-        )
-        date_map = {trade_id: trade.trade_date for trade_id, trade in trades}
-        try:
-            result = engine.compute(instrument, trades)
-        except (
-            WrongAssetClassError,
-            InconsistentTradeError,
-            UnmatchedDisposalError,
-            RateNotFoundError,
-        ) as exc:
-            out.append((instrument, None, date_map, exc))
-            continue
-        out.append((instrument, result, date_map, None))
-    return out
+    _render_match_bonds(runs, db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2308,17 +1963,18 @@ def _run_match_bonds(
 # ---------------------------------------------------------------------------
 
 
-def _render_match_bonds(rows: list[_MatchBondsRow], db_path: Path) -> None:
-    """Render the six sections of a `match bonds` run."""
-    _render_match_bonds_exempt(rows)
-    _render_match_bonds_disposals(rows)
-    _render_match_bonds_residuals(rows)
-    _render_match_bonds_final_pools(rows)
-    _render_match_bonds_summary(rows, db_path)
-    _render_match_bonds_errors(rows)
+def _render_match_bonds(runs: Sequence[BondEngineRun], db_path: Path) -> None:
+    """Render the seven sections of a `match bonds` run."""
+    _render_match_bonds_exempt(runs)
+    _render_match_bonds_disposals(runs)
+    _render_match_bonds_unmatched_disposals(runs)
+    _render_match_bonds_residuals(runs)
+    _render_match_bonds_final_pools(runs)
+    _render_match_bonds_summary(runs, db_path)
+    _render_match_bonds_errors(runs)
 
 
-def _render_match_bonds_exempt(rows: list[_MatchBondsRow]) -> None:
+def _render_match_bonds_exempt(runs: Sequence[BondEngineRun]) -> None:
     """Yellow summary table for exempt bonds — no CGT, audit only.
 
     UK gilts and QCBs produce no `MatchedDisposal` rows; this table
@@ -2327,9 +1983,9 @@ def _render_match_bonds_exempt(rows: list[_MatchBondsRow]) -> None:
     expected buy / sell registered.
     """
     exempt_rows: list[tuple[BondInstrument, ExemptBondResult]] = [
-        (instrument, result)
-        for instrument, result, _, error in rows
-        if error is None and isinstance(result, ExemptBondResult)
+        (run.instrument, run.result)
+        for run in runs
+        if run.error is None and isinstance(run.result, ExemptBondResult)
     ]
     if not exempt_rows:
         return
@@ -2359,28 +2015,36 @@ def _render_match_bonds_exempt(rows: list[_MatchBondsRow]) -> None:
     _console.print(table)
 
 
-def _render_match_bonds_disposals(rows: list[_MatchBondsRow]) -> None:
+def _matching_bond_runs(
+    runs: Sequence[BondEngineRun],
+) -> list[tuple[BondInstrument, MatchingResult, tuple[tuple[int, Trade], ...]]]:
+    """Narrow a bond pass to the non-exempt runs that produced a `MatchingResult`."""
+    return [
+        (run.instrument, run.result, run.trades)
+        for run in runs
+        if run.error is None and isinstance(run.result, MatchingResult)
+    ]
+
+
+def _render_match_bonds_disposals(runs: Sequence[BondEngineRun]) -> None:
     """Per-non-exempt-bond bold header + matched-disposal table.
 
     Reuses `_matched_disposal_to_cells` — the projection is asset-
     class-agnostic, so the same 11-column shape that drives the
     stock disposal table works here unchanged.
     """
-    matching_rows: list[tuple[BondInstrument, MatchingResult, dict[int, date]]] = [
-        (instrument, result, date_map)
-        for instrument, result, date_map, error in rows
-        if error is None and isinstance(result, MatchingResult)
-    ]
+    matching_rows = _matching_bond_runs(runs)
     if not matching_rows:
         return
 
     _console.print("\n[bold]Bond matched disposals (dry-run)[/]")
-    for instrument, result, date_map in matching_rows:
+    for instrument, result, trades in matching_rows:
         divider = _bond_divider(instrument)
         _console.print(f"\n[bold cyan]{divider}[/]")
         if not result.matched_disposals:
             _console.print("  [dim](no matched disposals)[/]")
             continue
+        date_map = _trade_dates(trades)
         table = Table(header_style="bold", show_lines=False)
         table.add_column("Disp ID", justify="right")
         table.add_column("Disp Date")
@@ -2398,12 +2062,22 @@ def _render_match_bonds_disposals(rows: list[_MatchBondsRow]) -> None:
         _console.print(table)
 
 
-def _render_match_bonds_residuals(rows: list[_MatchBondsRow]) -> None:
+def _render_match_bonds_unmatched_disposals(runs: Sequence[BondEngineRun]) -> None:
+    """Yellow block of every soft-residual unmatched disposal across non-exempt bonds."""
+    _render_instrument_unmatched_disposals(
+        [
+            (instrument, chunk)
+            for instrument, result, _trades in _matching_bond_runs(runs)
+            for chunk in result.unmatched_disposals
+        ]
+    )
+
+
+def _render_match_bonds_residuals(runs: Sequence[BondEngineRun]) -> None:
     """One flat table of every UnmatchedAcquisition across non-exempt bonds."""
     residuals: list[tuple[BondInstrument, UnmatchedAcquisition]] = [
         (instrument, ua)
-        for instrument, result, _, error in rows
-        if error is None and isinstance(result, MatchingResult)
+        for instrument, result, _trades in _matching_bond_runs(runs)
         for ua in result.unmatched_acquisitions
     ]
     if not residuals:
@@ -2432,12 +2106,12 @@ def _render_match_bonds_residuals(rows: list[_MatchBondsRow]) -> None:
     _console.print(table)
 
 
-def _render_match_bonds_final_pools(rows: list[_MatchBondsRow]) -> None:
+def _render_match_bonds_final_pools(runs: Sequence[BondEngineRun]) -> None:
     """Per-non-exempt-bond final-pool aggregate — one flat table."""
     pools: list[tuple[BondInstrument, TaxLot]] = [
         (instrument, result.final_pool)
-        for instrument, result, _, error in rows
-        if error is None and isinstance(result, MatchingResult) and result.final_pool.quantity > 0
+        for instrument, result, _trades in _matching_bond_runs(runs)
+        if result.final_pool.quantity > 0
     ]
     if not pools:
         return
@@ -2463,24 +2137,17 @@ def _render_match_bonds_final_pools(rows: list[_MatchBondsRow]) -> None:
     _console.print(table)
 
 
-def _render_match_bonds_summary(rows: list[_MatchBondsRow], db_path: Path) -> None:
+def _render_match_bonds_summary(runs: Sequence[BondEngineRun], db_path: Path) -> None:
     """Counts table — exempt vs non-exempt vs error split, plus realised gain."""
     exempt_count = sum(
-        1 for _, result, _, error in rows if error is None and isinstance(result, ExemptBondResult)
+        1 for run in runs if run.error is None and isinstance(run.result, ExemptBondResult)
     )
-    matched_count = sum(
-        1 for _, result, _, error in rows if error is None and isinstance(result, MatchingResult)
-    )
-    error_count = sum(1 for _, _, _, error in rows if error is not None)
-    md_count = sum(
-        len(result.matched_disposals)
-        for _, result, _, error in rows
-        if error is None and isinstance(result, MatchingResult)
-    )
+    matching_rows = _matching_bond_runs(runs)
+    matched_count = len(matching_rows)
+    error_count = sum(1 for run in runs if run.error is not None)
+    md_count = sum(len(result.matched_disposals) for _instrument, result, _trades in matching_rows)
     total_gain = Money.gbp(Decimal("0"))
-    for _, result, _, error in rows:
-        if error is not None or not isinstance(result, MatchingResult):
-            continue
+    for _instrument, result, _trades in matching_rows:
         for md in result.matched_disposals:
             total_gain = total_gain + md.gain_gbp
 
@@ -2491,7 +2158,7 @@ def _render_match_bonds_summary(rows: list[_MatchBondsRow], db_path: Path) -> No
     )
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Instruments processed", str(len(rows)))
+    table.add_row("Instruments processed", str(len(runs)))
     table.add_row("…exempt (skipped)", str(exempt_count))
     table.add_row("…non-exempt matched", str(matched_count))
     table.add_row("…with errors", str(error_count))
@@ -2504,9 +2171,9 @@ def _render_match_bonds_summary(rows: list[_MatchBondsRow], db_path: Path) -> No
     _console.print(table)
 
 
-def _render_match_bonds_errors(rows: list[_MatchBondsRow]) -> None:
+def _render_match_bonds_errors(runs: Sequence[BondEngineRun]) -> None:
     """Print every per-instrument error in one block at the end."""
-    error_rows = [(instrument, error) for instrument, _, _, error in rows if error is not None]
+    error_rows = [(run.instrument, run.error) for run in runs if run.error is not None]
     if not error_rows:
         return
     _console.print(f"\n[bold red]Errors ({len(error_rows)})[/]")
@@ -2553,10 +2220,7 @@ def show_trade(
         # FX-conversion preview at trade_date — for non-GBP trades only.
         # Build a real `FXService` so the rate the dossier prints is
         # exactly what the rule engines would consume.
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
+        fx_service = _build_fx_service(conn)
         rate_preview = _fx_rate_preview(stored.trade, fx_service)
     finally:
         conn.close()
@@ -2782,10 +2446,7 @@ def show_realisation(
 
         instrument = stored.trade.instrument
         instrument_trades = TradeRepo(conn).for_instrument_with_ids(stored.instrument_id)
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
+        fx_service = _build_fx_service(conn)
         engine = FutureRuleEngine(fx_service)
         try:
             result = engine.compute(instrument, instrument_trades)
@@ -3000,50 +2661,19 @@ def show_match(
             )
             raise typer.Exit(code=0)
 
-        audit = _load_fx_audit_data(conn)
-        engine = FXRuleEngine(audit.fx_service)
-        source_descriptions = _build_fx_source_descriptions(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-        )
-        date_map = _build_fx_event_date_map(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-        )
-        id_label_map = _build_fx_id_label_map(
-            forex_trades=audit.forex_trades,
-            stock_trades=audit.stock_trades,
-            future_trades=audit.future_trades,
-            future_realisations=audit.future_realisations,
-            dividends=audit.dividends,
-            dividend_real_id=audit.dividend_real_id,
-        )
+        # Same loader `match fx` uses (via the calculator's runner) so
+        # the chunks printed here are exactly the ones that command
+        # rendered. Only the pools this disposal can touch are re-run.
+        fx_service = _build_fx_service(conn)
+        inputs = load_fx_inputs(conn, future_runs=run_future_engine(conn, fx_service))
+        labels = _FxLabels.from_inputs(inputs)
         per_pool_results: list[tuple[str, MatchingResult]] = []
-        for ccy in pools:
-            try:
-                result = engine.compute(
-                    ccy,
-                    forex_trades=audit.forex_trades,
-                    stock_trades=audit.stock_trades,
-                    future_trades=audit.future_trades,
-                    future_realisations=audit.future_realisations,
-                    dividends=audit.dividends,
-                )
-            except (
-                WrongAssetClassError,
-                InconsistentTradeError,
-                RateNotFoundError,
-                ValueError,
-            ) as exc:
-                _console.print(f"[red]Pool {ccy}: {exc}[/]")
+        for run in run_fx_pools(fx_service, inputs, pools):
+            if run.error is not None:
+                _console.print(f"[red]Pool {run.currency}: {run.error}[/]")
                 continue
-            per_pool_results.append((ccy, result))
+            assert run.result is not None  # mypy — error/result are mutually exclusive
+            per_pool_results.append((run.currency, run.result))
     finally:
         conn.close()
 
@@ -3051,9 +2681,7 @@ def show_match(
         disposal_trade_id=disposal,
         stored=stored,
         per_pool_results=per_pool_results,
-        date_map=date_map,
-        source_descriptions=source_descriptions,
-        id_label_map=id_label_map,
+        labels=labels,
         db_path=db_path,
     )
 
@@ -3083,13 +2711,11 @@ def _render_show_match(
     disposal_trade_id: int,
     stored: StoredTrade,
     per_pool_results: list[tuple[str, MatchingResult]],
-    date_map: dict[int, date],
-    source_descriptions: dict[int, str],
-    id_label_map: dict[int, str],
+    labels: _FxLabels,
     db_path: Path,
 ) -> None:
     """Render per-pool tables of chunks belonging to one disposal."""
-    source_label = source_descriptions.get(disposal_trade_id, "—")
+    source_label = labels.source_descriptions.get(disposal_trade_id, "—")
     _console.print(
         f"\n[bold]Disposal #{disposal_trade_id} — {source_label} on "
         f"{stored.trade.trade_date.isoformat()}[/]"
@@ -3129,9 +2755,7 @@ def _render_show_match(
         for i, md in enumerate(chunks, start=1):
             consumed += md.matched_quantity
             after = total_disposal_qty - consumed
-            basis_text, _src, _date = _fx_basis_cells(
-                md.basis, date_map, source_descriptions, id_label_map
-            )
+            basis_text, _src, _date = _fx_basis_cells(md.basis, labels)
             table.add_row(
                 str(i),
                 md.match_rule.value,
@@ -3215,10 +2839,7 @@ def _execute_check(
         # Defensive — same as every other read command. A fresh DB
         # would otherwise surface as "no such table".
         apply_migrations(conn)
-        fx_service = FXService(
-            FXRateRepo(conn),
-            FrankfurterClient(base_url=resolve_fx_base_url()),
-        )
+        fx_service = _build_fx_service(conn)
         report = run_all(
             conn,
             fx=fx_service,

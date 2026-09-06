@@ -15,13 +15,16 @@ handles:
   counts and a Unix-style exit code (``0`` clean, ``1`` any error,
   ``2`` if `--strict` and any warning).
 
-Engine-replay caching is built into the `CheckContext` so multiple
+Engine-run caching is built into the `CheckContext` so multiple
 Tier B / Tier C invariants can share one matching run per
 instrument or currency pool. Tier B alone evaluates ~12 invariants
 per stock instrument; running the engine 12 times per instrument
 would be wasteful and out-of-step (the engines are deterministic,
 but re-running through the FX cache is still ~10x slower than the
-arithmetic on the cached result).
+arithmetic on the cached result). The runs themselves come from
+`ib_cgt.calculator.runner` — the same loader the `match` commands
+and the tax-year calculator use — so the checks assert against
+exactly the inputs production sees.
 
 Author: Emre Tezel
 """
@@ -36,14 +39,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ib_cgt.domain import (
-        FutureInstrument,
-        FutureRealisation,
-        StockInstrument,
-        Trade,
+    from ib_cgt.calculator.runs import (
+        BondEngineRun,
+        EngineOutputs,
+        FutureEngineRun,
+        FXEngineRun,
+        StockEngineRun,
     )
-    from ib_cgt.rules.futures import FutureResult, FXConverter
-    from ib_cgt.rules.matching import MatchingResult
+    from ib_cgt.rules.futures import FXConverter
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +86,7 @@ class Tier(StrEnum):
 
     Maps onto the plan:
     A — pre-match data integrity (SQL only).
-    B — matching invariants (engine replay).
+    B — matching invariants (engine run).
     C — per-asset specifics.
     D — persisted-result invariants (dormant until `compute --year`).
     """
@@ -152,53 +155,14 @@ class CheckResult:
 
 
 @dataclass(slots=True, kw_only=True)
-class StockReplay:
-    """One stock instrument's engine replay (Tier B/C cache entry)."""
-
-    instrument_id: int
-    instrument: StockInstrument
-    trades: tuple[tuple[int, Trade], ...]
-    result: MatchingResult | None
-    error: Exception | None
-
-
-@dataclass(slots=True, kw_only=True)
-class FutureReplay:
-    """One futures instrument's engine replay (Tier C cache entry)."""
-
-    instrument_id: int
-    instrument: FutureInstrument
-    trades: tuple[tuple[int, Trade], ...]
-    result: FutureResult | None
-    error: Exception | None
-
-
-@dataclass(slots=True, kw_only=True)
-class FXReplay:
-    """One currency pool's engine replay (Tier B/C cache entry).
-
-    `inputs` carries the materialised acquisition / disposal lists
-    in the order they were fed to the engine — Tier C3 (cross-pool
-    symmetry) needs them to verify that a forex trade fed two pools
-    rather than one.
-    """
-
-    currency: str
-    forex_trades: tuple[tuple[int, Trade], ...]
-    stock_trades: tuple[tuple[int, Trade], ...]
-    future_trades: tuple[tuple[int, Trade], ...]
-    future_realisations: tuple[tuple[int, FutureRealisation, str], ...]
-    result: MatchingResult | None
-    error: Exception | None
-
-
-@dataclass(slots=True, kw_only=True)
 class CheckContext:
-    """Inputs and lazily-cached engine replays for the check pipeline.
+    """Inputs and lazily-cached engine runs for the check pipeline.
 
     Each Tier B / Tier C check reads from one of the lazy caches so
     we run each engine at most once per `run_all` call regardless of
-    how many invariants reference its output.
+    how many invariants reference its output. The caches are filled
+    by `ib_cgt.calculator.runner` on first access; tests pre-seed
+    them with hand-mutated runs to exercise each invariant.
     """
 
     conn: sqlite3.Connection
@@ -207,39 +171,94 @@ class CheckContext:
     symbol: str | None = None
     since: date | None = None
     until: date | None = None
-    _stock_replays: list[StockReplay] | None = field(default=None, repr=False)
-    _future_replays: list[FutureReplay] | None = field(default=None, repr=False)
-    _fx_replays: list[FXReplay] | None = field(default=None, repr=False)
+    _stock_runs: list[StockEngineRun] | None = field(default=None, repr=False)
+    _bond_runs: list[BondEngineRun] | None = field(default=None, repr=False)
+    _future_runs: list[FutureEngineRun] | None = field(default=None, repr=False)
+    _fx_runs: list[FXEngineRun] | None = field(default=None, repr=False)
 
-    def stock_replays(self) -> list[StockReplay]:
-        """Return the cached stock-engine replays, building them on first call."""
-        if self._stock_replays is None:
-            from ib_cgt.checks.replay import load_stock_replays
+    @property
+    def is_narrowed(self) -> bool:
+        """True when a symbol or date filter clips the engine inputs.
 
-            self._stock_replays = load_stock_replays(
-                self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+        A narrowed context cannot reproduce a persisted tax run (the
+        pools would be built from a partial history), so Tier D's
+        recompute check skips itself when this is set.
+        """
+        return self.symbol is not None or self.since is not None or self.until is not None
+
+    def stock_runs(self) -> list[StockEngineRun]:
+        """Return the cached stock-engine runs, building them on first call."""
+        if self._stock_runs is None:
+            from ib_cgt.calculator.runner import run_stock_engine
+
+            self._stock_runs = list(
+                run_stock_engine(
+                    self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+                )
             )
-        return self._stock_replays
+        return self._stock_runs
 
-    def future_replays(self) -> list[FutureReplay]:
-        """Return the cached futures-engine replays, building them on first call."""
-        if self._future_replays is None:
-            from ib_cgt.checks.replay import load_future_replays
+    def bond_runs(self) -> list[BondEngineRun]:
+        """Return the cached bond-engine runs, building them on first call."""
+        if self._bond_runs is None:
+            from ib_cgt.calculator.runner import run_bond_engine
 
-            self._future_replays = load_future_replays(
-                self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+            self._bond_runs = list(
+                run_bond_engine(
+                    self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+                )
             )
-        return self._future_replays
+        return self._bond_runs
 
-    def fx_replays(self) -> list[FXReplay]:
-        """Return the cached FX-engine replays, building them on first call."""
-        if self._fx_replays is None:
-            from ib_cgt.checks.replay import load_fx_replays
+    def future_runs(self) -> list[FutureEngineRun]:
+        """Return the cached futures-engine runs, building them on first call."""
+        if self._future_runs is None:
+            from ib_cgt.calculator.runner import run_future_engine
 
-            self._fx_replays = load_fx_replays(
-                self.conn, self.fx, since=self.since, until=self.until
+            self._future_runs = list(
+                run_future_engine(
+                    self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+                )
             )
-        return self._fx_replays
+        return self._future_runs
+
+    def fx_runs(self) -> list[FXEngineRun]:
+        """Return the cached FX-engine runs, building them on first call.
+
+        FX pools are global, so a `--symbol` filter must not narrow the
+        futures realisations that feed them: when a symbol is set the
+        runner performs its own complete futures pass; otherwise the
+        cached (complete) futures runs are shared to avoid a second pass.
+        """
+        if self._fx_runs is None:
+            from ib_cgt.calculator.runner import run_fx_engine
+
+            future_runs = None if self.symbol is not None else self.future_runs()
+            self._fx_runs = list(
+                run_fx_engine(
+                    self.conn,
+                    self.fx,
+                    future_runs=future_runs,
+                    since=self.since,
+                    until=self.until,
+                )
+            )
+        return self._fx_runs
+
+    def engine_outputs(self) -> EngineOutputs:
+        """Bundle the four cached runs into the calculator's `EngineOutputs`.
+
+        Lets Tier D hand the checks' cached pass to the calculator's
+        pure report builder instead of running the engines again.
+        """
+        from ib_cgt.calculator.runs import EngineOutputs
+
+        return EngineOutputs(
+            stocks=tuple(self.stock_runs()),
+            bonds=tuple(self.bond_runs()),
+            futures=tuple(self.future_runs()),
+            fx=tuple(self.fx_runs()),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -449,13 +468,13 @@ def run_all(
         strict: If True, the report's `exit_code` is 2 (rather than
             0) when any warning fired. Individual `CheckResult`
             statuses are unaffected.
-        symbol: Restrict Tier B/C engine replays to one stock /
+        symbol: Restrict Tier B/C engine runs to one stock /
             futures symbol. No effect on Tier A.
         since: Inclusive lower bound on trade_date for engine
-            replays. Use sparingly: clipping the trade history
+            runs. Use sparingly: clipping the trade history
             invalidates S.104 pool reconstruction.
         until: Inclusive upper bound on trade_date for engine
-            replays. Same caveat as `since`.
+            runs. Same caveat as `since`.
         scope: Which subset of registered checks to run.
 
     Returns:

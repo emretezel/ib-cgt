@@ -15,9 +15,8 @@ from collections.abc import Sequence
 from dataclasses import replace
 from decimal import Decimal
 
+from ib_cgt.calculator import StockEngineRun, run_stock_engine
 from ib_cgt.checks import Check, CheckResult, Finding, Scope, Status, run_all
-from ib_cgt.checks.framework import StockReplay
-from ib_cgt.checks.replay import load_stock_replays
 from ib_cgt.domain import (
     MatchedDisposal,
     MatchRule,
@@ -66,7 +65,7 @@ def _replay_aapl_with_mutated_result(
     *,
     new_matched: tuple[MatchedDisposal, ...] | None = None,
     new_pool: TaxLot | None = None,
-) -> list[StockReplay]:
+) -> list[StockEngineRun]:
     """Build the stock replays then mutate AAPL's MatchingResult.
 
     The check pipeline reads from the cached replay objects, so
@@ -74,14 +73,14 @@ def _replay_aapl_with_mutated_result(
     each invariant against the corruption without needing to
     actually break the engine.
     """
-    replays = load_stock_replays(db, fx_service)
-    out: list[StockReplay] = []
+    replays = list(run_stock_engine(db, fx_service))
+    out: list[StockEngineRun] = []
     for r in replays:
         if r.instrument.symbol != "AAPL" or r.result is None:
             out.append(r)
             continue
         # Build a new MatchingResult with the mutation; then a new
-        # StockReplay with that result.
+        # StockEngineRun with that result.
         old = r.result
         mutated = MatchingResult(
             matched_disposals=new_matched or old.matched_disposals,
@@ -90,7 +89,7 @@ def _replay_aapl_with_mutated_result(
             unmatched_disposals=old.unmatched_disposals,
         )
         out.append(
-            StockReplay(
+            StockEngineRun(
                 instrument_id=r.instrument_id,
                 instrument=r.instrument,
                 trades=r.trades,
@@ -104,11 +103,11 @@ def _replay_aapl_with_mutated_result(
 def _run_with_replays(
     db: sqlite3.Connection,
     fx_service: FXService,
-    stock_replays: list[StockReplay],
+    stock_replays: list[StockEngineRun],
     *,
     scope: Scope = Scope.STOCKS,
 ) -> list[tuple[Check, Finding]]:
-    """Run checks with a pre-populated `_stock_replays` cache.
+    """Run checks with a pre-populated `_stock_runs` cache.
 
     Returns a list of `(check, finding)` pairs only for checks
     whose scope set matches `scope` — preserves alignment between
@@ -118,9 +117,10 @@ def _run_with_replays(
     from ib_cgt.checks.framework import CheckContext, registered_checks
 
     ctx = CheckContext(conn=db, fx=fx_service)
-    ctx._stock_replays = stock_replays
-    ctx._fx_replays = []
-    ctx._future_replays = []
+    ctx._stock_runs = stock_replays
+    ctx._fx_runs = []
+    ctx._future_runs = []
+    ctx._bond_runs = []
     pairs: list[tuple[Check, Finding]] = []
     for c in registered_checks():
         if scope not in c.scopes:
@@ -131,7 +131,7 @@ def _run_with_replays(
 
 def test_B5_fires_when_pool_overdrawn(db: sqlite3.Connection, fx_service: FXService) -> None:
     """Inflating a SECTION_104 chunk's matched_qty above pool_qty_before fires B5."""
-    replays = load_stock_replays(db, fx_service)
+    replays = list(run_stock_engine(db, fx_service))
     aapl = next(r for r in replays if r.instrument.symbol == "AAPL")
     assert aapl.result is not None
     # Find the SECTION_104 chunk and inflate its quantity.
@@ -150,7 +150,7 @@ def test_B5_fires_when_pool_overdrawn(db: sqlite3.Connection, fx_service: FXServ
 
 def test_B7_fires_on_pool_aggregate_mismatch(db: sqlite3.Connection, fx_service: FXService) -> None:
     """Skewing final_pool.quantity vs unmatched_acquisitions trips B7."""
-    replays = load_stock_replays(db, fx_service)
+    replays = list(run_stock_engine(db, fx_service))
     aapl = next(r for r in replays if r.instrument.symbol == "AAPL")
     assert aapl.result is not None
     # Replace final_pool with one whose quantity is offset by a clearly
@@ -168,7 +168,7 @@ def test_B7_fires_on_pool_aggregate_mismatch(db: sqlite3.Connection, fx_service:
 
 def test_B8_fires_on_basis_rule_mismatch(db: sqlite3.Connection, fx_service: FXService) -> None:
     """A SAME_DAY chunk with a TaxLotSnapshot basis trips B8."""
-    replays = load_stock_replays(db, fx_service)
+    replays = list(run_stock_engine(db, fx_service))
     isf = next(r for r in replays if r.instrument.symbol == "ISF")
     assert isf.result is not None
     same_day = next(c for c in isf.result.matched_disposals if c.match_rule is MatchRule.SAME_DAY)
@@ -205,7 +205,7 @@ def test_B8_fires_on_basis_rule_mismatch(db: sqlite3.Connection, fx_service: FXS
     out = []
     from ib_cgt.checks.framework import CheckContext, registered_checks
 
-    isf_replay = StockReplay(
+    isf_replay = StockEngineRun(
         instrument_id=isf.instrument_id,
         instrument=isf.instrument,
         trades=isf.trades,
@@ -218,9 +218,10 @@ def test_B8_fires_on_basis_rule_mismatch(db: sqlite3.Connection, fx_service: FXS
         error=None,
     )
     ctx = CheckContext(conn=db, fx=fx_service)
-    ctx._stock_replays = [isf_replay if r.instrument.symbol == "ISF" else r for r in replays]
-    ctx._fx_replays = []
-    ctx._future_replays = []
+    ctx._stock_runs = [isf_replay if r.instrument.symbol == "ISF" else r for r in replays]
+    ctx._fx_runs = []
+    ctx._future_runs = []
+    ctx._bond_runs = []
     for c in registered_checks():
         if c.name == "B8":
             out.append(c.fn(ctx))

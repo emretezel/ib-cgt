@@ -32,6 +32,7 @@ from ib_cgt.db.codecs import (
     text_to_date,
     text_to_dec,
 )
+from ib_cgt.db.connection import transaction
 from ib_cgt.domain import (
     AnyInstrument,
     AssetClass,
@@ -95,20 +96,18 @@ class InstrumentRepo:
             return existing
 
         # The connection is in autocommit mode (`isolation_level=None`),
-        # so the explicit BEGIN…COMMIT block is what makes the parent
-        # and child writes atomic.
-        self._conn.execute("BEGIN")
-        try:
+        # so the explicit transaction is what makes the parent and child
+        # writes atomic. `transaction()` joins an enclosing transaction
+        # when the caller (ingest, the calculator's persist step) has
+        # already opened one, so the pair is atomic with the caller's
+        # unit of work rather than committed on its own.
+        with transaction(self._conn):
             cursor = self._conn.execute(
                 "INSERT INTO instruments (asset_class, isin) VALUES (?, ?)",
                 (instrument.asset_class.value, instrument.isin),
             )
             instrument_id = int(cursor.lastrowid or 0)
             self._insert_child(instrument_id, instrument)
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
         return instrument_id
 
     # ------------------------------------------------------------------

@@ -284,7 +284,7 @@ short-aware branching:
 | Sell-short and buy-to-cover same date      | `SAME_DAY` — buy-to-cover as the same-day acquisition                  |
 | Sell-short, buy-to-cover within 30 days    | `BED_AND_BREAKFAST` — buy-to-cover as the 30-day forward acquisition    |
 | Sell-short, buy-to-cover after 30 days     | `LATER_ACQUISITION` — buy-to-cover as the s.105(2) later acquisition    |
-| Sell-short with no buy-to-cover            | `UnmatchedDisposalError` — disposal still residual after all four passes |
+| Sell-short with no buy-to-cover            | strict: `UnmatchedDisposalError`; soft-residual mode (the runner's default): an `UnmatchedDisposalChunk` in `unmatched_disposals` |
 
 For shorts, `MatchedDisposal.disposal_date` is the sell-short trade
 date (the date the borrowed shares are disposed of); the basis
@@ -299,7 +299,7 @@ basis trade id at the domain level).
 | `WrongAssetClassError`   | The engine was handed a non-`StockInstrument`.                                                    |
 | `InconsistentTradeError` | A trade carries an action other than `BUY`/`SELL` (defensive — `Trade.__post_init__` rejects this). |
 | `ValueError`             | A trade's `instrument` doesn't match the engine call's `instrument`.                              |
-| `UnmatchedDisposalError` | Propagated from `MatchingEngine` when a disposal can't be covered by all four rules.              |
+| `UnmatchedDisposalError` | Propagated from `MatchingEngine` when a disposal can't be covered by all four rules — strict mode only; `compute(..., soft_residuals=True)` reports the remainder instead (see *Soft-residual mode* under `FXRuleEngine`). |
 
 ## `FutureRuleEngine`
 
@@ -576,9 +576,18 @@ Soft mode collects the residual into
 `UnmatchedDisposalChunk`) so the renderer can show every matched
 chunk plus a clearly-flagged warning for the un-covered remainder.
 The CLI's `match fx` command surfaces this as a yellow "Unmatched
-disposals" section. Stock and futures matching keep the strict
-default — their inputs are self-contained and a residual genuinely
-indicates bad data.
+disposals" section.
+
+`StockRuleEngine.compute` and `BondRuleEngine.compute` take the
+same switch as a keyword (`soft_residuals=False` by default, so
+direct callers keep strict semantics). The engine runner (below)
+always passes `True`: a still-open short, or a sale of units the
+history never saw bought, is then a residual chunk the `match
+stocks` / `match bonds` commands render in their own yellow block,
+and the tax-year calculator decides whether it is expected by
+reconciling the instrument against the open positions on the
+account's latest statement. Futures never match, so the switch does
+not apply to them.
 
 ### Errors
 
@@ -672,6 +681,45 @@ compatible with a future ingestion change.
 | `ValueError`             | A trade in the input list references a different bond than the engine was called with.        |
 | `UnmatchedDisposalError` | Non-exempt branch only. A disposal still has residual quantity after all four matching passes (typically a buy-to-cover never appearing in the input). |
 
+## The engine runner
+
+`ib_cgt.calculator.runner` is the one place that loads the persisted
+history and drives the four engines. The `match` commands, the
+`check` tiers, and the tax-year calculator all consume it, so every
+command sees the same inputs and the same engine behaviour.
+
+| Entry point                                                | What it does                                                                                   |
+|------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `run_stock_engine(conn, fx, *, symbol, since, until)`      | One `StockEngineRun` per stock, cross-account, soft-residual mode.                              |
+| `run_bond_engine(conn, fx, *, symbol, since, until)`       | One `BondEngineRun` per bond (sealed `BondResult` union), soft-residual mode.                   |
+| `run_future_engine(conn, fx, *, symbol, account_id, …)`    | One `FutureEngineRun` per contract, GBP contracts included.                                     |
+| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP futures trades, futures realisations, dividends, coupons, provenance map, pool list. |
+| `run_fx_engine(conn, fx, *, future_runs, currency, …)`     | One `FXEngineRun` per non-GBP pool; runs its own futures pass when none is supplied.            |
+| `run_engines(conn, fx)`                                    | The whole-history pass: futures → stocks → bonds → FX.                                          |
+
+Each run record carries the instrument (or currency), the trades
+that fed the engine, and *either* the result *or* the captured
+exception — a single bad instrument never blanks the pass.
+
+**Ordering.** The FX engine consumes `FutureRealisation` objects
+(a closed contract settles its P&L in the contract's currency, an
+acquisition or disposal of that currency on the close date), and
+only the futures engine produces them. `load_fx_inputs` therefore
+takes the futures runs as a required argument and `run_engines`
+fixes the order outright. Stock and bond cash legs come from the
+trades themselves, not from those engines' results, so their order
+relative to FX is immaterial; FX is a pure sink.
+
+**Synthetic ids and provenance.** Non-trade FX cashflows get
+integer ids from disjoint high ranges — realisations from
+`10**12`, dividends from `2 * 10**12`, coupons from `3 * 10**12`
+— allocated in a deterministic order (futures in `list_futures`
+order and engine emit order, then dividends and coupons by
+currency and pay date). `FXInputs.sources` maps every synthetic
+id to a `FutureRealisationRef` / `DividendRef` / `BondCouponRef`
+(`ib_cgt.domain.fx_events`), which is how the audit output prints
+`P&L #A→#B`, `Div #N`, `WHT #N` and `Cpn #N` instead of the ids.
+
 ## What's not implemented yet
 
 A strategy-pattern abstract base class for the four engines is
@@ -679,4 +727,4 @@ deliberately deferred — the per-engine APIs are not yet identical
 (FX is per-currency, Stock / Bond / Future are per-instrument; Bond
 returns a sealed union, Future returns its own shape). With four
 real implementations now in place, the right abstraction is easier
-to see; we'll revisit when the calculator orchestrator lands.
+to see; we'll revisit when the tax-year calculator lands.

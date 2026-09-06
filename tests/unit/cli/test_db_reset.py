@@ -150,3 +150,26 @@ def test_reset_without_yes_aborts(runner: CliRunner, populated_db: Path) -> None
     assert result.exit_code == 1, result.stdout
     after = _row_counts(populated_db)
     assert after == before, "declining the prompt must not delete anything"
+
+
+def test_reset_failure_leaves_every_table_intact(
+    runner: CliRunner, populated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DELETE that fails part-way must roll back the deletes before it.
+
+    Appending a non-existent table to the reset list makes the last
+    DELETE raise after every real table has already been emptied
+    inside the transaction; the rollback must restore all of them.
+    """
+    import ib_cgt.cli as cli_module
+
+    before = _row_counts(populated_db)
+    assert before["trades"] > 0
+    monkeypatch.setattr(
+        cli_module,
+        "_RESET_TABLES_DATA",
+        (*cli_module._RESET_TABLES_DATA, "no_such_table"),
+    )
+    result = runner.invoke(app, ["db", "reset", "--yes"])
+    assert result.exit_code != 0
+    assert _row_counts(populated_db) == before

@@ -105,7 +105,7 @@ restrict the column to the enum's value set.
 | Name | Columns | Query pattern served |
 |---|---|---|
 | `ix_trades_instrument_dt` | `(instrument_id, trade_datetime)` | Hot path: `SELECT … WHERE instrument_id = ? ORDER BY trade_datetime ASC`, the calculator's per-instrument chronological scan. |
-| `ix_trades_trade_date` | `(trade_date)` | Tax-year cut-off scans, e.g. `WHERE trade_date BETWEEN ? AND ?` for `distinct_instruments_in(year)`. |
+| `ix_trades_trade_date` | `(trade_date)` | Date-bounded scans — the `since` / `until` filters on `for_instrument_with_ids` / `for_asset_class` and Tier A's date-integrity checks. |
 | `ix_trades_account_date` | `(account_id, trade_date)` | Per-account CLI listings (`ib-cgt trades --account …`) ordered by date. |
 | `ix_trades_statement` | `(source_statement_hash)` | Withdraw-and-reimport workflows that need to delete or audit every trade from one statement. |
 
@@ -116,10 +116,15 @@ None.
 ## Read paths
 
 - [`TradeRepo.for_instrument(instrument_id, *, up_to=None)`](../../src/ib_cgt/db/repos/trades.py)
-  — chronological per-instrument scan; the calculator's hot path.
-- [`TradeRepo.distinct_instruments_in(year)`](../../src/ib_cgt/db/repos/trades.py)
-  — outer-loop driver for `compute --year`; returns the instrument
-  ids touched by any trade inside the tax year.
+  — chronological per-instrument scan.
+- [`TradeRepo.for_instrument_with_ids(instrument_id, *, account_id=, since=, until=)`](../../src/ib_cgt/db/repos/trades.py)
+  — the engine runner's per-instrument load (`(trade_id, Trade)`
+  pairs, chronological). Pools need the whole history, so the
+  calculator never scopes instruments by tax year — it runs every
+  instrument and filters the *results* by date.
+- [`TradeRepo.for_asset_class(asset_class, *, since=, until=)`](../../src/ib_cgt/db/repos/trades.py)
+  — the runner's bulk load for the FX pool inputs (every forex,
+  non-GBP stock and non-GBP futures trade).
 - [`TradeRepo.list_filtered(...)`](../../src/ib_cgt/db/repos/trades.py)
   — flexible CLI listing with optional `account_id` / `symbol` /
   `since` / `limit` filters.

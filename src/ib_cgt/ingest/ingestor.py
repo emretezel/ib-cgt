@@ -26,6 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from ib_cgt.db.connection import transaction
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo
 from ib_cgt.db.repos.dividends import DividendRepo
@@ -232,13 +233,15 @@ def ingest_statement(
     dividend_repo = DividendRepo(conn)
     bond_coupon_repo = BondCouponRepo(conn)
 
-    # One transaction for everything the parser produced. `with conn:`
+    # One transaction for everything the parser produced. `transaction()`
     # issues COMMIT on successful exit and ROLLBACK on exception, which
-    # is exactly the atomicity the idempotency story relies on. When
-    # `replace` is set, the prior-row delete also lives inside this
-    # transaction so a failure between the delete and the re-insert
-    # leaves the DB exactly as it was before the call.
-    with conn:
+    # is exactly the atomicity the idempotency story relies on (the
+    # connection is in autocommit mode, so a bare `with conn:` would
+    # commit every statement individually). When `replace` is set, the
+    # prior-row delete also lives inside this transaction so a failure
+    # between the delete and the re-insert leaves the DB exactly as it
+    # was before the call.
+    with transaction(conn):
         if prior_existed and replace:
             # Migration 004 made `trades.source_statement_hash`
             # ON DELETE CASCADE, migration 009 set the same cascade

@@ -88,10 +88,14 @@ every coupon that pointed at it.
 ## Read paths
 
 - `BondCouponRepo.for_currency(currency, since=, until=)` — primary
-  consumer is the FX rule engine. Returns `(bond_coupon_id,
-  BondCoupon)` pairs ordered by `pay_date` ASC. GBP coupons are
-  retrievable via `currency="GBP"` for audit but the FX projector
-  skips them.
+  consumer is the FX rule engine via the calculator's engine runner
+  (`load_fx_inputs`, which feeds coupons to `FXRuleEngine.compute`).
+  Returns `(bond_coupon_id, BondCoupon)` pairs ordered by `pay_date`
+  ASC. GBP coupons are retrievable via `currency="GBP"` for audit but
+  the FX projector skips them.
+- `BondCouponRepo.distinct_currencies()` — sorted list of every
+  currency with at least one row; unioned into the FX pool list by
+  the runner.
 - `BondCouponRepo.get(bond_coupon_id)` — single-row audit lookup.
   Returns a `StoredBondCoupon` DTO carrying the coupon plus its
   statement provenance.

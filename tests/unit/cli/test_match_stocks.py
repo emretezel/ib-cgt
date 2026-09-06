@@ -338,16 +338,17 @@ def test_match_stocks_cross_account_pool_drains_to_zero(
     assert "Final S.104 pools" not in result.stdout
 
 
-def test_match_stocks_unmatched_disposal_lands_in_errors_block(
+def test_match_stocks_unmatched_disposal_lands_in_unmatched_block(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A still-open short surfaces in the trailing errors block.
+    """A still-open short surfaces in the yellow unmatched-disposals block.
 
-    Seeds only a sell-short with no buy-to-cover. The engine raises
-    `UnmatchedDisposalError`; the CLI captures it and renders it
-    inside the trailing `Errors` block.
+    Seeds only a sell-short with no buy-to-cover. The runner drives
+    the engine in soft-residual mode, so the uncovered sale is
+    reported as an `UnmatchedDisposalChunk` and rendered in the
+    "Unmatched disposals" block — not as an engine error.
     """
     monkeypatch.setenv("COLUMNS", "260")
     db_path = tmp_path / "shorts.sqlite"
@@ -382,11 +383,15 @@ def test_match_stocks_unmatched_disposal_lands_in_errors_block(
 
     result = runner.invoke(app, ["match", "stocks"])
     assert result.exit_code == 0, result.stdout
-    assert "Errors" in result.stdout
-    # Errors block appears after Summary in the output.
+    # No engine error: the short is a residual, not a failure.
+    assert "Errors" not in result.stdout
+    assert "Unmatched disposals (1)" in result.stdout
+    # The block sits between the disposals section and the Summary,
+    # and names the instrument with the full uncovered quantity.
+    unmatched_idx = result.stdout.find("Unmatched disposals")
     summary_idx = result.stdout.find("Summary")
-    errors_idx = result.stdout.find("Errors")
-    assert summary_idx != -1 and errors_idx != -1
-    assert errors_idx > summary_idx
-    # The failing symbol must appear inside the trailing errors block.
-    assert "BBBY" in result.stdout[errors_idx:]
+    assert unmatched_idx != -1 and summary_idx != -1
+    assert unmatched_idx < summary_idx
+    block = result.stdout[unmatched_idx:summary_idx]
+    assert "BBBY" in block
+    assert "100.00" in block

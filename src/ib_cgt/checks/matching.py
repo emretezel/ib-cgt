@@ -1,4 +1,4 @@
-"""Tier B — matching invariants (engine replay).
+"""Tier B — matching invariants (engine run).
 
 Each check re-runs the relevant rule engine against the live
 database (via the shared `CheckContext` cache) and validates that
@@ -17,14 +17,17 @@ docstring promises:
 * the chunk-level net-gain reconciles to the disposal-level figure.
 
 These invariants are what the user explicitly asked for. Each check
-aggregates findings across every replayed instrument / pool so a
+aggregates findings across every instrument / pool run so a
 single CheckResult tells you "every stock is clean" or "AAPL and
 MSFT broke B5".
 
-FX residuals are ignored throughout — the FX engine runs in
-soft-residual mode by design, and B1's strict equality is therefore
-checked for stocks only. Any other invariant that's symmetric (B2,
-B5, B7, B8, B10, B11) covers both stocks and FX.
+Every engine runs in soft-residual mode (the runner's contract), so
+an uncovered disposal appears as an `UnmatchedDisposalChunk` rather
+than an exception. B1 folds those residuals into its quantity
+conservation for stocks; FX residuals are otherwise ignored here
+(they are an expected opening-balance artefact). Any invariant that's
+symmetric (B2, B5, B7, B8, B10, B11) covers stocks, non-exempt bonds
+and FX alike.
 
 Author: Emre Tezel
 """
@@ -36,13 +39,12 @@ from datetime import date
 from decimal import Decimal
 from typing import Final
 
+from ib_cgt.calculator.runs import FXEngineRun, StockEngineRun
 from ib_cgt.checks.framework import (
     CheckContext,
     Finding,
-    FXReplay,
     Scope,
     Severity,
-    StockReplay,
     Tier,
     register_check,
 )
@@ -78,45 +80,54 @@ _BED_AND_BREAKFAST_DAYS: Final = 30
 # ---------------------------------------------------------------------------
 
 
-def _stock_acquisition_qty(replay: StockReplay) -> dict[int, Decimal]:
-    """Map every BUY trade_id in a stock replay to its acquisition quantity."""
-    return {tid: t.quantity for tid, t in replay.trades if t.action is TradeAction.BUY}
+def _stock_acquisition_qty(run: StockEngineRun) -> dict[int, Decimal]:
+    """Map every BUY trade_id in a stock run to its acquisition quantity."""
+    return {tid: t.quantity for tid, t in run.trades if t.action is TradeAction.BUY}
 
 
-def _stock_disposal_qty(replay: StockReplay) -> dict[int, Decimal]:
-    """Map every SELL trade_id in a stock replay to its disposal quantity."""
-    return {tid: t.quantity for tid, t in replay.trades if t.action is TradeAction.SELL}
+def _stock_disposal_qty(run: StockEngineRun) -> dict[int, Decimal]:
+    """Map every SELL trade_id in a stock run to its disposal quantity."""
+    return {tid: t.quantity for tid, t in run.trades if t.action is TradeAction.SELL}
 
 
-def _stock_acquisition_dates(replay: StockReplay) -> dict[int, date]:
+def _stock_acquisition_dates(run: StockEngineRun) -> dict[int, date]:
     """Map every BUY trade_id to its trade_date for B9 date checks."""
-    return {tid: t.trade_date for tid, t in replay.trades if t.action is TradeAction.BUY}
+    return {tid: t.trade_date for tid, t in run.trades if t.action is TradeAction.BUY}
 
 
-def _replay_results(
+def _engine_results(
     ctx: CheckContext,
 ) -> tuple[
-    list[tuple[str, MatchingResult, StockReplay | None, FXReplay | None]],
+    list[tuple[str, MatchingResult, StockEngineRun | None, FXEngineRun | None]],
     list[tuple[str, Exception]],
 ]:
-    """Yield (label, result, stock_or_fx_replay) tuples plus engine errors.
+    """Yield (label, result, stock_run, fx_run) tuples plus engine errors.
 
     Tier B invariants apply to whichever engine produced the
-    `MatchingResult`. Threading both possible replay shapes through
-    a single helper keeps the per-invariant functions short. The
-    discriminator on the third/fourth tuple element lets a check
-    ask for the underlying `trades` list (stocks only) without
-    having to walk the whole context twice.
+    `MatchingResult` — stocks, non-exempt bonds, and FX pools all go
+    through the shared matcher. Threading every shape through a single
+    helper keeps the per-invariant functions short. The third / fourth
+    tuple elements carry the originating run for stocks and FX so a
+    check can reach the underlying `trades` list; bond rows carry
+    `None` for both (no Tier B invariant needs bond trades yet), and
+    exempt bonds contribute nothing because they produce no
+    `MatchingResult`.
     """
-    rows: list[tuple[str, MatchingResult, StockReplay | None, FXReplay | None]] = []
+    rows: list[tuple[str, MatchingResult, StockEngineRun | None, FXEngineRun | None]] = []
     errors: list[tuple[str, Exception]] = []
-    for sr in ctx.stock_replays():
+    for sr in ctx.stock_runs():
         if sr.error is not None:
             errors.append((f"stock {sr.instrument.symbol}", sr.error))
             continue
         if sr.result is not None:
             rows.append((f"stock {sr.instrument.symbol}", sr.result, sr, None))
-    for fx in ctx.fx_replays():
+    for br in ctx.bond_runs():
+        if br.error is not None:
+            errors.append((f"bond {br.instrument.symbol}", br.error))
+            continue
+        if isinstance(br.result, MatchingResult):
+            rows.append((f"bond {br.instrument.symbol}", br.result, None, None))
+    for fx in ctx.fx_runs():
         if fx.error is not None:
             errors.append((f"fx {fx.currency}", fx.error))
             continue
@@ -138,31 +149,47 @@ def _truncate_evidence(rows: Iterable[Mapping[str, object]]) -> tuple[Mapping[st
 
 @register_check(
     name="B1",
-    description="per-disposal Σ matched_quantity == disposal.quantity (stocks)",
+    description="per-disposal Σ matched_qty + unmatched remainder == disposal.quantity (stocks)",
     tier=Tier.B,
     scopes={Scope.ALL, Scope.STOCKS, Scope.POOL},
     severity=Severity.ERROR,
 )
 def _check_per_disposal_qty_conservation(ctx: CheckContext) -> Finding:
+    """Every unit of a disposal is either matched or reported as a residual.
+
+    The runner drives the stock engine in soft-residual mode, so a
+    still-open short (or a sale the history cannot cover) surfaces as
+    an `UnmatchedDisposalChunk` rather than an exception. Quantity
+    conservation therefore reads: matched chunks plus the residual
+    remainder must add back up to the disposal's original quantity —
+    anything else means the engine dropped or double-counted units.
+    """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
-        disposal_qty = _stock_disposal_qty(replay)
+        disposal_qty = _stock_disposal_qty(run)
         sums: dict[int, Decimal] = {}
-        for chunk in replay.result.matched_disposals:
+        for chunk in run.result.matched_disposals:
             sums[chunk.disposal_trade_id] = (
                 sums.get(chunk.disposal_trade_id, Decimal(0)) + chunk.matched_quantity
             )
+        residuals: dict[int, Decimal] = {}
+        for residual in run.result.unmatched_disposals:
+            residuals[residual.disposal_trade_id] = (
+                residuals.get(residual.disposal_trade_id, Decimal(0)) + residual.quantity_remaining
+            )
         for tid, original in disposal_qty.items():
             matched = sums.get(tid, Decimal(0))
-            if abs(matched - original) > _TOLERANCE:
+            remaining = residuals.get(tid, Decimal(0))
+            if abs(matched + remaining - original) > _TOLERANCE:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "disposal_trade_id": tid,
                         "disposal_qty": str(original),
                         "sum_matched_qty": str(matched),
+                        "unmatched_qty": str(remaining),
                     }
                 )
     if not bad:
@@ -193,16 +220,16 @@ def _check_no_chunk_overfill(ctx: CheckContext) -> Finding:
     `_consume`), so this check is a regression net.
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
-        disposal_qty = _stock_disposal_qty(replay)
-        for chunk in replay.result.matched_disposals:
+        disposal_qty = _stock_disposal_qty(run)
+        for chunk in run.result.matched_disposals:
             original = disposal_qty.get(chunk.disposal_trade_id)
             if original is None:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "disposal_trade_id": chunk.disposal_trade_id,
                         "issue": "chunk references unknown disposal trade_id",
                     }
@@ -211,7 +238,7 @@ def _check_no_chunk_overfill(ctx: CheckContext) -> Finding:
             if chunk.matched_quantity > original + _TOLERANCE:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "disposal_trade_id": chunk.disposal_trade_id,
                         "disposal_qty": str(original),
                         "chunk_qty": str(chunk.matched_quantity),
@@ -251,12 +278,12 @@ def _check_per_acquisition_direct_use(ctx: CheckContext) -> Finding:
     sum captures both invariants in one pass.
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
-        acq_qty = _stock_acquisition_qty(replay)
+        acq_qty = _stock_acquisition_qty(run)
         direct_used: dict[int, Decimal] = {}
-        for chunk in replay.result.matched_disposals:
+        for chunk in run.result.matched_disposals:
             if isinstance(chunk.basis, DirectAcquisition):
                 aid = chunk.basis.acquisition_trade_id
                 direct_used[aid] = direct_used.get(aid, Decimal(0)) + chunk.matched_quantity
@@ -265,7 +292,7 @@ def _check_per_acquisition_direct_use(ctx: CheckContext) -> Finding:
             if available is None:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "acquisition_trade_id": aid,
                         "issue": "DIRECT basis references unknown acquisition trade_id",
                     }
@@ -274,7 +301,7 @@ def _check_per_acquisition_direct_use(ctx: CheckContext) -> Finding:
             if used > available + _TOLERANCE:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "acquisition_trade_id": aid,
                         "acq_qty": str(available),
                         "sum_direct_matched_qty": str(used),
@@ -303,7 +330,7 @@ def _check_per_acquisition_direct_use(ctx: CheckContext) -> Finding:
 )
 def _check_pool_overdraw(ctx: CheckContext) -> Finding:
     bad: list[Mapping[str, object]] = []
-    rows, _errors = _replay_results(ctx)
+    rows, _errors = _engine_results(ctx)
     for label, result, _sr, _fx in rows:
         for chunk in result.matched_disposals:
             if chunk.match_rule is not MatchRule.SECTION_104:
@@ -370,23 +397,23 @@ def _check_final_pool_reconciliation(ctx: CheckContext) -> Finding:
     so B6 is restricted to the strict stock case.
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
         total_acq = sum(
-            (t.quantity for _tid, t in replay.trades if t.action is TradeAction.BUY),
+            (t.quantity for _tid, t in run.trades if t.action is TradeAction.BUY),
             start=Decimal(0),
         )
         total_matched = sum(
-            (c.matched_quantity for c in replay.result.matched_disposals),
+            (c.matched_quantity for c in run.result.matched_disposals),
             start=Decimal(0),
         )
         expected = total_acq - total_matched
-        actual = replay.result.final_pool.quantity
+        actual = run.result.final_pool.quantity
         if abs(expected - actual) > _TOLERANCE:
             bad.append(
                 {
-                    "instrument": replay.instrument.symbol,
+                    "instrument": run.instrument.symbol,
                     "sum_acq_qty": str(total_acq),
                     "sum_matched_qty": str(total_matched),
                     "expected_final_pool_qty": str(expected),
@@ -416,7 +443,7 @@ def _check_final_pool_reconciliation(ctx: CheckContext) -> Finding:
 )
 def _check_unmatched_acquisitions_aggregate(ctx: CheckContext) -> Finding:
     bad: list[Mapping[str, object]] = []
-    rows, _errors = _replay_results(ctx)
+    rows, _errors = _engine_results(ctx)
     for label, result, _sr, _fx in rows:
         sum_qty = sum(
             (u.quantity_remaining for u in result.unmatched_acquisitions),
@@ -465,7 +492,7 @@ def _check_unmatched_acquisitions_aggregate(ctx: CheckContext) -> Finding:
 )
 def _check_basis_rule_consistency(ctx: CheckContext) -> Finding:
     bad: list[Mapping[str, object]] = []
-    rows, _errors = _replay_results(ctx)
+    rows, _errors = _engine_results(ctx)
     for label, result, _sr, _fx in rows:
         for chunk in result.matched_disposals:
             if chunk.match_rule is MatchRule.SECTION_104:
@@ -569,12 +596,12 @@ def _check_date_constraints(ctx: CheckContext) -> Finding:
     acquisition dates here.
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
-        acq_dates = _stock_acquisition_dates(replay)
-        label = f"stock {replay.instrument.symbol}"
-        for chunk in replay.result.matched_disposals:
+        acq_dates = _stock_acquisition_dates(run)
+        label = f"stock {run.instrument.symbol}"
+        for chunk in run.result.matched_disposals:
             acq_date: date | None = None
             if isinstance(chunk.basis, DirectAcquisition):
                 acq_date = acq_dates.get(chunk.basis.acquisition_trade_id)
@@ -604,7 +631,7 @@ def _check_date_constraints(ctx: CheckContext) -> Finding:
 )
 def _check_fee_subset(ctx: CheckContext) -> Finding:
     bad: list[Mapping[str, object]] = []
-    rows, _errors = _replay_results(ctx)
+    rows, _errors = _engine_results(ctx)
     for label, result, _sr, _fx in rows:
         for chunk in result.matched_disposals:
             acq_fees = chunk.matched_acquisition_fees_gbp.amount
@@ -659,7 +686,7 @@ def _check_fee_subset(ctx: CheckContext) -> Finding:
 )
 def _check_proceeds_cost_nonnegative(ctx: CheckContext) -> Finding:
     bad: list[Mapping[str, object]] = []
-    rows, _errors = _replay_results(ctx)
+    rows, _errors = _engine_results(ctx)
     for label, result, _sr, _fx in rows:
         for chunk in result.matched_disposals:
             if chunk.matched_proceeds_gbp.amount < 0:
@@ -715,12 +742,12 @@ def _check_net_gain_reconciliation(ctx: CheckContext) -> Finding:
     disposal without needing to re-derive FX figures.
     """
     bad: list[Mapping[str, object]] = []
-    for replay in ctx.stock_replays():
-        if replay.result is None:
+    for run in ctx.stock_runs():
+        if run.result is None:
             continue
         per_disposal_proceeds: dict[int, Decimal] = {}
         per_disposal_cost: dict[int, Decimal] = {}
-        for chunk in replay.result.matched_disposals:
+        for chunk in run.result.matched_disposals:
             tid = chunk.disposal_trade_id
             per_disposal_proceeds[tid] = (
                 per_disposal_proceeds.get(tid, Decimal(0)) + chunk.matched_proceeds_gbp.amount
@@ -733,7 +760,7 @@ def _check_net_gain_reconciliation(ctx: CheckContext) -> Finding:
             if proceeds < 0 or cost < 0:
                 bad.append(
                     {
-                        "instrument": replay.instrument.symbol,
+                        "instrument": run.instrument.symbol,
                         "disposal_trade_id": tid,
                         "issue": "negative aggregate proceeds or cost",
                         "sum_proceeds": str(proceeds),

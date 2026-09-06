@@ -31,6 +31,12 @@ from ib_cgt.domain.disposal import (
 )
 from ib_cgt.domain.dividends import Dividend, DividendKind, InvalidDividendError
 from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
+from ib_cgt.domain.fx_events import (
+    BondCouponRef,
+    DividendRef,
+    FutureRealisationRef,
+    FXEventSource,
+)
 from ib_cgt.domain.money import (
     CurrencyMismatchError,
     CurrencyPair,
@@ -59,6 +65,7 @@ __all__ = [
     "AssetClass",
     "AssetClassSummary",
     "BondCoupon",
+    "BondCouponRef",
     "BondInstrument",
     "CurrencyMismatchError",
     "CurrencyPair",
@@ -66,9 +73,12 @@ __all__ = [
     "Disposal",
     "Dividend",
     "DividendKind",
+    "DividendRef",
+    "FXEventSource",
     "FXInstrument",
     "FutureInstrument",
     "FutureRealisation",
+    "FutureRealisationRef",
     "Instrument",
     "InvalidBondCouponError",
     "InvalidDividendError",

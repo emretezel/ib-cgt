@@ -134,6 +134,8 @@ class BondRuleEngine:
         self,
         instrument: AnyInstrument,
         trades: Sequence[tuple[int, Trade]],
+        *,
+        soft_residuals: bool = False,
     ) -> BondResult:
         """Project trades and run the four-rule matcher (or skip if exempt).
 
@@ -143,6 +145,14 @@ class BondRuleEngine:
                 `WrongAssetClassError`.
             trades: `(trade_id, trade)` pairs. Order is not required
                 (the matcher sorts internally).
+            soft_residuals: Forwarded to `MatchingEngine.match` on the
+                non-exempt branch. False (default) raises
+                `UnmatchedDisposalError` for an uncovered disposal;
+                True returns the remainder in
+                `MatchingResult.unmatched_disposals` instead, which is
+                what the calculator's runner wants so an open short can
+                be reconciled against the statement rather than fail.
+                Ignored on the exempt branch (nothing is matched).
 
         Returns:
             `ExemptBondResult` for exempt bonds (gilts / QCBs) —
@@ -160,8 +170,8 @@ class BondRuleEngine:
             ValueError: A trade in `trades` references a different
                 instrument than `instrument`.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
-                when a non-exempt bond's disposal still carries
-                residual quantity after all four passes.
+                (strict mode only) when a non-exempt bond's disposal
+                still carries residual quantity after all four passes.
         """
         if not isinstance(instrument, BondInstrument):
             raise WrongAssetClassError(
@@ -200,7 +210,9 @@ class BondRuleEngine:
                     detail=f"action {trade.action.value!r} is not valid for a bond trade",
                 )
 
-        return self._matcher.match(instrument, acquisitions, disposals)
+        return self._matcher.match(
+            instrument, acquisitions, disposals, soft_residuals=soft_residuals
+        )
 
     # ------------------------------------------------------------------
     # Exempt-bond summary (no FX, no matching)

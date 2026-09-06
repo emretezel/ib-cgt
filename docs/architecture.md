@@ -150,10 +150,15 @@ where noted.
    details.
 
 6. **CGT calculator / orchestrator** — `ib_cgt.calculator` — entry point
-   for a tax-year computation. Loads trades from the DB, routes each to the
-   right rule engine, calls the FX service for GBP conversions, filters
-   disposals into the target tax year (6 Apr → 5 Apr), persists the run plus
-   `MatchedDisposal` rows for audit.
+   for a tax-year computation. Its `runner` module is the single canonical
+   loader: it reads the trade / dividend / coupon history from the DB and
+   drives the four rule engines in the one order that works (futures before
+   FX, because realised futures P&L is an FX cashflow), with stocks and
+   bonds in soft-residual mode so an open short is reported rather than
+   raised. The `match` commands, the `check` tiers and the calculator all
+   consume that runner. The tax-year layer on top filters disposals into
+   the target tax year (6 Apr → 5 Apr) and persists the run plus
+   `MatchedDisposal` rows for audit. See [`rules.md`](./rules.md#the-engine-runner).
 
 7. **Reporting** — `ib_cgt.report` — consumes a tax run; renders per-asset-
    class summary (count of disposals, total proceeds, cost, gains, losses,
@@ -203,6 +208,8 @@ Rules:
 - `Domain` imports nothing from this library — leaf.
 - No upward imports. `Reporting` may not import from `CLI`; `Rules` may not
   import from `Calculator`; etc.
+- `Checks` (the `ib-cgt check` facility, `ib_cgt.checks`) sits beside `CLI`
+  and consumes `Calculator`'s engine runner; nothing below it imports it.
 - `Config` is injected into components at composition time (in `CLI`), not
   imported downward.
 
@@ -234,7 +241,8 @@ ib-cgt/
 │       ├── ingest/              (planned)
 │       ├── fx/                  (planned)
 │       ├── rules/               (planned)
-│       ├── calculator/          (planned)
+│       ├── calculator/          ← engine runner (`runner.py`, `runs.py`)
+│       ├── checks/              ← `ib-cgt check` facility
 │       ├── report/              (planned)
 │       └── utils/               (planned, if needed)
 └── tests/
@@ -295,8 +303,10 @@ items marked ⬜ are pending.
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
     `ib-cgt match fx [--currency CCY]`.
-11. ⬜ **Calculator orchestrator** — wire engines together, tax-year
-    filtering, persist `tax_run` and `future_realisations`.
+11. 🟡 **Calculator orchestrator** — the engine runner
+    (`ib_cgt.calculator.runner`) is in place and every `match` command
+    and `check` tier runs on it; tax-year filtering and persistence of
+    `tax_run` / `future_realisations` are pending.
 12. ⬜ **Reporting** — console + CSV + JSON renderers.
 13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
@@ -311,7 +321,7 @@ items marked ⬜ are pending.
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
-| 7 | Calculator | `ib_cgt.calculator` | ⬜ Pending |
+| 7 | Calculator | `ib_cgt.calculator` | 🟡 engine runner (`run_engines` + per-engine loaders); tax-year computation pending |
 | 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
 | 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |

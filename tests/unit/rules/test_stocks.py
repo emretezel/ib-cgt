@@ -400,3 +400,25 @@ def test_empty_trades_returns_empty_result() -> None:
     assert result.unmatched_acquisitions == ()
     assert result.final_pool.quantity == Decimal("0")
     assert result.final_pool.instrument == inst
+
+
+def test_open_short_with_soft_residuals_reports_chunk_instead_of_raising() -> None:
+    """`soft_residuals=True` returns the uncovered remainder rather than raising."""
+    fx = StubFXService({})
+    engine = StockRuleEngine(fx)
+    inst = _gbp_stock()
+    trades = [
+        (
+            1,
+            stock_trade(
+                action=TradeAction.SELL, on=date(2024, 5, 1), qty=10, price=100, instrument=inst
+            ),
+        ),
+    ]
+    result = engine.compute(inst, trades, soft_residuals=True)
+    assert result.matched_disposals == ()
+    assert len(result.unmatched_disposals) == 1
+    chunk = result.unmatched_disposals[0]
+    assert chunk.disposal_trade_id == 1
+    assert chunk.quantity_remaining == Decimal("10")
+    assert chunk.disposal_date == date(2024, 5, 1)

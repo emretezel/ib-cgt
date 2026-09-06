@@ -86,6 +86,8 @@ class StockRuleEngine:
         self,
         instrument: AnyInstrument,
         trades: Sequence[tuple[int, Trade]],
+        *,
+        soft_residuals: bool = False,
     ) -> MatchingResult:
         """Project trades into GBP and run the four-rule matcher.
 
@@ -100,6 +102,14 @@ class StockRuleEngine:
             trades: `(trade_id, trade)` pairs, typically in
                 chronological order. The matcher sorts internally,
                 so input order is not required.
+            soft_residuals: Forwarded to `MatchingEngine.match`. When
+                False (the default) a disposal the four passes cannot
+                cover raises `UnmatchedDisposalError`. When True the
+                uncovered remainder is returned in
+                `MatchingResult.unmatched_disposals` instead — the
+                calculator's runner uses this so a still-open short
+                (confirmed against the statement's open positions)
+                is reported rather than treated as a failure.
 
         Returns:
             `MatchingResult` with matched chunks (in (chronological,
@@ -116,9 +126,10 @@ class StockRuleEngine:
             ValueError: A trade in `trades` references a different
                 instrument than `instrument`.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
-                when a disposal still carries residual quantity
-                after all four passes (typically a still-open short
-                with no buy-to-cover anywhere in the input).
+                (strict mode only) when a disposal still carries
+                residual quantity after all four passes (typically a
+                still-open short with no buy-to-cover anywhere in
+                the input).
         """
         if not isinstance(instrument, StockInstrument):
             raise WrongAssetClassError(
@@ -153,7 +164,9 @@ class StockRuleEngine:
                     detail=f"action {trade.action.value!r} is not valid for a stock trade",
                 )
 
-        return self._matcher.match(instrument, acquisitions, disposals)
+        return self._matcher.match(
+            instrument, acquisitions, disposals, soft_residuals=soft_residuals
+        )
 
     # ------------------------------------------------------------------
     # Per-trade projection

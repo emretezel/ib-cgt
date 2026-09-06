@@ -338,3 +338,39 @@ def test_mixed_instrument_on_exempt_bond_also_raises() -> None:
     )
     with pytest.raises(ValueError, match="different bond"):
         engine.compute(gilt_a, [(1, trade)])
+
+
+def test_non_exempt_open_short_is_strict_by_default() -> None:
+    """A non-exempt bond sold short with no cover raises under the default."""
+    from ib_cgt.rules.errors import UnmatchedDisposalError
+
+    engine = BondRuleEngine(StubFXService({}))
+    inst = _corp_bond_gbp()
+    trades = [
+        (
+            1,
+            _bond_trade(
+                action=TradeAction.SELL, on=date(2024, 5, 1), qty=10, price=100, instrument=inst
+            ),
+        ),
+    ]
+    with pytest.raises(UnmatchedDisposalError):
+        engine.compute(inst, trades)
+
+
+def test_non_exempt_open_short_with_soft_residuals_reports_chunk() -> None:
+    """`soft_residuals=True` reports the uncovered remainder on the non-exempt branch."""
+    engine = BondRuleEngine(StubFXService({}))
+    inst = _corp_bond_gbp()
+    trades = [
+        (
+            1,
+            _bond_trade(
+                action=TradeAction.SELL, on=date(2024, 5, 1), qty=10, price=100, instrument=inst
+            ),
+        ),
+    ]
+    result = engine.compute(inst, trades, soft_residuals=True)
+    assert isinstance(result, MatchingResult)
+    assert result.matched_disposals == ()
+    assert [c.quantity_remaining for c in result.unmatched_disposals] == [Decimal("10")]

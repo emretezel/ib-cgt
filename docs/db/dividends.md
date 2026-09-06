@@ -83,9 +83,12 @@ every dividend that pointed at it.
 ## Read paths
 
 - `DividendRepo.for_currency(currency, since=, until=)` — primary
-  consumer is the FX rule engine via the CLI's `_load_fx_audit_data`
-  helper. Returns `(dividend_id, Dividend)` pairs ordered by
-  `pay_date` ASC.
+  consumer is the FX rule engine via the calculator's engine runner
+  (`load_fx_inputs`). Returns `(dividend_id, Dividend)` pairs ordered
+  by `pay_date` ASC.
+- `DividendRepo.distinct_currencies()` — sorted list of every
+  currency with at least one row; the runner unions it into the FX
+  pool list so a dividend-only currency still gets a pool.
 - `DividendRepo.get(dividend_id)` — single-row audit lookup.
   Returns a `StoredDividend` DTO carrying the dividend plus its
   statement provenance.

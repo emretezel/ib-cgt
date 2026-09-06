@@ -14,7 +14,6 @@ from ib_cgt.domain import (
     Account,
     Money,
     StockInstrument,
-    TaxYear,
     Trade,
     TradeAction,
 )
@@ -156,30 +155,6 @@ def test_for_instrument_honours_up_to_cutoff(db: sqlite3.Connection) -> None:
     iid = InstrumentRepo(db).upsert(_aapl_buy().instrument)
     loaded = repo.for_instrument(iid, up_to=date(2024, 7, 15))
     assert [t.trade_date for t in loaded] == [date(2024, 7, 10)]
-
-
-def test_distinct_instruments_in_tax_year(db: sqlite3.Connection) -> None:
-    _seed_account_and_statement(db)
-    repo = TradeRepo(db)
-
-    # A trade in the 2024/25 tax year (starts 6 Apr 2024).
-    repo.insert_many([_aapl_buy(day=15)], source_statement_hash="hash-a")
-    # A trade well before the tax year.
-    old = Trade(
-        account_id="U1",
-        instrument=StockInstrument(symbol="MSFT", currency="USD"),
-        action=TradeAction.BUY,
-        trade_datetime=datetime(2023, 1, 10, 14, 0, tzinfo=_UK),
-        trade_date=date(2023, 1, 10),
-        settlement_date=date(2023, 1, 12),
-        quantity=Decimal("5"),
-        price=Money.of("400", "USD"),
-        fees=Money.of("1", "USD"),
-    )
-    repo.insert_many([old], source_statement_hash="hash-a")
-
-    touched = repo.distinct_instruments_in(TaxYear(2024))
-    assert len(touched) == 1  # only AAPL is in-window
 
 
 def test_unknown_statement_hash_rejected(db: sqlite3.Connection) -> None:

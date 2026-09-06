@@ -105,6 +105,20 @@ class DividendRepo:
     # Read
     # ------------------------------------------------------------------
 
+    def distinct_currencies(self) -> list[str]:
+        """Return every currency that has at least one dividend row, sorted.
+
+        Drives FX-pool discovery in the calculator's runner: a currency
+        that only ever appears as a dividend (a still-held historical
+        position dripping cash with no trades in the window) must still
+        get a pool. GBP is *not* filtered here — the caller decides
+        which currencies are pooled; this method just reports the facts.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT currency FROM dividends ORDER BY currency"
+        ).fetchall()
+        return [str(r["currency"]) for r in rows]
+
     def for_currency(
         self,
         currency: str,

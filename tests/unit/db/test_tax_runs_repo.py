@@ -6,7 +6,9 @@ import sqlite3
 from datetime import date
 from decimal import Decimal
 
-from ib_cgt.db import MatchedDisposalRepo, TaxRunRepo
+import pytest
+
+from ib_cgt.db import MatchedDisposalRepo, TaxRunRepo, transaction
 from ib_cgt.domain import (
     DirectAcquisition,
     MatchedDisposal,
@@ -213,3 +215,21 @@ def test_matched_disposal_pool_round_trip_with_fees(db: sqlite3.Connection) -> N
 
     loaded = matches.for_run(run_id)
     assert loaded == [m]
+
+
+def test_replace_for_joins_an_enclosing_transaction(db: sqlite3.Connection) -> None:
+    """A failing outer unit of work must leave the prior run untouched."""
+    runs = TaxRunRepo(db)
+    runs.create(TaxYear(2024), Money.gbp("100"))
+    with pytest.raises(RuntimeError), transaction(db):
+        runs.replace_for(TaxYear(2024), Money.gbp("200"))
+        raise RuntimeError("boom")
+    latest = runs.latest_for(TaxYear(2024))
+    assert latest is not None
+    assert latest.net_gbp == Money.gbp("100")
+    assert db.execute("SELECT COUNT(*) FROM tax_runs").fetchone()[0] == 1
+
+
+def test_create_rejects_non_gbp(db: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="must be GBP"):
+        TaxRunRepo(db).create(TaxYear(2024), Money.of("1", "USD"))

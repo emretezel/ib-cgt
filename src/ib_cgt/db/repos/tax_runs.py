@@ -27,6 +27,7 @@ from ib_cgt.db.codecs import (
     text_to_date,
     text_to_dec,
 )
+from ib_cgt.db.connection import transaction
 from ib_cgt.db.repos.instruments import InstrumentRepo
 from ib_cgt.domain import (
     DirectAcquisition,
@@ -81,19 +82,16 @@ class TaxRunRepo:
 
         Wrapped in a single transaction so the observable state never has
         zero runs for the year (every reader either sees the old run or
-        the new one, never nothing).
+        the new one, never nothing). `transaction()` joins an enclosing
+        transaction, so the calculator can wrap this call together with
+        the child-table inserts in one atomic unit of work.
         """
-        self._conn.execute("BEGIN")
-        try:
+        with transaction(self._conn):
             self._conn.execute(
                 "DELETE FROM tax_runs WHERE tax_year = ?",
                 (tax_year.start_year,),
             )
             run_id = self.create(tax_year, net_gbp)
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
         return run_id
 
     def latest_for(self, tax_year: TaxYear) -> TaxRun | None:
