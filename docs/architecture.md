@@ -202,10 +202,22 @@ where noted.
    what worked". See [`rules.md`](./rules.md#persistence) and
    [`rules.md`](./rules.md#the-engine-runner).
 
-7. **Reporting** — `ib_cgt.report` — consumes a tax run; renders per-asset-
-   class summary (count of disposals, total proceeds, cost, gains, losses,
-   net) and a disposal-by-disposal detail (HMRC / SA108 evidence). Output
-   formats: console (rich tables), CSV, JSON. Pure formatting — no tax logic.
+7. **Reporting** — `ib_cgt.report` — consumes a persisted tax run
+   (`calculator.load_persisted_run`) and renders the SA108 view of it:
+   the five box figures per form section ("Listed shares and
+   securities" for stocks and non-exempt bonds, boxes 23–27; "Other
+   property, assets and gains" for futures close-outs and currency
+   pools, boxes 14–19), split by asset class, then one computation per
+   HMRC disposal (one instrument, one day) in the working-sheet layout
+   of the SA108 notes (A proceeds, B incidental costs of disposal, C,
+   D cost, E incidental costs of acquisition, G, H). `model` is the
+   report shape, `builder` the only arithmetic (gross proceeds and fee
+   un-folding, the futures proceeds / cost convention, per-line
+   gain / loss classification), `sources` / `labels` resolve engine ids
+   to the citeable labels of `docs/audit.md`, `document` / `layout`
+   form the page, and `render` emits console (rich), Markdown, JSON and
+   CSV. Pure formatting on top of persisted results — no engine pass,
+   no FX lookups. See [`reporting.md`](./reporting.md).
 
 8. **CLI** — `ib_cgt.cli` — Typer app, laid out as a package with one
    module per command or command group. `cli/app.py` owns the root
@@ -281,6 +293,7 @@ ib-cgt/
 ├── docs/
 │   ├── index.md
 │   ├── architecture.md          ← this page
+│   ├── reporting.md             ← SA108 report: box mapping, conventions, formats
 │   ├── cgt-rules.md             (planned)
 │   ├── ingestion.md             (planned)
 │   ├── fx.md                    (planned)
@@ -314,8 +327,16 @@ ib-cgt/
 │       │   ├── show_trade.py / show_realisation.py / show_match.py
 │       │   ├── check.py         ← `check` callback + six subcommands
 │       │   ├── bonds.py         ← `bonds list`
-│       │   └── compute.py       ← `compute --year`
-│       └── report/              (planned)
+│       │   ├── compute.py       ← `compute --year`
+│       │   └── report.py        ← `report --year`
+│       └── report/              ← SA108 reporting (component 7)
+│           ├── model.py         ← report shape: sections, boxes, computations
+│           ├── builder.py       ← persisted run → `Sa108Report` (the only arithmetic)
+│           ├── sources.py       ← engine ids → `EventRef` through the repos
+│           ├── labels.py        ← citeable label vocabulary (docs/audit.md)
+│           ├── document.py      ← format-neutral page AST
+│           ├── layout.py        ← `Sa108Report` → `Document`
+│           └── render/          ← to_console / to_markdown / to_json / to_csv
 └── tests/
     ├── __init__.py
     ├── conftest.py
@@ -385,7 +406,10 @@ items marked ⬜ are pending.
     history, records issues and persists five tables; CLI
     `compute --year [--dry-run]`; Tier D checks D1–D6 verify the
     persisted runs.
-12. ⬜ **Reporting** — console + CSV + JSON renderers.
+12. ✅ **Reporting** — `ib-cgt report --year`: SA108 box figures per
+    form section with a per-class split, one computation per HMRC
+    disposal in the working-sheet layout, console / Markdown / JSON /
+    CSV renderers. See [`reporting.md`](./reporting.md).
 13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
 
@@ -400,8 +424,8 @@ items marked ⬜ are pending.
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
 | 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner, open-position reconciliation, `Calculator.compute` / `persist` / `load` |
-| 8 | Reporting | `ib_cgt.report` | ⬜ Pending |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` / `check` / `compute` |
+| 8 | Reporting | `ib_cgt.report` | ✅ SA108 model + builder, console / Markdown / JSON / CSV renderers |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` / `check` / `compute` / `report` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |

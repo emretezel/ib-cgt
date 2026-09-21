@@ -22,8 +22,10 @@ from __future__ import annotations
 
 from ib_cgt.calculator.calculator import (
     Calculator,
+    PersistedRun,
     TaxYearComputation,
     build_report,
+    load_persisted_run,
     referenced_fx_sources,
 )
 from ib_cgt.calculator.positions import (
@@ -61,6 +63,7 @@ __all__ = [
     "FXEngineRun",
     "FXInputs",
     "FutureEngineRun",
+    "PersistedRun",
     "PositionReconciliation",
     "PositionStatus",
     "StockEngineRun",
@@ -68,6 +71,7 @@ __all__ = [
     "build_report",
     "instrument_reconciles",
     "load_fx_inputs",
+    "load_persisted_run",
     "reconcile_positions",
     "referenced_fx_sources",
     "run_bond_engine",

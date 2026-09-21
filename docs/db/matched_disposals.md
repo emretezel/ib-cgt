@@ -129,8 +129,13 @@ None.
 - `ib-cgt compute --year YYYY`
   ([`src/ib_cgt/cli/compute.py`](../../src/ib_cgt/cli/compute.py)) — writes one row
   per matched chunk after the calculator runs. Reads back via
-  `for_run(run_id)` when generating reports. *(Command pending
-  implementation per the project's component map.)*
+  `for_run(run_id)` when generating reports.
+- `ib-cgt report --year YYYY`
+  ([`src/ib_cgt/cli/report.py`](../../src/ib_cgt/cli/report.py)) — reads
+  the run's rows back through `for_run(run_id)` and projects each chunk
+  onto one working-sheet line of the SA108 report (gross proceeds =
+  `matched_proceeds_gbp + matched_disposal_fees_gbp`, and so on — see
+  [`../reporting.md`](../reporting.md)).
 
 ## Sample (first 5 rows)
 

@@ -43,6 +43,7 @@ from ib_cgt.cli import show_match  # noqa: F401  — `show match`
 from ib_cgt.cli import check  # noqa: F401  — `check [all|data|stocks|fx|futures|pool]`
 from ib_cgt.cli import bonds  # noqa: F401  — `bonds list`
 from ib_cgt.cli import compute  # noqa: F401  — `compute --year`
+from ib_cgt.cli import report  # noqa: F401  — `report --year`
 from ib_cgt.cli.app import app
 
 # isort: on

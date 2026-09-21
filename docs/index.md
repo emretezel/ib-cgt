@@ -20,6 +20,8 @@ implementation status.
 - `ingestion.md` — IB HTML format notes and known quirks. *(planned)*
 - [`fx.md`](./fx.md) — Frankfurter caching and business-day fallback.
 - [`rules.md`](./rules.md) — UK matching engine + per-asset-class rule engines.
+- [`reporting.md`](./reporting.md) — the SA108 report: box mapping, the
+  disposal-grouping rule, the working-sheet conventions, output formats.
 - [`db/index.md`](./db/index.md) — database reference, one page per table,
   plus a one-page schema summary in [`db/schema.md`](./db/schema.md).
 - `cli.md` — command reference. *(planned)*

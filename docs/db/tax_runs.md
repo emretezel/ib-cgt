@@ -86,8 +86,11 @@ None.
 
 - `ib-cgt compute --year YYYY`
   ([`src/ib_cgt/cli/compute.py`](../../src/ib_cgt/cli/compute.py)) — sole writer;
-  also reads back via `latest_for` for status output. *(Command
-  pending implementation per the project's component map.)*
+  also reads back via `latest_for` for status output.
+- `ib-cgt report --year YYYY`
+  ([`src/ib_cgt/cli/report.py`](../../src/ib_cgt/cli/report.py)) — reads
+  the year's latest run through `calculator.load_persisted_run` and
+  prints its `run_id` and `computed_at` as the report's provenance.
 
 ## Sample (first 5 rows)
 

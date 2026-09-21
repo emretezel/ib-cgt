@@ -44,6 +44,7 @@ from ib_cgt.db import (
     FXEventSourceRepo,
     MatchedDisposalRepo,
     StatementRepo,
+    TaxRun,
     TaxRunIssueRepo,
     TaxRunRepo,
     transaction,
@@ -94,6 +95,52 @@ class TaxYearComputation:
     def warnings(self) -> tuple[RunIssue, ...]:
         """The warning-severity issues — notices that never fail the run."""
         return tuple(i for i in self.issues if i.severity is IssueSeverity.WARNING)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PersistedRun:
+    """A computation read back from the run tables, with the header that describes it.
+
+    `compute` produces a `TaxYearComputation` that has no run id yet;
+    once persisted, the same rows carry a `tax_runs` header (id,
+    timestamp, net). Readers that report on a stored run — the
+    `report` command above all — need both halves, so they travel
+    together here rather than as an optional field that would be
+    `None` on the compute path.
+
+    Attributes:
+        run: The `tax_runs` header row the rows below belong to.
+        computation: The rows and issues rebuilt from the run tables,
+            identical to what `Calculator.compute` returned before
+            `persist` wrote them.
+    """
+
+    run: TaxRun
+    computation: TaxYearComputation
+
+
+def load_persisted_run(conn: sqlite3.Connection, tax_year: TaxYear) -> PersistedRun | None:
+    """Read the latest persisted run for `tax_year`, or `None` if the year was never computed.
+
+    Reading needs no FX service and no engine pass — only the five
+    run tables — so this is a module-level function rather than a
+    `Calculator` method. `Calculator.load` delegates here for callers
+    that already hold a calculator.
+    """
+    run = TaxRunRepo(conn).latest_for(tax_year)
+    if run is None:
+        return None
+    report = TaxYearReport.build(
+        tax_year,
+        MatchedDisposalRepo(conn).for_run(run.run_id),
+        FutureRealisationRepo(conn).for_run(run.run_id),
+    )
+    computation = TaxYearComputation(
+        report=report,
+        issues=tuple(TaxRunIssueRepo(conn).for_run(run.run_id)),
+        fx_event_sources=FXEventSourceRepo(conn).for_run(run.run_id),
+    )
+    return PersistedRun(run=run, computation=computation)
 
 
 # ---------------------------------------------------------------------------
@@ -305,20 +352,13 @@ class Calculator:
         return run_id
 
     def load(self, tax_year: TaxYear) -> TaxYearComputation | None:
-        """Read the persisted computation for `tax_year` back, or `None` if none."""
-        run = TaxRunRepo(self._conn).latest_for(tax_year)
-        if run is None:
-            return None
-        report = TaxYearReport.build(
-            tax_year,
-            MatchedDisposalRepo(self._conn).for_run(run.run_id),
-            FutureRealisationRepo(self._conn).for_run(run.run_id),
-        )
-        return TaxYearComputation(
-            report=report,
-            issues=tuple(TaxRunIssueRepo(self._conn).for_run(run.run_id)),
-            fx_event_sources=FXEventSourceRepo(self._conn).for_run(run.run_id),
-        )
+        """Read the persisted computation for `tax_year` back, or `None` if none.
+
+        A convenience over `load_persisted_run` for callers that hold a
+        calculator and only want the rows; the run header is dropped.
+        """
+        loaded = load_persisted_run(self._conn, tax_year)
+        return None if loaded is None else loaded.computation
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +473,9 @@ def _fmt_stated(quantity: Decimal | None) -> str:
 
 __all__ = [
     "Calculator",
+    "PersistedRun",
     "TaxYearComputation",
     "build_report",
+    "load_persisted_run",
     "referenced_fx_sources",
 ]

@@ -1,0 +1,199 @@
+"""Resolving the ids on a persisted run back to the events behind them.
+
+A `matched_disposals` row cites its disposal and (for a direct basis)
+its acquisition by integer id. For stocks, bonds and forex trades that
+is a real `trades.trade_id`. For the non-trade cashflows the FX pools
+consume — dividends, withholding tax, coupons, cash movements, futures
+P&L — it is a synthetic id the runner allocated, and the run's
+`fx_event_sources` table says which row each one stands for.
+
+`DbEventResolver` turns either kind of id into an `EventRef` (label,
+date, account, description) with one repository lookup per distinct
+id. `StaticEventResolver` does the same from a fixed mapping so the
+builder can be tested without a database.
+
+Author: Emre Tezel
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Mapping
+from typing import Protocol
+
+from ib_cgt.db import BondCouponRepo, CashEventRepo, DividendRepo, TradeRepo
+from ib_cgt.domain import (
+    BondCouponRef,
+    CashEventRef,
+    DividendRef,
+    FutureInstrument,
+    FutureRealisationRef,
+    FXEventSource,
+)
+from ib_cgt.report.labels import (
+    cash_description,
+    cash_label,
+    coupon_description,
+    coupon_label,
+    dividend_description,
+    dividend_label,
+    realisation_description,
+    realisation_label,
+    trade_description,
+    trade_label,
+)
+from ib_cgt.report.model import EventRef
+
+
+class EventResolver(Protocol):
+    """Anything that can turn an engine event id into an `EventRef`."""
+
+    def resolve(self, event_id: int) -> EventRef:
+        """The reference for `event_id`; never raises for an unknown id."""
+        ...
+
+
+def unresolved(event_id: int) -> EventRef:
+    """The reference used when no row can be found for an id.
+
+    A statement withdrawn after the run was computed leaves its trade
+    ids dangling (the run tables deliberately do not cascade from
+    `trades`). The line is still reported — the figures are the run's
+    — but the reader is told the row is gone rather than shown a
+    made-up description.
+    """
+    return EventRef(
+        event_id=event_id,
+        label=trade_label(event_id),
+        on=None,
+        account_id=None,
+        description="unresolved — the source row is no longer in the database",
+    )
+
+
+class StaticEventResolver:
+    """A resolver over a fixed id → reference mapping (tests, pure callers)."""
+
+    def __init__(self, refs: Mapping[int, EventRef]) -> None:
+        """Keep the mapping; ids outside it resolve as unresolved."""
+        self._refs = dict(refs)
+
+    def resolve(self, event_id: int) -> EventRef:
+        """Look the id up, falling back to the unresolved reference."""
+        return self._refs.get(event_id) or unresolved(event_id)
+
+
+class DbEventResolver:
+    """Resolve ids through the repositories, guided by the run's provenance map."""
+
+    def __init__(
+        self, conn: sqlite3.Connection, fx_event_sources: Mapping[int, FXEventSource]
+    ) -> None:
+        """Bind to an open connection and the run's synthetic-id map."""
+        self._trades = TradeRepo(conn)
+        self._dividends = DividendRepo(conn)
+        self._coupons = BondCouponRepo(conn)
+        self._cash_events = CashEventRepo(conn)
+        self._sources = fx_event_sources
+        # A disposal cited by several lines, or an acquisition matched
+        # by several disposals, is looked up once.
+        self._cache: dict[int, EventRef] = {}
+
+    def resolve(self, event_id: int) -> EventRef:
+        """The reference for `event_id`, memoised per id."""
+        ref = self._cache.get(event_id)
+        if ref is None:
+            ref = self._lookup(event_id)
+            self._cache[event_id] = ref
+        return ref
+
+    def _lookup(self, event_id: int) -> EventRef:
+        """Synthetic ids go through the provenance map; anything else is a trade id."""
+        source = self._sources.get(event_id)
+        if source is None:
+            return self._trade(event_id)
+        if isinstance(source, DividendRef):
+            return self._dividend(event_id, source)
+        if isinstance(source, BondCouponRef):
+            return self._coupon(event_id, source)
+        if isinstance(source, CashEventRef):
+            return self._cash_event(event_id, source)
+        return self._realisation(event_id, source)
+
+    def _trade(self, event_id: int) -> EventRef:
+        """A real trade: label `#N`, dated and described from the row."""
+        stored = self._trades.get(event_id)
+        if stored is None:
+            return unresolved(event_id)
+        trade = stored.trade
+        return EventRef(
+            event_id=event_id,
+            label=trade_label(event_id),
+            on=trade.trade_date,
+            account_id=trade.account_id,
+            description=trade_description(trade),
+        )
+
+    def _dividend(self, event_id: int, source: DividendRef) -> EventRef:
+        """A dividend or withholding-tax row, dated on its pay date."""
+        stored = self._dividends.get(source.dividend_id)
+        if stored is None:
+            return unresolved(event_id)
+        dividend = stored.dividend
+        return EventRef(
+            event_id=event_id,
+            label=dividend_label(dividend.kind, source.dividend_id),
+            on=dividend.pay_date,
+            account_id=dividend.account_id,
+            description=dividend_description(dividend),
+        )
+
+    def _coupon(self, event_id: int, source: BondCouponRef) -> EventRef:
+        """A bond coupon, dated on its pay date."""
+        stored = self._coupons.get(source.bond_coupon_id)
+        if stored is None:
+            return unresolved(event_id)
+        coupon = stored.coupon
+        return EventRef(
+            event_id=event_id,
+            label=coupon_label(source.bond_coupon_id),
+            on=coupon.pay_date,
+            account_id=coupon.account_id,
+            description=coupon_description(coupon),
+        )
+
+    def _cash_event(self, event_id: int, source: CashEventRef) -> EventRef:
+        """An instrument-less cash movement, dated on its value date."""
+        stored = self._cash_events.get(source.cash_event_id)
+        if stored is None:
+            return unresolved(event_id)
+        event = stored.event
+        return EventRef(
+            event_id=event_id,
+            label=cash_label(source.cash_event_id),
+            on=event.value_date,
+            account_id=event.account_id,
+            description=cash_description(event),
+        )
+
+    def _realisation(self, event_id: int, source: FutureRealisationRef) -> EventRef:
+        """A futures P&L cashflow: dated and accounted like its close trade."""
+        stored = self._trades.get(source.close_trade_id)
+        if stored is None:
+            return unresolved(event_id)
+        trade = stored.trade
+        instrument = trade.instrument
+        if not isinstance(instrument, FutureInstrument):
+            return unresolved(event_id)
+        return EventRef(
+            event_id=event_id,
+            label=realisation_label(source.open_trade_id, source.close_trade_id),
+            on=trade.trade_date,
+            account_id=trade.account_id,
+            description=realisation_description(
+                instrument, source.open_trade_id, source.close_trade_id
+            ),
+        )
+
+
+__all__ = ["DbEventResolver", "EventResolver", "StaticEventResolver", "unresolved"]

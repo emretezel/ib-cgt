@@ -30,7 +30,7 @@ from ib_cgt.cli.app import app as app_module_app
 # subcommands (also in registration order — Typer prints commands in the
 # order they were registered, which is the order `ib_cgt.cli.__init__`
 # imports the modules).
-EXPECTED_COMMANDS: tuple[str, ...] = ("ingest", "trades", "compute")
+EXPECTED_COMMANDS: tuple[str, ...] = ("ingest", "trades", "compute", "report")
 EXPECTED_GROUPS: dict[str, tuple[str, ...]] = {
     "db": ("init", "reset"),
     "fx": ("sync",),

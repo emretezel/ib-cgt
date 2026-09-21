@@ -125,3 +125,16 @@ net gain and the recorded engine failures; D2 re-adds the header from
 its rows; D4 / D6 confirm every trade id (or synthetic id) still
 resolves. A `FAIL` there means the database changed under a run —
 re-run `compute` for the year.
+
+## `ib-cgt report --year 2025/26 [--format console|markdown|json|csv] [--out FILE] [--summary-only]`
+
+The SA108 view of a persisted run — see [`reporting.md`](./reporting.md)
+for the box mapping and the working-sheet conventions. Every line of
+every computation cites its events in the notation above, resolved
+from the run's `fx_event_sources` rows rather than a live engine pass:
+`#N` for a trade (`show trade N`), `Div #N` / `WHT #N` / `Cpn #N` /
+`Cash #N` for the non-trade cashflows, and `P&L #A→#B` for a futures
+close-out (`show realisation --close B`). The one difference from
+`match fx` is that the `[i]` slice suffix is not printed — a persisted
+run cannot tell how many slices a close drained in *other* years, and
+`(open, close)` is unique within a run anyway.

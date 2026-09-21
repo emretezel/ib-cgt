@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from ib_cgt.calculator import Calculator
+from ib_cgt.calculator import Calculator, load_persisted_run
 from ib_cgt.db import CashEventRepo, StatementRepo, TaxRunIssueRepo, TradeRepo
 from ib_cgt.domain import (
     CashEvent,
@@ -130,6 +130,22 @@ def test_load_round_trips_the_computation(
     assert loaded.issues == computed.issues
     assert dict(loaded.fx_event_sources) == dict(computed.fx_event_sources)
     assert calc.load(TaxYear(2030)) is None
+
+
+def test_load_persisted_run_returns_the_header_with_the_rows(
+    calc_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    calc = Calculator(calc_db, fx_service)
+    computed = calc.compute(Y2024)
+    run_id = calc.persist(computed)
+    loaded = load_persisted_run(calc_db, Y2024)
+    assert loaded is not None
+    assert loaded.run.run_id == run_id
+    assert loaded.run.tax_year == Y2024
+    assert loaded.run.net_gbp == computed.report.net_gbp
+    assert loaded.computation.report == computed.report
+    assert loaded.computation.issues == computed.issues
+    assert load_persisted_run(calc_db, TaxYear(2030)) is None
 
 
 def test_rerun_replaces_the_year_and_keeps_one_run_row(
