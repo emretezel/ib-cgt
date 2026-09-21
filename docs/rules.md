@@ -342,6 +342,27 @@ closing a long never touches a short slice, and vice versa.
 A single close trade may close N open slices: the engine emits N
 `FutureRealisation` rows, one per drained slice.
 
+### Why FIFO rather than pooling (decision)
+
+Which open slice a close-out is identified against is a judgement
+call: the futures chapter of the HMRC manual (CG56000P) does not
+settle it. TCGA 1992 s.104(3)(b) ("any other assets ... dealt in
+without identifying the particular assets") together with s.106A(10)
+extends same-day / 30-day / pooling to fungible non-share assets, and
+HMRC applies that reading to crypto tokens (CRYPTO22200). No page in
+the futures chapter applies it to contract close-outs, and CG56081's
+"pooling rules will apply" refers to the delivered underlying asset,
+not to the contracts themselves. The choice only moves gain between
+close-outs, and therefore between tax years; the total over the life
+of a position is identical under either model.
+
+**Decision (2026-09-21): identify close-outs against opens first-in,
+first-out, per side.** FIFO keeps every `FutureRealisation` traceable
+to exactly one open trade (which `show realisation` relies on), it is
+the ordering IB's own statements present, and it needs no second
+identification model in the domain. A pooled-average alternative is
+not planned.
+
 ### Long vs short legs
 
 | Side  | Disposal date  | proceeds_gbp leg               | cost_gbp leg                  |
