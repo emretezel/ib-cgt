@@ -64,7 +64,7 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt db init` (entry point at
-  [`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — calls
+  [`src/ib_cgt/cli/db.py`](../../src/ib_cgt/cli/db.py)) — calls
   `apply_migrations`, which writes one row for each newly-applied
   migration file.
 

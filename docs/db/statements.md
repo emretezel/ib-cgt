@@ -120,7 +120,7 @@ Ingest is idempotent, so running the loop again is harmless.
 ## CLI commands that touch this table
 
 - `ib-cgt ingest PATH [--replace]` (entry point at
-  [`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — orchestrated by
+  [`src/ib_cgt/cli/ingest.py`](../../src/ib_cgt/cli/ingest.py)) — orchestrated by
   [`src/ib_cgt/ingest/ingestor.py`](../../src/ib_cgt/ingest/ingestor.py),
   which writes one statement row plus everything it produced inside a
   single transaction.

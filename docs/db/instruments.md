@@ -105,7 +105,7 @@ for callers that don't care about the discriminator.
 ## CLI commands that touch this table
 
 - `ib-cgt ingest PATH`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — for each parsed
+  ([`src/ib_cgt/cli/ingest.py`](../../src/ib_cgt/cli/ingest.py)) — for each parsed
   trade, position and coupon, upserts the `Instrument` (parent +
   child) before inserting the row.
 - `ib-cgt compute --year` — the persist step resolves every matched

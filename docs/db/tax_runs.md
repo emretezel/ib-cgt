@@ -85,7 +85,7 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt compute --year YYYY`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — sole writer;
+  ([`src/ib_cgt/cli/compute.py`](../../src/ib_cgt/cli/compute.py)) — sole writer;
   also reads back via `latest_for` for status output. *(Command
   pending implementation per the project's component map.)*
 

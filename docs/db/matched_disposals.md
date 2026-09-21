@@ -127,7 +127,7 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt compute --year YYYY`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — writes one row
+  ([`src/ib_cgt/cli/compute.py`](../../src/ib_cgt/cli/compute.py)) — writes one row
   per matched chunk after the calculator runs. Reads back via
   `for_run(run_id)` when generating reports. *(Command pending
   implementation per the project's component map.)*

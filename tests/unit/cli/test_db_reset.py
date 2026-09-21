@@ -161,14 +161,14 @@ def test_reset_failure_leaves_every_table_intact(
     DELETE raise after every real table has already been emptied
     inside the transaction; the rollback must restore all of them.
     """
-    import ib_cgt.cli as cli_module
+    import ib_cgt.cli.db as db_module
 
     before = _row_counts(populated_db)
     assert before["trades"] > 0
     monkeypatch.setattr(
-        cli_module,
+        db_module,
         "_RESET_TABLES_DATA",
-        (*cli_module._RESET_TABLES_DATA, "no_such_table"),
+        (*db_module._RESET_TABLES_DATA, "no_such_table"),
     )
     result = runner.invoke(app, ["db", "reset", "--yes"])
     assert result.exit_code != 0

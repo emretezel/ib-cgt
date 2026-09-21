@@ -207,8 +207,21 @@ where noted.
    net) and a disposal-by-disposal detail (HMRC / SA108 evidence). Output
    formats: console (rich tables), CSV, JSON. Pure formatting — no tax logic.
 
-8. **CLI** — `ib_cgt.cli` — Typer app. Commands: `db init`, `ingest`,
-   `fx sync --year`, `compute --year`, `report --year`.
+8. **CLI** — `ib_cgt.cli` — Typer app, laid out as a package with one
+   module per command or command group. `cli/app.py` owns the root
+   `app` and the six sub-group Typers (`db`, `fx`, `match`, `show`,
+   `check`, `bonds`) and nothing else; each command module registers
+   its commands on those Typers at import time, and the package
+   `__init__` imports the modules in `--help` order and re-exports
+   `app` for the `ib-cgt` console script. Helpers used by two or more
+   command modules live in `cli/common.py` (console, FX-service
+   factory, option parsers, number formatters), `cli/matching_render.py`
+   (share-matching tables shared by `match stocks` / `match bonds`) and
+   `cli/fx_labels.py` (FX provenance labels shared by `match fx` /
+   `show match`); a helper used by one command stays private to that
+   command's module. `tests/unit/cli/test_app_tree.py` pins the
+   registered command tree so a module dropped from `__init__` fails
+   loudly rather than silently removing its commands.
 
 9. **Configuration** — `ib_cgt.config` — defaults (DB path, data dir,
    Frankfurter URL, log level), overridable via `ib-cgt.toml` in the repo
@@ -276,18 +289,33 @@ ib-cgt/
 │   └── ib_cgt/
 │       ├── __init__.py
 │       ├── py.typed
-│       ├── cli.py               (planned)
-│       ├── config.py            (planned)
+│       ├── config.py            ← env-var knobs (full TOML config planned)
 │       ├── domain/
 │       ├── db/
-│       │   └── migrations/      (planned)
-│       ├── ingest/              (planned)
-│       ├── fx/                  (planned)
-│       ├── rules/               (planned)
+│       │   ├── migrations/      ← `NNN_*.sql`, applied by `migrator.py`
+│       │   └── repos/           ← one repository class per table
+│       ├── ingest/
+│       ├── fx/
+│       ├── rules/
 │       ├── calculator/          ← engine runner (`runner.py`, `runs.py`)
 │       ├── checks/              ← `ib-cgt check` facility
-│       ├── report/              (planned)
-│       └── utils/               (planned, if needed)
+│       ├── cli/                 ← Typer package (component 8)
+│       │   ├── __init__.py      ← composition root; imports the command modules, exports `app`
+│       │   ├── __main__.py      ← `python -m ib_cgt.cli`
+│       │   ├── app.py           ← root `app` + the six sub-group Typers
+│       │   ├── common.py        ← console, FX-service factory, parsers, formatters
+│       │   ├── matching_render.py ← share-matching tables (match stocks / bonds)
+│       │   ├── fx_labels.py     ← FX provenance labels (match fx / show match)
+│       │   ├── db.py            ← `db init`, `db reset`
+│       │   ├── ingest.py        ← `ingest`
+│       │   ├── trades.py        ← `trades`
+│       │   ├── fx.py            ← `fx sync`
+│       │   ├── match_futures.py / match_stocks.py / match_fx.py / match_bonds.py
+│       │   ├── show_trade.py / show_realisation.py / show_match.py
+│       │   ├── check.py         ← `check` callback + six subcommands
+│       │   ├── bonds.py         ← `bonds list`
+│       │   └── compute.py       ← `compute --year`
+│       └── report/              (planned)
 └── tests/
     ├── __init__.py
     ├── conftest.py

@@ -148,11 +148,11 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt ingest PATH`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — sole writer;
+  ([`src/ib_cgt/cli/ingest.py`](../../src/ib_cgt/cli/ingest.py)) — sole writer;
   inserts every parsed trade in one transaction with the parent
   statement row.
 - `ib-cgt trades [--account | --symbol | --since | --limit]`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — interactive
+  ([`src/ib_cgt/cli/trades.py`](../../src/ib_cgt/cli/trades.py)) — interactive
   read-only listing, served by `TradeRepo.list_filtered`.
 
 ## Sample (first 5 rows)

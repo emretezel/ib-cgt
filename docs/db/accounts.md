@@ -62,7 +62,7 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt ingest PATH` (entry point at
-  [`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py)) — parses the IB
+  [`src/ib_cgt/cli/ingest.py`](../../src/ib_cgt/cli/ingest.py)) — parses the IB
   statement, derives the account from its header, and upserts a row.
 
 ## Sample (first 5 rows)

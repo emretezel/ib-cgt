@@ -90,7 +90,7 @@ None.
 ## CLI commands that touch this table
 
 - `ib-cgt fx sync [--currency CODE]…`
-  ([`src/ib_cgt/cli.py`](../../src/ib_cgt/cli.py),
+  ([`src/ib_cgt/cli/fx.py`](../../src/ib_cgt/cli/fx.py),
   [`src/ib_cgt/fx/service.py`](../../src/ib_cgt/fx/service.py)) —
   resumes from `max_rate_date` per currency and inserts the missing
   range.
