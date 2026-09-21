@@ -58,12 +58,12 @@ def runner() -> CliRunner:
 
 def _isf() -> StockInstrument:
     """ISF — GBP-denominated UK ETF; identity FX path."""
-    return StockInstrument(symbol="ISF", currency="GBP")
+    return StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
 
 
 def _aapl() -> StockInstrument:
     """AAPL — USD-denominated; FX involved."""
-    return StockInstrument(symbol="AAPL", currency="USD")
+    return StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def _gbp_trade(
@@ -368,7 +368,7 @@ def test_match_stocks_unmatched_disposal_lands_in_unmatched_block(
             period_start=date(2024, 4, 6),
             period_end=date(2025, 4, 5),
         )
-        bbby = StockInstrument(symbol="BBBY", currency="USD")
+        bbby = StockInstrument(conid=110285963, symbol="BBBY", currency="USD")
         sell = Trade(
             account_id="U1",
             instrument=bbby,

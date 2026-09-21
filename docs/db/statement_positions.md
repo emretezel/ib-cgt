@@ -31,7 +31,7 @@ duplicate that fact (AGENTS.md §3, single source of truth).
 |---|---|---|---|
 | `statement_hash` | `TEXT` | No (PK, FK) | The statement whose Open Positions section the row came from. |
 | `statement_row_index` | `INTEGER` | No (PK) | Zero-based offset within the statement's position stream (parser emit order across the section's sub-tables). Independent of every other table's row-index space. |
-| `instrument_id` | `INTEGER` | No (FK) | The held instrument, resolved to the same `instruments` row the trades use — a stock by `(symbol, currency)`, a bond by ISIN, a futures contract by multiplier and expiry (all through the statement's Financial Instrument Information section). |
+| `instrument_id` | `INTEGER` | No (FK) | The held instrument, resolved to the same `instruments` row the trades use — a stock or a futures contract by its IB `conid`, a bond by ISIN (all through the statement's Financial Instrument Information section; a held-over row with no such section falls back to a `(symbol, currency)` lookup against the instruments already stored). |
 | `quantity` | `TEXT` | No | Signed Decimal string in the trades' unit (shares, contracts, bond face units). Negative = short. Never zero: a flat instrument has no row, and the mapper skips the zero lines IB prints for a contract closed on the period's last day. |
 
 See [`index.md`](./index.md#encoding-conventions) for decimal

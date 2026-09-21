@@ -12,8 +12,9 @@ top-level pages:
   dependency graph, and implementation status.
 - [`docs/fx.md`](./docs/fx.md) — Frankfurter FX cache and business-day
   fallback.
-- [`docs/db/index.md`](./docs/db/index.md) — database reference; see
-  also one page per table:
+- [`docs/db/index.md`](./docs/db/index.md) — database reference, with a
+  one-page schema summary in [`docs/db/schema.md`](./docs/db/schema.md);
+  see also one page per table:
   [`accounts`](./docs/db/accounts.md),
   [`instruments`](./docs/db/instruments.md),
   [`stock_instruments`](./docs/db/stock_instruments.md),

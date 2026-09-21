@@ -80,13 +80,41 @@ def _ca_row(
     )
 
 
-def _make(rows: list[RawCorporateActionRow]) -> ParsedStatement:
+def _stock_info(symbol: str, isin: str, conid: str = "555000111") -> RawInstrumentInfo:
+    """Stocks-shaped Financial Instrument Information row — the conid source."""
+    return RawInstrumentInfo(
+        asset_class="Stocks",
+        symbol=symbol,
+        description=f"{symbol} CORP",
+        multiplier_text="1",
+        expiry_text=None,
+        listing_exch="NYSE",
+        security_id=isin,
+        conid_text=conid,
+    )
+
+
+# The instrument-information rows every merger test can fall back on.
+# Stocks are keyed by conid (migration 021), so the synthesiser must be
+# able to resolve the merged-away symbol against this table.
+_DEFAULT_INFO: tuple[RawInstrumentInfo, ...] = (
+    _stock_info("ABC", "US0000000123", "555000111"),
+    _stock_info("AAA", "US0000001111", "555000222"),
+    _stock_info("BBB", "US0000002222", "555000333"),
+    _stock_info("IEMI", "IE00B2NPL135", "59262240"),
+)
+
+
+def _make(
+    rows: list[RawCorporateActionRow],
+    instruments: tuple[RawInstrumentInfo, ...] = _DEFAULT_INFO,
+) -> ParsedStatement:
     return ParsedStatement(
         account_id="U9999998",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
         trades=(),
-        instruments=(),
+        instruments=instruments,
         corporate_actions=tuple(rows),
         dividends=(),
     )
@@ -123,6 +151,7 @@ def test_synthesizes_sell_trade_from_cash_merger_same_currency() -> None:
     assert isinstance(trade.instrument, StockInstrument)
     assert trade.instrument.symbol == "ABC"
     assert trade.instrument.currency == "USD"
+    assert trade.instrument.conid == 555000111
     assert trade.action is TradeAction.SELL
     assert trade.quantity == Decimal("100")
     assert trade.price.currency == "USD"
@@ -320,11 +349,13 @@ def test_raises_when_group_has_no_proceeds_row() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_synthesizer_ignores_regular_trades_and_instruments() -> None:
-    """`map_corporate_actions` only consults `parsed.corporate_actions`.
+def test_synthesizer_ignores_regular_trades_and_unrelated_instruments() -> None:
+    """`map_corporate_actions` reads `parsed.corporate_actions` plus the FII table.
 
     Belt-and-braces: a stray `RawTradeRow` in `parsed.trades` must not
-    influence the synthesizer, and vice versa.
+    influence the synthesizer, and an unrelated instrument row (DECOY)
+    must not be picked up for the merged stock — only the row whose
+    symbol matches the merger description supplies the conid.
     """
     parsed = ParsedStatement(
         account_id="U9999998",
@@ -350,7 +381,9 @@ def test_synthesizer_ignores_regular_trades_and_instruments() -> None:
                 multiplier_text=None,
                 expiry_text=None,
                 listing_exch="NASDAQ",
+                conid_text="999999999",
             ),
+            _stock_info("ABC", "US0000000123", "555000111"),
         ),
         corporate_actions=(
             _ca_row(
@@ -368,3 +401,58 @@ def test_synthesizer_ignores_regular_trades_and_instruments() -> None:
 
     [trade] = map_corporate_actions(parsed, fx_service=_FXStub(rate=Decimal(1)))
     assert trade.instrument.symbol == "ABC"
+    assert isinstance(trade.instrument, StockInstrument)
+    assert trade.instrument.conid == 555000111
+
+
+# ---------------------------------------------------------------------------
+# Conid resolution
+# ---------------------------------------------------------------------------
+
+
+def test_merger_resolves_conid_by_isin_when_symbol_was_renamed() -> None:
+    """The description's ISIN is the fallback key into the instrument table.
+
+    IB renames symbols between statements; if the merger row still
+    prints the old symbol while the instrument table prints the new
+    one, the ISIN both carry is what links them.
+    """
+    parsed = _make(
+        [
+            _ca_row(
+                currency="USD",
+                description=(
+                    "ABCZ(US0000000123) Merged(Acquisition) for USD 12.500000 per Share "
+                    "(ABCZ, ACME CORP, US0000000123)"
+                ),
+                quantity_text="-100",
+                proceeds_text="1,250.00",
+            ),
+        ],
+        instruments=(_stock_info("ABC", "US0000000123", "555000111"),),
+    )
+    [trade] = map_corporate_actions(parsed, fx_service=_FXStub(rate=Decimal(1)))
+    assert isinstance(trade.instrument, StockInstrument)
+    assert trade.instrument.conid == 555000111
+    # The instrument table's current symbol wins for display.
+    assert trade.instrument.symbol == "ABC"
+
+
+def test_merger_with_no_instrument_row_raises() -> None:
+    """A merged-away stock the instrument table does not list has no conid."""
+    parsed = _make(
+        [
+            _ca_row(
+                currency="USD",
+                description=(
+                    "ABC(US0000000123) Merged(Acquisition) for USD 12.500000 per Share "
+                    "(ABC, ACME CORP, US0000000123)"
+                ),
+                quantity_text="-100",
+                proceeds_text="1,250.00",
+            ),
+        ],
+        instruments=(),
+    )
+    with pytest.raises(MappingError, match="need Conid"):
+        map_corporate_actions(parsed, fx_service=_FXStub(rate=Decimal(1)))

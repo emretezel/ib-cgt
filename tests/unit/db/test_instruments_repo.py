@@ -10,6 +10,7 @@ import pytest
 
 from ib_cgt.db import InstrumentRepo
 from ib_cgt.domain import (
+    AssetClass,
     BondInstrument,
     CurrencyPair,
     FutureInstrument,
@@ -20,7 +21,11 @@ from ib_cgt.domain import (
 
 def test_stock_round_trips(db: sqlite3.Connection) -> None:
     repo = InstrumentRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD", isin="US0378331005")
+    aapl = StockInstrument(
+        conid=66468935,
+        symbol="AAPL",
+        currency="USD",
+    )
     iid = repo.upsert(aapl)
 
     loaded = repo.get(iid)
@@ -29,7 +34,7 @@ def test_stock_round_trips(db: sqlite3.Connection) -> None:
 
 def test_upsert_is_idempotent(db: sqlite3.Connection) -> None:
     repo = InstrumentRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     id1 = repo.upsert(aapl)
     id2 = repo.upsert(aapl)
     assert id1 == id2
@@ -38,12 +43,14 @@ def test_upsert_is_idempotent(db: sqlite3.Connection) -> None:
 def test_futures_with_different_expiries_are_distinct(db: sqlite3.Connection) -> None:
     repo = InstrumentRepo(db)
     es_mar = FutureInstrument(
+        conid=120172476,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
         expiry_date=date(2025, 3, 21),
     )
     es_jun = FutureInstrument(
+        conid=208418403,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -67,18 +74,6 @@ def test_bond_exempt_flag_round_trips(db: sqlite3.Connection) -> None:
     )
     iid = repo.upsert(gilt)
     assert repo.get(iid) == gilt
-
-
-def test_bond_without_isin_rejected(db: sqlite3.Connection) -> None:
-    """Migration 014 made ISIN the bond's natural key — upsert must require it."""
-    repo = InstrumentRepo(db)
-    gilt_no_isin = BondInstrument(
-        symbol="UKT 4 1/2 06/07/34",
-        currency="GBP",
-        is_cgt_exempt=True,
-    )
-    with pytest.raises(ValueError, match="no ISIN"):
-        repo.upsert(gilt_no_isin)
 
 
 def test_two_bond_lots_with_same_isin_collapse_to_one_row(db: sqlite3.Connection) -> None:
@@ -177,7 +172,7 @@ def test_get_missing_raises_keyerror(db: sqlite3.Connection) -> None:
 
 def test_find_id_returns_none_when_absent(db: sqlite3.Connection) -> None:
     repo = InstrumentRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     assert repo.find_id(aapl) is None
     repo.upsert(aapl)
     assert repo.find_id(aapl) is not None
@@ -209,8 +204,12 @@ def test_per_child_currency_indexes_exist(db: sqlite3.Connection) -> None:
 def test_list_stocks_returns_inserted_rows(db: sqlite3.Connection) -> None:
     """`list_stocks` returns every inserted stock as `(id, StockInstrument)`."""
     repo = InstrumentRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD", isin="US0378331005")
-    isf = StockInstrument(symbol="ISF", currency="GBP")
+    aapl = StockInstrument(
+        conid=66468935,
+        symbol="AAPL",
+        currency="USD",
+    )
+    isf = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     aapl_id = repo.upsert(aapl)
     isf_id = repo.upsert(isf)
 
@@ -222,8 +221,8 @@ def test_list_stocks_returns_inserted_rows(db: sqlite3.Connection) -> None:
 def test_list_stocks_filters_by_symbol(db: sqlite3.Connection) -> None:
     """`symbol=` narrows to that exact symbol; non-matches are excluded."""
     repo = InstrumentRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
-    isf = StockInstrument(symbol="ISF", currency="GBP")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
+    isf = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     repo.upsert(aapl)
     repo.upsert(isf)
 
@@ -234,7 +233,7 @@ def test_list_stocks_filters_by_symbol(db: sqlite3.Connection) -> None:
 def test_list_stocks_excludes_other_asset_classes(db: sqlite3.Connection) -> None:
     """A bond/future/fx with the same symbol must not appear in `list_stocks`."""
     repo = InstrumentRepo(db)
-    stock = StockInstrument(symbol="ABC", currency="USD")
+    stock = StockInstrument(conid=94465593, symbol="ABC", currency="USD")
     bond = BondInstrument(
         isin="US0000000001",
         symbol="ABC",
@@ -263,6 +262,7 @@ def test_duplicate_future_does_not_create_duplicate_row(
     """
     repo = InstrumentRepo(db)
     es_jun = FutureInstrument(
+        conid=208418403,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -288,10 +288,105 @@ def test_upsert_joins_an_enclosing_transaction(db: sqlite3.Connection) -> None:
     from ib_cgt.db import transaction
 
     repo = InstrumentRepo(db)
-    new = StockInstrument(symbol="NEW", currency="USD")
+    new = StockInstrument(conid=150542135, symbol="NEW", currency="USD")
     with pytest.raises(RuntimeError), transaction(db):
         repo.upsert(new)
         raise RuntimeError("boom")
     assert repo.find_id(new) is None
     assert db.execute("SELECT COUNT(*) FROM instruments").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM stock_instruments").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Conid identity (migration 021)
+# ---------------------------------------------------------------------------
+
+
+def test_stock_renamed_by_ib_collapses_to_one_row_and_latest_symbol_wins(
+    db: sqlite3.Connection,
+) -> None:
+    """The JNKEz → JNKE case: one conid, two symbols, one instrument row."""
+    repo = InstrumentRepo(db)
+    old = StockInstrument(conid=102048570, symbol="JNKEz", currency="CHF")
+    new = StockInstrument(conid=102048570, symbol="JNKE", currency="CHF")
+    id_old = repo.upsert(old)
+    id_new = repo.upsert(new)
+    assert id_old == id_new
+    assert db.execute("SELECT COUNT(*) FROM stock_instruments").fetchone()[0] == 1
+    assert repo.get(id_old) == new
+
+
+def test_same_symbol_and_currency_with_different_conids_are_two_stocks(
+    db: sqlite3.Connection,
+) -> None:
+    """Symbol is display text: two listings may share it without colliding."""
+    repo = InstrumentRepo(db)
+    first = repo.upsert(StockInstrument(conid=1001, symbol="ABC", currency="USD"))
+    second = repo.upsert(StockInstrument(conid=1002, symbol="ABC", currency="USD"))
+    assert first != second
+    assert len(repo.find_by_symbol(AssetClass.STOCK, "ABC", "USD")) == 2
+
+
+def test_upsert_refreshes_stock_currency_from_the_latest_writer(
+    db: sqlite3.Connection,
+) -> None:
+    """Trades and positions own the trade currency; a later sighting corrects it."""
+    repo = InstrumentRepo(db)
+    iid = repo.upsert(StockInstrument(conid=59262240, symbol="IEMI", currency="USD"))
+    repo.upsert(StockInstrument(conid=59262240, symbol="IEMI", currency="GBP"))
+    assert repo.get(iid) == StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+
+
+def test_future_renamed_collapses_and_contract_facts_are_insert_only(
+    db: sqlite3.Connection,
+) -> None:
+    repo = InstrumentRepo(db)
+    original = FutureInstrument(
+        conid=495512563,
+        symbol="ESZ5",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 12, 19),
+    )
+    renamed = FutureInstrument(
+        conid=495512563,
+        symbol="ES DEC25",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 12, 19),
+    )
+    iid = repo.upsert(original)
+    assert repo.upsert(renamed) == iid
+    assert db.execute("SELECT COUNT(*) FROM future_instruments").fetchone()[0] == 1
+    assert repo.get(iid) == renamed
+
+
+def test_futures_sharing_a_root_symbol_are_distinct_by_conid(db: sqlite3.Connection) -> None:
+    repo = InstrumentRepo(db)
+    mar = FutureInstrument(
+        conid=1,
+        symbol="ES",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 3, 21),
+    )
+    jun = FutureInstrument(
+        conid=2,
+        symbol="ES",
+        currency="USD",
+        contract_multiplier=Decimal("50"),
+        expiry_date=date(2025, 6, 20),
+    )
+    assert repo.upsert(mar) != repo.upsert(jun)
+    assert [inst.expiry_date for _id, inst in repo.list_futures(symbol="ES")] == [
+        date(2025, 3, 21),
+        date(2025, 6, 20),
+    ]
+
+
+def test_parent_row_carries_only_the_discriminator(db: sqlite3.Connection) -> None:
+    """`instruments.isin` is gone (migration 021); bonds own their ISIN."""
+    repo = InstrumentRepo(db)
+    repo.upsert(BondInstrument(isin="GB00BLPK7110", symbol="UKT 0 1/4 01/31/25", currency="GBP"))
+    columns = [r["name"] for r in db.execute("PRAGMA table_info(instruments)")]
+    assert columns == ["instrument_id", "asset_class"]

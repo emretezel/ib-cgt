@@ -78,7 +78,7 @@ def _fx_buy(
 
 
 def _stock_buy(*, on: date, account_id: str = "U1") -> Trade:
-    inst = StockInstrument(symbol="ISF", currency="GBP")
+    inst = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     return Trade(
         account_id=account_id,
         instrument=inst,

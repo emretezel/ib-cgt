@@ -179,8 +179,6 @@ class FutureRuleEngine:
             InconsistentTradeError: If the trade stream is internally
                 inconsistent (CLOSE_LONG with no open long, close
                 quantity exceeding the queue, BUY/SELL on a future).
-            ValueError: If a trade in `trades` references a different
-                instrument than `instrument`.
         """
         if not isinstance(instrument, FutureInstrument):
             raise WrongAssetClassError(
@@ -192,16 +190,13 @@ class FutureRuleEngine:
         short_q: deque[_OpenSlice] = deque()
         realisations: list[FutureRealisation] = []
 
+        # Per-contract engine: `trades` is the history of exactly one
+        # `instruments.instrument_id`, loaded as such by the caller. The
+        # engine does not re-check that against the trades' instrument
+        # fields — the conid is the ingest-time key and the symbol is
+        # display data; the surrogate id is the only identity in this
+        # system.
         for trade_id, trade in trades:
-            # Per-instrument engine — silently mixing instruments would
-            # make P&L meaningless. The validation is cheap and worth
-            # doing every iteration.
-            if trade.instrument != instrument:
-                raise ValueError(
-                    f"FutureRuleEngine.compute: trade_id={trade_id} belongs to "
-                    f"a different instrument than {instrument.symbol}"
-                )
-
             self._process_trade(
                 trade_id=trade_id,
                 trade=trade,

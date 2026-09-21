@@ -35,9 +35,13 @@ from ib_cgt.domain import (
 from ib_cgt.fx import FXService
 
 ACCOUNT = "U1004320"
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 ES = FutureInstrument(
-    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+    conid=14826456,
+    symbol="ES",
+    currency="USD",
+    contract_multiplier=Decimal("50"),
+    expiry_date=date(2025, 12, 19),
 )
 
 
@@ -68,7 +72,7 @@ def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Conne
         [
             Dividend(
                 account_id=ACCOUNT,
-                instrument=AAPL,
+                symbol="AAPL",
                 kind=DividendKind.CASH_DIVIDEND,
                 pay_date=date(2025, 4, 3),
                 amount=Money.of("50", "USD"),
@@ -76,7 +80,7 @@ def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Conne
             ),
             Dividend(
                 account_id=ACCOUNT,
-                instrument=AAPL,
+                symbol="AAPL",
                 kind=DividendKind.WITHHOLDING_TAX,
                 pay_date=date(2025, 4, 3),
                 amount=Money.of("7.50", "USD"),
@@ -107,8 +111,10 @@ def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Conne
     return db
 
 
-def _tier_d(db: sqlite3.Connection, fx_service: FXService, **kwargs: str) -> list[CheckResult]:
-    report = run_all(db, fx=fx_service, scope=Scope.ALL, **kwargs)
+def _tier_d(
+    db: sqlite3.Connection, fx_service: FXService, *, symbol: str | None = None
+) -> list[CheckResult]:
+    report = run_all(db, fx=fx_service, scope=Scope.ALL, symbol=symbol)
     return [r for r in report.results if r.name.startswith("D")]
 
 

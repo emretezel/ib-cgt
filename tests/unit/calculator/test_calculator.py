@@ -23,6 +23,8 @@ from ib_cgt.calculator import (
     TaxYearComputation,
 )
 from ib_cgt.calculator import calculator as calculator_module
+from ib_cgt.calculator.positions import reconcile_positions
+from ib_cgt.calculator.runner import run_engines
 from ib_cgt.db import (
     CashEventRepo,
     FXRateRepo,
@@ -48,9 +50,9 @@ from ib_cgt.rules import FXConverter
 
 from .conftest import AAPL, CL, CORP_USD, ES, GILT, STATEMENT_HASH, trade
 
-MSFT = StockInstrument(symbol="MSFT", currency="USD")
-NVDA = StockInstrument(symbol="NVDA", currency="USD")
-IEAA = StockInstrument(symbol="IEAA", currency="EUR")
+MSFT = StockInstrument(conid=7208578, symbol="MSFT", currency="USD")
+NVDA = StockInstrument(conid=250604280, symbol="NVDA", currency="USD")
+IEAA = StockInstrument(conid=50748999, symbol="IEAA", currency="EUR")
 U2_HASH = "hash-u2"
 Y2024 = TaxYear(2024)
 Y2025 = TaxYear(2025)
@@ -344,8 +346,10 @@ def test_engines_and_reconciliation_run_once_per_instance(
     calc_db: sqlite3.Connection, fx_service: FXService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = {"engines": 0, "positions": 0}
-    real_run = calculator_module.run_engines
-    real_reconcile = calculator_module.reconcile_positions
+    # Bind the originals from their defining modules; `calculator.py`
+    # only imports these names, it does not re-export them.
+    real_run = run_engines
+    real_reconcile = reconcile_positions
 
     def counting_run(conn: sqlite3.Connection, fx: FXConverter) -> EngineOutputs:
         calls["engines"] += 1

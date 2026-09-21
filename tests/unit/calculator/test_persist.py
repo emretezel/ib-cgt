@@ -150,6 +150,7 @@ def test_partial_run_persists_what_worked_and_records_the_failure(
 ) -> None:
     """A CLOSE with no OPEN fails one contract; everything else is saved."""
     nq = FutureInstrument(
+        conid=13113679,
         symbol="NQ",
         currency="USD",
         contract_multiplier=Decimal("20"),

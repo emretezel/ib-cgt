@@ -491,25 +491,30 @@ def _check_instrument_symbol_currency(ctx: CheckContext) -> Finding:
 
 @register_check(
     name="A13",
-    description="dividends reference live instrument/account and have plausible pay_date",
+    description="dividends reference a live account and carry a symbol and a plausible pay_date",
     tier=Tier.A,
     scopes={Scope.ALL, Scope.DATA},
     severity=Severity.WARN,
 )
 def _check_dividends_referential(ctx: CheckContext) -> Finding:
+    # Dividends are instrument-less (migration 021): the only FK is the
+    # account, and the IB security tag travels as `symbol` text.
     rows = ctx.conn.execute(
-        "SELECT d.dividend_id, d.account_id, d.instrument_id, d.pay_date "
+        "SELECT d.dividend_id, d.account_id, d.symbol, d.pay_date "
         "FROM dividends d "
         "LEFT JOIN accounts a ON a.account_id = d.account_id "
-        "LEFT JOIN instruments i ON i.instrument_id = d.instrument_id "
-        "WHERE a.account_id IS NULL OR i.instrument_id IS NULL "
+        "WHERE a.account_id IS NULL "
+        "OR d.symbol IS NULL OR d.symbol = '' "
         "OR d.pay_date IS NULL OR d.pay_date = ''"
     ).fetchall()
     if not rows:
         return Finding(triggered=False)
     return Finding(
         triggered=True,
-        detail=f"{len(rows)} dividend row(s) with broken refs or missing pay_date",
+        detail=(
+            f"{len(rows)} dividend row(s) with a broken account ref, "
+            "empty symbol or missing pay_date"
+        ),
         evidence=_rows_to_evidence(rows),
     )
 

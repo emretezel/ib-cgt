@@ -50,6 +50,7 @@ def _seed_accounts_and_statement(
 def _es_dec25() -> FutureInstrument:
     """A canonical ES future expiring 2025-12-19 in USD."""
     return FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),

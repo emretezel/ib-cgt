@@ -21,7 +21,7 @@ from ib_cgt.domain import (
 
 
 def _aapl() -> StockInstrument:
-    return StockInstrument(symbol="AAPL", currency="USD")
+    return StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def test_create_and_latest_for(db: sqlite3.Connection) -> None:

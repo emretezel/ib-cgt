@@ -22,6 +22,7 @@ from ib_cgt.domain import (
     Money,
 )
 from ib_cgt.rules.fx_cashflow import from_bond_coupon, make_pool_instrument
+from tests.conid import fake_isin
 
 
 class _StubFx:
@@ -53,6 +54,7 @@ def _coupon(
     return BondCoupon(
         account_id="U1",
         instrument=BondInstrument(
+            isin=fake_isin(symbol, currency),
             symbol=symbol,
             currency=currency,
             is_cgt_exempt=False,

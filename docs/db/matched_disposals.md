@@ -34,7 +34,7 @@ reported gain remains `matched_proceeds_gbp − matched_cost_gbp`.
 |---|---|---|---|
 | `run_id` | `INTEGER` | No (PK, FK) | Parent run. |
 | `disposal_trade_id` | `INTEGER` | No (PK) | The disposing trade's `trades.trade_id` (not declared as a FK so the disposal row remains valid as audit data even if the underlying trade is later corrected and reingested). For FX-pool rows this may be a **synthetic** id (≥ `10**12`) standing for a futures realisation, dividend, coupon or cash event; [`fx_event_sources`](./fx_event_sources.md) resolves it within the run. The same applies to `acquisition_trade_id`. |
-| `instrument_id` | `INTEGER` | No (FK) | Resolved at write time so the audit row keeps working even if the instrument is later renamed. |
+| `instrument_id` | `INTEGER` | No (FK) | Resolved at write time through the instrument's natural key (conid / ISIN / pair), so the audit row keeps pointing at the same `instruments` row even when IB later renames the symbol. |
 | `disposal_date` | `TEXT` | No | `YYYY-MM-DD` — disposal trade's `trade_date`. |
 | `match_rule` | `TEXT` | No | Domain enum; values are `same_day`, `bed_and_breakfast`, `section_104`, `later_acquisition` (the four UK matching rules — see [`docs/rules.md`](../rules.md)). |
 | `matched_quantity` | `TEXT` | No | Decimal string — size of this matched chunk. |

@@ -31,10 +31,14 @@ from ib_cgt.domain import (
 from ib_cgt.fx import FXService
 
 ACCOUNT = "U1004320"
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
-TSLA = StockInstrument(symbol="TSLA", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
+TSLA = StockInstrument(conid=171756085, symbol="TSLA", currency="USD")
 ES = FutureInstrument(
-    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+    conid=14826456,
+    symbol="ES",
+    currency="USD",
+    contract_multiplier=Decimal("50"),
+    expiry_date=date(2025, 12, 19),
 )
 
 

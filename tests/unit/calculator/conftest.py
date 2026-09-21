@@ -16,7 +16,9 @@ Scenario (all trades in April 2025 unless stated):
   long round-trip; `CL` (USD) five opened, three closed.
 * Forex — one `USD.GBP` buy in March, seeding the USD pool.
 * Dividends — an `AAPL` USD cash dividend and its withholding tax; an
-  `ASML` EUR dividend on a stock that is never traded (pool discovery).
+  `ASML` EUR dividend on a stock that is never traded (pool discovery:
+  dividends are instrument-less, so the EUR pool exists purely because
+  a dividend row is in EUR).
 * Coupons — one USD coupon on the corporate bond.
 * FX cache — GBP/USD 1.25 and GBP/EUR 1.16 from March to June 2025.
 
@@ -70,10 +72,10 @@ STATEMENT_HASH = "hash-calc"
 # Instruments
 # ---------------------------------------------------------------------------
 
-ISF = StockInstrument(symbol="ISF", currency="GBP")
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
-TSLA = StockInstrument(symbol="TSLA", currency="USD")
-ASML = StockInstrument(symbol="ASML", currency="EUR")
+ISF = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
+TSLA = StockInstrument(conid=171756085, symbol="TSLA", currency="USD")
+ASML = StockInstrument(conid=149536668, symbol="ASML", currency="EUR")
 GILT = BondInstrument(
     symbol="UKT 0 1/8 01/30/26", currency="GBP", isin="GB00BL68HJ26", is_cgt_exempt=True
 )
@@ -81,13 +83,25 @@ CORP_USD = BondInstrument(
     symbol="ACME 5 2030", currency="USD", isin="US000000AA11", is_cgt_exempt=False
 )
 ES = FutureInstrument(
-    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+    conid=14826456,
+    symbol="ES",
+    currency="USD",
+    contract_multiplier=Decimal("50"),
+    expiry_date=date(2025, 12, 19),
 )
 ZG = FutureInstrument(
-    symbol="ZG", currency="GBP", contract_multiplier=Decimal("10"), expiry_date=date(2025, 12, 19)
+    conid=73948901,
+    symbol="ZG",
+    currency="GBP",
+    contract_multiplier=Decimal("10"),
+    expiry_date=date(2025, 12, 19),
 )
 CL = FutureInstrument(
-    symbol="CL", currency="USD", contract_multiplier=Decimal("1000"), expiry_date=date(2025, 6, 20)
+    conid=100697936,
+    symbol="CL",
+    currency="USD",
+    contract_multiplier=Decimal("1000"),
+    expiry_date=date(2025, 6, 20),
 )
 USD_GBP = FXInstrument(
     symbol="USD.GBP", currency="USD", currency_pair=CurrencyPair(base="USD", quote="GBP")
@@ -138,10 +152,14 @@ def dividend(
     *,
     account_id: str = "U1",
 ) -> Dividend:
-    """A dividend-shaped cashflow in the stock's listing currency."""
+    """A dividend-shaped cashflow, paid in the stock's trade currency.
+
+    Dividends are instrument-less (migration 021); the stock is only
+    used here to pick the symbol label and the payment currency.
+    """
     return Dividend(
         account_id=account_id,
-        instrument=instrument,
+        symbol=instrument.symbol,
         kind=kind,
         pay_date=on,
         amount=Money.of(amount, instrument.currency),
@@ -189,7 +207,11 @@ def seed_accounts_and_statement(conn: sqlite3.Connection) -> None:
 
 def baseline_trades() -> list[Trade]:
     """The trade mix described in the module docstring."""
-    apr = lambda d: date(2025, 4, d)  # noqa: E731 — terse date helper
+
+    def apr(d: int) -> date:
+        """Terse date helper: the d-th of April 2025."""
+        return date(2025, 4, d)
+
     return [
         # ISF: same-day round-trip.
         trade(ISF, TradeAction.BUY, apr(5), "10", "100", fees="2", account_id="U2"),

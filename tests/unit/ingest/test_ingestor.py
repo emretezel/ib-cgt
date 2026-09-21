@@ -24,6 +24,7 @@ from ib_cgt.db import (
 )
 from ib_cgt.domain import FutureInstrument, Money
 from ib_cgt.ingest.ingestor import ingest_statement
+from tests.conid import fake_conid
 
 
 @dataclass
@@ -453,6 +454,7 @@ def test_leftover_future_position_resolves_against_known_contract(
 ) -> None:
     """A held-over contract with no FII row resolves via `future_instruments`."""
     cbk6 = FutureInstrument(
+        conid=182589266,
         symbol="CBK6",
         currency="USD",
         contract_multiplier=Decimal("1000"),
@@ -477,6 +479,7 @@ def test_ambiguous_leftover_future_position_stays_unresolved(db: sqlite3.Connect
     for expiry in (date(2026, 5, 15), date(2027, 5, 14)):
         repo.upsert(
             FutureInstrument(
+                conid=fake_conid("CBK6", "USD", expiry),
                 symbol="CBK6",
                 currency="USD",
                 contract_multiplier=Decimal("1000"),

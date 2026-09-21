@@ -10,7 +10,7 @@ from ib_cgt.db import TaxRunIssueRepo, TaxRunRepo
 from ib_cgt.domain import Money, RunIssue, RunIssueKind, StockInstrument, TaxYear
 from ib_cgt.rules.fx_cashflow import make_pool_instrument
 
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def test_round_trip_preserves_order_and_null_instrument(db: sqlite3.Connection) -> None:

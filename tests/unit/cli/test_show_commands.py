@@ -88,13 +88,14 @@ def _seed_trades(conn: sqlite3.Connection) -> dict[str, int]:
         period_end=date(2025, 4, 5),
     )
 
-    isf = StockInstrument(symbol="ISF", currency="GBP")
+    isf = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     usd_gbp = FXInstrument(
         symbol="USD.GBP",
         currency="USD",
         currency_pair=CurrencyPair(base="USD", quote="GBP"),
     )
     es = FutureInstrument(
+        conid=60584552,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),

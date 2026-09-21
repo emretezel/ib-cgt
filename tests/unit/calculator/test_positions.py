@@ -45,12 +45,16 @@ from ib_cgt.domain import (
     TradeAction,
 )
 
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
-TSLA = StockInstrument(symbol="TSLA", currency="USD")
-MSFT = StockInstrument(symbol="MSFT", currency="USD")
-IEAA = StockInstrument(symbol="IEAA", currency="EUR")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
+TSLA = StockInstrument(conid=171756085, symbol="TSLA", currency="USD")
+MSFT = StockInstrument(conid=7208578, symbol="MSFT", currency="USD")
+IEAA = StockInstrument(conid=50748999, symbol="IEAA", currency="EUR")
 ES = FutureInstrument(
-    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+    conid=14826456,
+    symbol="ES",
+    currency="USD",
+    contract_multiplier=Decimal("50"),
+    expiry_date=date(2025, 12, 19),
 )
 USD_GBP = FXInstrument(
     symbol="USD.GBP", currency="USD", currency_pair=CurrencyPair(base="USD", quote="GBP")

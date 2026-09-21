@@ -17,7 +17,7 @@ from ib_cgt.domain import (
     StockInstrument,
 )
 
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def test_long_and_short_positions_are_valid() -> None:
@@ -28,6 +28,7 @@ def test_long_and_short_positions_are_valid() -> None:
 
 def test_futures_positions_are_valid() -> None:
     es = FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),

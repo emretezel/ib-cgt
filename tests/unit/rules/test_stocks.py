@@ -42,7 +42,7 @@ from .conftest import StubFXService, aapl, stock_trade
 
 def _gbp_stock() -> StockInstrument:
     """GBP-denominated stock — the FX-free identity path."""
-    return StockInstrument(symbol="ISF", currency="GBP")
+    return StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +317,7 @@ def test_wrong_asset_class_raises() -> None:
     fx = StubFXService({})
     engine = StockRuleEngine(fx)
     future = FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -328,30 +329,46 @@ def test_wrong_asset_class_raises() -> None:
     assert exc_info.value.instrument_class == "FutureInstrument"
 
 
-def test_mixed_instrument_in_trades_raises() -> None:
-    """A trade for a different instrument leaking through raises ValueError."""
-    fx = StubFXService({})
+def test_engine_does_not_key_identity_on_instrument_fields() -> None:
+    """Identity is the caller's `instrument_id`; display fields are never compared.
+
+    IB renames symbols between statements (`JNKEz` became `JNKE`), so
+    a trade whose instrument object carries a different symbol from
+    the one the engine was handed is still the same instrument as far
+    as the engine is concerned: it is matched, and the engine's own
+    instrument is stamped on the output.
+    """
+    fx = StubFXService({date(2024, 5, 1): Decimal("0.80"), date(2024, 6, 1): Decimal("0.80")})
     engine = StockRuleEngine(fx)
-    inst = aapl()  # AAPL/USD
-    other = StockInstrument(symbol="MSFT", currency="USD")
-    fx_with_rate = StubFXService({date(2024, 5, 1): Decimal("0.80")})
-    engine = StockRuleEngine(fx_with_rate)
-    with pytest.raises(ValueError, match="different instrument"):
-        engine.compute(
-            inst,
-            [
-                (
-                    1,
-                    stock_trade(
-                        action=TradeAction.BUY,
-                        on=date(2024, 5, 1),
-                        qty=10,
-                        price=100,
-                        instrument=other,
-                    ),
+    inst = aapl()
+    renamed = StockInstrument(conid=inst.conid, symbol="AAPL.OLD", currency="USD")
+    result = engine.compute(
+        inst,
+        [
+            (
+                1,
+                stock_trade(
+                    action=TradeAction.BUY,
+                    on=date(2024, 5, 1),
+                    qty=10,
+                    price=100,
+                    instrument=renamed,
                 ),
-            ],
-        )
+            ),
+            (
+                2,
+                stock_trade(
+                    action=TradeAction.SELL,
+                    on=date(2024, 6, 1),
+                    qty=10,
+                    price=120,
+                    instrument=renamed,
+                ),
+            ),
+        ],
+    )
+    assert len(result.matched_disposals) == 1
+    assert result.matched_disposals[0].instrument == inst
 
 
 def test_invalid_action_for_stock_raises() -> None:

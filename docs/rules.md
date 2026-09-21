@@ -104,9 +104,13 @@ result = engine.match(
 `Acquisition` and `Disposal` are the *derived* shapes from
 `ib_cgt.domain.disposal` — both are GBP-denominated. The engine takes
 unsorted input and sorts internally, so the caller does not have to
-order chronologically. Instrument identity is required separately so
-the engine can validate every input belongs to the named instrument
-and so an empty input still returns a sensible `final_pool`.
+order chronologically. The instrument is passed separately so an
+empty input still returns a sensible `final_pool`; it is **not** used
+to validate the inputs. Identity is the caller's responsibility: the
+runner loads every acquisition and disposal for one
+`instruments.instrument_id`, and the engine never compares symbol,
+ISIN, conid or expiry — IB renames symbols between statements, and
+those fields are display or ingest-time data.
 
 ### Output: `MatchingResult`
 
@@ -270,9 +274,11 @@ S.104 pools span every account belonging to the taxpayer (per
 [`docs/architecture.md §Scope — Accounts`](./architecture.md)). The
 engine does not partition by `account_id` — the caller is expected
 to feed in the trade history for an instrument across **all**
-accounts. The persistence layer's `(symbol, currency)` natural-key
-UNIQUE on `stock_instruments` resolves cross-account history to a
-single instrument id automatically.
+accounts. The persistence layer's natural-key UNIQUE on each child
+table (IB `conid` for stocks and futures, ISIN for bonds) resolves
+cross-account history to a single instrument id automatically, even
+when IB renders the listing under a different symbol in one
+account's statements.
 
 ### Short positions
 
@@ -529,11 +535,11 @@ Each is a pure function returning `Acquisition | Disposal | None`.
 
 The CGT pool for a UK taxpayer is per single non-GBP currency vs
 GBP — there is one USD pool, one EUR pool, etc. — irrespective of
-which counter-currency the trade was struck against. To match
-`MatchingEngine`'s instrument-identity contract the engine
-synthesises an `FXInstrument(symbol=<ccy>, currency=<ccy>,
-currency_pair=(<ccy>, GBP))` once per `compute()` call and stamps
-it onto every projected event. The persisted `FXInstrument` rows in
+which counter-currency the trade was struck against. Every projected
+event needs an instrument to carry, so the engine synthesises an
+`FXInstrument(symbol=<ccy>, currency=<ccy>, currency_pair=(<ccy>,
+GBP))` once per `compute()` call and stamps it onto every projected
+event; the matching engine itself never inspects it for identity. The persisted `FXInstrument` rows in
 `fx_instruments` stay keyed by traded pair (`EUR.USD`, `USD.GBP`,
 …) — that's the ingestion shape, distinct from the matching shape.
 

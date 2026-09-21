@@ -32,7 +32,7 @@ def _seed(db: sqlite3.Connection) -> int:
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
     )
-    inst = StockInstrument(symbol="ISF", currency="GBP")
+    inst = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     trade = Trade(
         account_id="U1",
         instrument=inst,

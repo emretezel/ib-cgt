@@ -147,7 +147,7 @@ def test_other_currency_pool_is_not_fed() -> None:
 
 
 def test_non_bond_trade_raises_wrong_asset_class() -> None:
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     trade = Trade(
         account_id="U1",
         instrument=aapl,

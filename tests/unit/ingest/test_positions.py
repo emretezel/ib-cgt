@@ -1,9 +1,9 @@
 """Unit tests for `ingest/positions.py:map_open_positions`.
 
-Covers the per-class resolution (stock from the row, bond by ISIN and
-future by multiplier / expiry through the instrument-information
-section), quantity normalisation, the leftover path for a futures
-contract with no instrument-information row, and the loud failures.
+Covers the per-class resolution (stock and future by conid, bond by
+ISIN, all through the instrument-information section), quantity
+normalisation, the leftover path for a position with no instrument-
+information row, and the loud failures.
 
 Author: Emre Tezel
 """
@@ -73,6 +73,20 @@ def _future_info(symbol: str = "6LK6") -> RawInstrumentInfo:
         multiplier_text="100,000",
         expiry_text="2026-05-29",
         listing_exch="CME",
+        conid_text="681234567",
+    )
+
+
+def _stock_info(symbol: str, conid: str) -> RawInstrumentInfo:
+    return RawInstrumentInfo(
+        asset_class="Stocks",
+        symbol=symbol,
+        description=f"{symbol} ETF",
+        multiplier_text="1",
+        expiry_text=None,
+        listing_exch="LSEETF",
+        security_id="IE00B2NPL135",
+        conid_text=conid,
     )
 
 
@@ -95,15 +109,18 @@ def _bond_info(symbol: str = "UKT 0 3/8 10/22/26") -> RawInstrumentInfo:
 # ---------------------------------------------------------------------------
 
 
-def test_stock_position_resolves_from_the_row_alone() -> None:
+def test_stock_position_resolves_conid_through_instrument_info() -> None:
     positions, leftovers = map_open_positions(
-        _parsed(_row(asset_class="Stocks", symbol="IEMI", quantity_text="100"))
+        _parsed(
+            _row(asset_class="Stocks", symbol="IEMI", quantity_text="100"),
+            instruments=(_stock_info("IEMI", "59262240"),),
+        )
     )
     assert leftovers == []
     assert positions == [
         type(positions[0])(
             account_id="U1",
-            instrument=StockInstrument(symbol="IEMI", currency="USD"),
+            instrument=StockInstrument(conid=59262240, symbol="IEMI", currency="USD"),
             quantity=Decimal("100"),
         )
     ]
@@ -143,6 +160,7 @@ def test_future_position_resolves_multiplier_and_expiry_from_instrument_info() -
     assert leftovers == []
     (position,) = positions
     assert position.instrument == FutureInstrument(
+        conid=681234567,
         symbol="6LK6",
         currency="USD",
         contract_multiplier=Decimal("100000"),
@@ -158,7 +176,10 @@ def test_future_position_resolves_multiplier_and_expiry_from_instrument_info() -
 
 def test_negative_quantity_is_a_short_position() -> None:
     positions, _ = map_open_positions(
-        _parsed(_row(asset_class="Stocks", symbol="TSLA", quantity_text="-40"))
+        _parsed(
+            _row(asset_class="Stocks", symbol="TSLA", quantity_text="-40"),
+            instruments=(_stock_info("TSLA", "76792991"),),
+        )
     )
     assert positions[0].quantity == Decimal("-40")
 
@@ -185,6 +206,14 @@ def test_unparseable_quantity_raises_mapping_error() -> None:
 def test_future_without_instrument_info_is_returned_as_leftover() -> None:
     """A held-over contract with no FII row is not an error here."""
     row = _row(asset_class="Futures", symbol="CBK6", quantity_text="-3")
+    positions, leftovers = map_open_positions(_parsed(row))
+    assert positions == []
+    assert leftovers == [row]
+
+
+def test_stock_without_instrument_info_is_returned_as_leftover() -> None:
+    """A held-over stock with no FII row (hence no conid) follows the same path."""
+    row = _row(asset_class="Stocks", symbol="IEAA", quantity_text="50")
     positions, leftovers = map_open_positions(_parsed(row))
     assert positions == []
     assert leftovers == [row]

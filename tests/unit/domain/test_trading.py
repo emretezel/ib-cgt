@@ -50,15 +50,18 @@ def test_account_rejects_blank_id() -> None:
 
 
 def _aapl() -> StockInstrument:
-    return StockInstrument(symbol="AAPL", currency="USD")
+    return StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def _gilt(exempt: bool = True) -> BondInstrument:
-    return BondInstrument(symbol="GILT25", currency="GBP", is_cgt_exempt=exempt)
+    return BondInstrument(
+        isin="XS5160487137", symbol="GILT25", currency="GBP", is_cgt_exempt=exempt
+    )
 
 
 def _es_future() -> FutureInstrument:
     return FutureInstrument(
+        conid=209080823,
         symbol="ESM5",
         currency="USD",
         contract_multiplier=Decimal("50"),

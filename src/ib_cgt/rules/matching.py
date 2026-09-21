@@ -243,9 +243,11 @@ class MatchingEngine:
 
         Args:
             instrument: The instrument all acquisitions and disposals
-                refer to. Used to construct the `final_pool` even when
-                inputs are empty, and to validate that every input
-                actually belongs to this instrument.
+                refer to. Used to stamp outputs and to construct the
+                `final_pool` even when inputs are empty. It is *not*
+                used to validate the inputs: identity is the
+                `instruments.instrument_id` the caller loaded them by,
+                never the instrument's symbol / ISIN / conid fields.
             acquisitions: Every acquisition in this instrument's
                 history (not just the target tax year). Order is not
                 required — the engine sorts internally.
@@ -272,24 +274,16 @@ class MatchingEngine:
                 quantity after exhausting same-day, 30-day, and pool
                 matches (i.e. the trade history is incomplete) and
                 `soft_residuals` is False.
-            ValueError: If any input acquisition or disposal references
-                a different instrument than `instrument`.
         """
-        # Validate inputs share the same instrument identity. The engine
-        # is per-instrument by design; mixed inputs would silently mis-
-        # match cost basis across unrelated holdings.
-        for acq in acquisitions:
-            if acq.instrument != instrument:
-                raise ValueError(
-                    f"MatchingEngine.match: acquisition trade_id={acq.trade_id} "
-                    f"belongs to a different instrument than {instrument.symbol}"
-                )
-        for disp in disposals:
-            if disp.instrument != instrument:
-                raise ValueError(
-                    f"MatchingEngine.match: disposal trade_id={disp.trade_id} "
-                    f"belongs to a different instrument than {instrument.symbol}"
-                )
+        # Identity contract: the engine is per-instrument by design, and
+        # "one instrument" means one `instruments.instrument_id` — the
+        # caller (the calculator runner) loads every acquisition and
+        # disposal for a single id and hands them over together. The
+        # engine therefore never inspects symbol, ISIN, conid or expiry
+        # to decide whether inputs belong together: those are display
+        # or ingest-time fields, and IB renames symbols between
+        # statements. `instrument` is carried for stamping outputs and
+        # for the empty-input `final_pool`, not for validation.
 
         # Build the mutable working state. Sorting both sides up-front
         # makes every pass deterministic and the FIFO behaviour obvious.

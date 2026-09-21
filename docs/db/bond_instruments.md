@@ -58,9 +58,9 @@ making the parent / child relationship strictly one-to-one.
 ## Views
 
 Surfaced through [`v_instruments`](./index.md#views) — the bond arm
-of the UNION ALL exposes `b.isin` (rather than `i.isin`) so callers
-that read `v_instruments.isin` get the bond's authoritative ISIN
-straight from the child column.
+of the UNION ALL is the only one that populates `isin` (stocks,
+futures and FX pairs project NULL there; the parent table has carried
+no `isin` since migration `021`).
 
 ## Read paths
 
@@ -74,23 +74,21 @@ straight from the child column.
 ## Write paths
 
 - [`InstrumentRepo._insert_child(instrument_id, instrument)`](../../src/ib_cgt/db/repos/instruments.py)
-  — inserts here when `instrument` is a `BondInstrument`. Raises
-  `ValueError` when `BondInstrument.isin is None`.
+  — inserts here when `instrument` is a `BondInstrument`. The domain
+  type makes `isin` a required, non-blank field, so an ISIN-less bond
+  cannot be constructed in the first place.
 - [`InstrumentRepo.upsert(...)`](../../src/ib_cgt/db/repos/instruments.py)
   — on hit, **promotes-only** `is_cgt_exempt` (an existing exempt
   bond cannot be silently downgraded by a placeholder `False`) and
   updates `symbol` to the latest canonical form.
 
-## Schema-design note: `instruments.isin` for bonds
+## Schema-design note: the ISIN lives here only
 
-The parent `instruments.isin` column is also populated for bonds
-(written through the same `InstrumentRepo.upsert` call). This is a
-deliberate denormalisation: bond-related reads use
-`bond_instruments.isin` (authoritative), while cross-class queries
-(`v_instruments`, joins that don't know the discriminator) can still
-project `instruments.isin` uniformly. The bond's ISIN is stored in
-two places but the **child column is the single source of truth** —
-the parent column is a write-time mirror.
+Until migration `021` the parent `instruments.isin` column mirrored
+this table's ISIN as a write-time copy. That duplicated a fact, and
+the column was meaningless for every other class, so it was dropped:
+`bond_instruments.isin` is the single home of a bond's ISIN, and
+cross-class readers get it through `v_instruments`.
 
 ## CLI commands that touch this table
 
@@ -99,9 +97,38 @@ the parent column is a write-time mirror.
 
 ## Sample (first 5 rows)
 
-Regenerate after re-ingesting the live DB:
+Captured after migration `021` with
+`SELECT instrument_id, isin, symbol, currency, is_cgt_exempt FROM bond_instruments LIMIT 5;`
+from the live DB, rendered as `column = value` blocks.
 
-```sql
-SELECT instrument_id, isin, symbol, currency, is_cgt_exempt
-FROM bond_instruments ORDER BY instrument_id LIMIT 5;
+```
+instrument_id = 251
+         isin = GB00B7Z53659
+       symbol = UKT 2 1/4 09/07/23
+     currency = GBP
+is_cgt_exempt = 1
+
+instrument_id = 403
+         isin = GB00BMGR2791
+       symbol = UKT 0 1/8 01/31/24
+     currency = GBP
+is_cgt_exempt = 1
+
+instrument_id = 404
+         isin = GB00BHBFH458
+       symbol = UKT 2 3/4 09/07/24
+     currency = GBP
+is_cgt_exempt = 1
+
+instrument_id = 539
+         isin = GB00BLPK7110
+       symbol = UKT 0 1/4 01/31/25
+     currency = GBP
+is_cgt_exempt = 1
+
+instrument_id = 540
+         isin = GB00BL68HJ26
+       symbol = UKT 0 1/8 01/30/26
+     currency = GBP
+is_cgt_exempt = 1
 ```

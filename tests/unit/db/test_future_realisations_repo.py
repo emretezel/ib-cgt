@@ -12,10 +12,18 @@ from ib_cgt.db import FutureRealisationRepo, TaxRunRepo
 from ib_cgt.domain import FutureInstrument, FutureRealisation, Money, TaxYear
 
 ES = FutureInstrument(
-    symbol="ES", currency="USD", contract_multiplier=Decimal("50"), expiry_date=date(2025, 12, 19)
+    conid=14826456,
+    symbol="ES",
+    currency="USD",
+    contract_multiplier=Decimal("50"),
+    expiry_date=date(2025, 12, 19),
 )
 ZG = FutureInstrument(
-    symbol="ZG", currency="GBP", contract_multiplier=Decimal("10"), expiry_date=date(2025, 12, 19)
+    conid=73948901,
+    symbol="ZG",
+    currency="GBP",
+    contract_multiplier=Decimal("10"),
+    expiry_date=date(2025, 12, 19),
 )
 
 

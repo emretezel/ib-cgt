@@ -64,8 +64,8 @@ def _seed_baseline(conn: sqlite3.Connection) -> None:
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
     )
-    isf = StockInstrument(symbol="ISF", currency="GBP")
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    isf = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     trades = [
         # ISF: same-day round-trip on day 5.
         Trade(

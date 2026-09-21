@@ -304,7 +304,9 @@ def test_preserves_input_order_across_multiple_maturities() -> None:
         "UKT 0 1/4 01/31/25",
         "UKT 2 3/4 09/07/24",
     ]
-    assert [t.instrument.isin for t in trades] == [
+    bonds = [t.instrument for t in trades]
+    assert all(isinstance(bond, BondInstrument) for bond in bonds)
+    assert [bond.isin for bond in bonds if isinstance(bond, BondInstrument)] == [
         "GB00BLPK7110",
         "GB00BHBFH458",
     ]

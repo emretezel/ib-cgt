@@ -32,3 +32,20 @@ def insert_legacy_statement(
         "imported_at, trade_count) VALUES (?, ?, ?, ?, 0)",
         (statement_hash, source_path, account_id, "2025-01-01T00:00:00+00:00"),
     )
+
+
+def insert_legacy_stock(conn: sqlite3.Connection, *, symbol: str, currency: str) -> int:
+    """Insert a stock in the migration-003-to-020 shape and return its id.
+
+    Before migration 021 the parent carried a nullable `isin` and the
+    child was keyed `(symbol, currency)` with no `conid`; tests that
+    replay a pre-021 schema must seed that shape rather than the one
+    `InstrumentRepo` writes today.
+    """
+    cur = conn.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
+    instrument_id = int(cur.lastrowid or 0)
+    conn.execute(
+        "INSERT INTO stock_instruments (instrument_id, symbol, currency) VALUES (?, ?, ?)",
+        (instrument_id, symbol, currency),
+    )
+    return instrument_id

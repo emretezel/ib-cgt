@@ -21,6 +21,13 @@ and obscuring which fields are valid for which class. A sealed hierarchy
 lets the rule engines dispatch via `match instrument: case
 FutureInstrument(...): ...` and get exhaustive type-narrowing for free.
 
+The same argument gives each class its own natural key rather than a
+shared optional one: stocks and futures carry IB's `conid`, bonds the
+ISIN, FX pairs the currency pair. Those keys exist so ingestion can
+recognise the same instrument across statements (IB renames symbols;
+it never changes a conid or an ISIN). Once persisted, the surrogate
+`instruments.instrument_id` is the only identity the calculator uses.
+
 Author: Emre Tezel
 """
 
@@ -106,6 +113,24 @@ class Account:
 # ---------------------------------------------------------------------------
 
 
+def _validate_conid(conid: object, *, owner: str) -> None:
+    """Reject anything but a strictly positive `int` as an IB contract id.
+
+    Shared by `StockInstrument` and `FutureInstrument`. `bool` is a
+    subclass of `int` in Python, so `True` would otherwise slip through
+    as conid `1` — it is rejected explicitly. The check is written
+    against `object` so a mis-typed call site (a conid still in its raw
+    statement-text form, for example) fails here rather than at the
+    STRICT `INTEGER` column.
+    """
+    if isinstance(conid, bool) or not isinstance(conid, int):
+        raise InvalidInstrumentError(
+            f"{owner}.conid must be an int, got {type(conid).__name__}: {conid!r}"
+        )
+    if conid <= 0:
+        raise InvalidInstrumentError(f"{owner}.conid must be > 0, got {conid}")
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Instrument:
     """Shared fields of every tradable instrument.
@@ -116,15 +141,23 @@ class Instrument:
     `AnyInstrument` union: downstream code receives one of four known
     subclasses and never a bare `Instrument`.
 
+    Identity is *not* a shared field: each subclass carries its own
+    natural key (`conid` for stocks and futures, `isin` for bonds, the
+    currency pair for FX) and the persistence layer maps that to the
+    surrogate `instruments.instrument_id`, which is the only identity
+    the calculator ever compares. `symbol` is display text — IB renames
+    symbols between statements, so nothing may treat it as identity.
+
     Attributes:
         symbol: The IB symbol or ticker as it appears in statements.
-        currency: The instrument's primary trading currency (ISO-4217).
-        isin: Optional ISIN; not every IB statement provides one.
+        currency: The currency IB prices the instrument's trades and
+            positions in (ISO-4217). For a stock this is the trade
+            currency of the listing, which is not necessarily the
+            currency its distributions are paid in.
     """
 
     symbol: str
     currency: str
-    isin: str | None = None
 
     # Each subclass sets this to its asset-class discriminator. Declared on
     # the base (without a value) so a `type: ignore`-free `instrument.asset_class`
@@ -138,51 +171,87 @@ class Instrument:
         # Reuse the currency-code validator from money.py rather than duplicating;
         # money.py has no domain-internal dependencies, so no import cycle risk.
         validate_currency_code(self.currency)
-        if self.isin is not None and (not self.isin or not self.isin.strip()):
-            raise InvalidInstrumentError("Instrument.isin, if provided, must be non-empty")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StockInstrument(Instrument):
-    """An equity listing. No extra fields beyond the shared base."""
+    """An equity listing, identified by IB's contract id.
 
+    Attributes:
+        conid: IB's contract id for the listing — stable across
+            statements even when IB renames the symbol (`JNKEz` became
+            `JNKE` under conid 102048570). One conid is one listing on
+            one venue in one trade currency.
+    """
+
+    conid: int
     asset_class: ClassVar[AssetClass] = AssetClass.STOCK
+
+    def __post_init__(self) -> None:
+        """Validate the shared fields, then the conid."""
+        # See FutureInstrument.__post_init__ for why the explicit-class
+        # form of `super()` is required under `@dataclass(slots=True)`.
+        super(StockInstrument, self).__post_init__()
+        _validate_conid(self.conid, owner="StockInstrument")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BondInstrument(Instrument):
-    """A bond holding — exempt flag separates QCBs / gilts from pooled bonds.
+    """A bond holding, identified by ISIN, with the CGT-exempt flag.
 
     UK gilts and Qualifying Corporate Bonds are CGT-exempt; setting
     `is_cgt_exempt=True` tells the `BondRuleEngine` to skip the matching
     logic entirely for this instrument.
+
+    Attributes:
+        isin: The bond's ISIN — its natural key (migration 014). IB
+            prints it in the bonds-shaped Financial Instrument
+            Information table and inline in every maturity row, so it
+            is always available and always required.
+        is_cgt_exempt: True for gilts / QCBs.
     """
 
+    isin: str
     is_cgt_exempt: bool = False
     asset_class: ClassVar[AssetClass] = AssetClass.BOND
+
+    def __post_init__(self) -> None:
+        """Validate the shared fields, then the ISIN."""
+        super(BondInstrument, self).__post_init__()
+        if not self.isin or not self.isin.strip():
+            raise InvalidInstrumentError("BondInstrument.isin must be non-empty")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FutureInstrument(Instrument):
-    """A futures contract. Multiplier and expiry are mandatory.
+    """A futures contract, identified by IB's contract id.
 
     Individual-investor UK CGT treats each closed contract as its own
     disposal, so the `FutureRuleEngine` needs the multiplier to compute
     notional values and the expiry to distinguish rolled vs expired
     positions.
+
+    Attributes:
+        conid: IB's contract id — one conid is one contract (one root,
+            one expiry, one venue), so two delivery months of the same
+            root are two conids.
+        contract_multiplier: Notional per point, strictly positive.
+        expiry_date: Last trading / delivery date.
     """
 
+    conid: int
     contract_multiplier: Decimal
     expiry_date: date
     asset_class: ClassVar[AssetClass] = AssetClass.FUTURE
 
     def __post_init__(self) -> None:
-        """Validate the multiplier is strictly positive."""
+        """Validate the conid and that the multiplier is strictly positive."""
         # `@dataclass(slots=True)` replaces the class object after this method
         # is compiled, which breaks the zero-arg `super()` closure's
         # `__class__` cell. Calling with the explicit class resolves the
         # post-decoration class at call time.
         super(FutureInstrument, self).__post_init__()
+        _validate_conid(self.conid, owner="FutureInstrument")
         if self.contract_multiplier <= 0:
             raise InvalidInstrumentError(
                 f"FutureInstrument.contract_multiplier must be > 0, got {self.contract_multiplier}"

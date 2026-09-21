@@ -63,9 +63,10 @@ def test_cash_dividend_row_maps_to_cash_dividend_kind() -> None:
     assert div.kind is DividendKind.CASH_DIVIDEND
     assert div.amount == Money.of(Decimal("30.00"), "USD")
     assert div.pay_date == date(2024, 5, 1)
-    assert div.instrument.symbol == "AAPL"
-    assert div.instrument.currency == "USD"
-    assert div.instrument.isin == "US0378331005"
+    # The security tag is carried as a label only; the `(SECID)` stays
+    # in the verbatim description and is never resolved to an instrument.
+    assert div.symbol == "AAPL"
+    assert div.description.startswith("AAPL(US0378331005)")
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,7 @@ def test_payment_in_lieu_row_maps_to_payment_in_lieu_kind() -> None:
     )
     [div] = map_dividends(parsed)
     assert div.kind is DividendKind.PAYMENT_IN_LIEU
-    assert div.instrument.currency == "EUR"
+    assert div.amount.currency == "EUR"
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +133,16 @@ def test_change_in_dividend_accruals_are_filtered_out() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ISIN vs internal-secid handling
+# Security-tag handling — the SECID is never interpreted
 # ---------------------------------------------------------------------------
 
 
-def test_internal_secid_is_not_stored_as_isin() -> None:
-    """A 9-digit IB security id (not an ISIN) leaves `isin` unset.
+def test_numeric_secid_is_accepted_and_symbol_kept() -> None:
+    """IB sometimes prints its own conid instead of the ISIN in the tag.
 
     Real-statement observed shape: `JNKE(102048570) Cash Dividend EUR ...`.
+    A dividend is not resolved to an instrument, so the mapper only
+    needs the prefix to parse; the symbol is kept as the audit label.
     """
     parsed = _make_parsed(
         [
@@ -153,8 +156,28 @@ def test_internal_secid_is_not_stored_as_isin() -> None:
         ]
     )
     [div] = map_dividends(parsed)
-    assert div.instrument.isin is None
-    assert div.instrument.symbol == "JNKE"
+    assert div.symbol == "JNKE"
+    assert div.amount == Money.of(Decimal("50.00"), "EUR")
+
+
+def test_payment_currency_is_the_section_currency_whatever_the_stock_trades_in() -> None:
+    """IEMI trades in GBP but IB pays its distributions in USD.
+
+    Nothing ties a dividend to the stock's trade currency: the amount
+    is simply in the currency of the section the row was printed in.
+    """
+    parsed = _make_parsed(
+        [
+            _div_row(
+                description="IEMI(IE00B2NPL135) Cash Dividend USD 0.0755 per Share (Mixed Income)",
+                currency="USD",
+                amount_text="62.21",
+            ),
+        ]
+    )
+    [div] = map_dividends(parsed)
+    assert div.symbol == "IEMI"
+    assert div.amount.currency == "USD"
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +272,6 @@ def test_withholding_on_broker_interest_is_left_to_the_cash_event_mapper() -> No
         ]
     )
     dividends = map_dividends(parsed)
-    assert [d.instrument.symbol for d in dividends] == ["BIG"]
+    assert [d.symbol for d in dividends] == ["BIG"]
     assert has_instrument_prefix("BIG(US0893021032) Cash Dividend") is True
     assert has_instrument_prefix("CANCEL WITHHOLDING ON Credit Interest for Dec-2018") is False

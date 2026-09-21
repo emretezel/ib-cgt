@@ -123,8 +123,6 @@ class StockRuleEngine:
                 rejects `OPEN_*`/`CLOSE_*` for non-future
                 instruments, but the engine guards against in-memory
                 malformed `Trade` objects too).
-            ValueError: A trade in `trades` references a different
-                instrument than `instrument`.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
                 (strict mode only) when a disposal still carries
                 residual quantity after all four passes (typically a
@@ -137,18 +135,14 @@ class StockRuleEngine:
                 instrument_class=type(instrument).__name__,
             )
 
+        # Per-instrument engine: `trades` is the history of exactly one
+        # `instruments.instrument_id`, loaded as such by the caller. The
+        # engine does not re-check that against the trades' instrument
+        # fields — symbol and the like are display data that IB renames,
+        # and the surrogate id is the only identity in this system.
         acquisitions: list[Acquisition] = []
         disposals: list[Disposal] = []
         for trade_id, trade in trades:
-            # Per-instrument engine — silently mixing instruments
-            # would distort cost basis across unrelated holdings.
-            # Cheap to validate every trade.
-            if trade.instrument != instrument:
-                raise ValueError(
-                    f"StockRuleEngine.compute: trade_id={trade_id} belongs to "
-                    f"a different instrument than {instrument.symbol}"
-                )
-
             if trade.action is TradeAction.BUY:
                 acquisitions.append(self._build_acquisition(trade_id, trade, instrument))
             elif trade.action is TradeAction.SELL:

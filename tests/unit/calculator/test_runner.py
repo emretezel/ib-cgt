@@ -10,8 +10,11 @@ from datetime import date
 from decimal import Decimal
 
 from ib_cgt.calculator import (
+    BondEngineRun,
     EngineOutputs,
+    FutureEngineRun,
     FXEngineRun,
+    StockEngineRun,
     load_fx_inputs,
     run_bond_engine,
     run_engines,
@@ -52,13 +55,22 @@ def test_run_engines_covers_every_asset_class(
 ) -> None:
     outputs = run_engines(db, fx_service)
 
-    assert {run.instrument.symbol for run in outputs.stocks} == {"AAPL", "ASML", "ISF", "TSLA"}
+    # ASML only ever pays a dividend; dividends are instrument-less, so
+    # it is not a stock run — its EUR pool is discovered from the
+    # dividend rows instead (asserted on `outputs.fx` below).
+    assert {run.instrument.symbol for run in outputs.stocks} == {"AAPL", "ISF", "TSLA"}
     assert {run.instrument.symbol for run in outputs.bonds} == {"ACME 5 2030", "UKT 0 1/8 01/30/26"}
     assert {run.instrument.symbol for run in outputs.futures} == {"CL", "ES", "ZG"}
     assert [run.currency for run in outputs.fx] == ["EUR", "USD"]
     assert outputs.failures == ()
     # Every run carries a result and no error.
-    for run in (*outputs.stocks, *outputs.bonds, *outputs.futures, *outputs.fx):
+    runs: list[StockEngineRun | BondEngineRun | FutureEngineRun | FXEngineRun] = [
+        *outputs.stocks,
+        *outputs.bonds,
+        *outputs.futures,
+        *outputs.fx,
+    ]
+    for run in runs:
         assert run.error is None and run.result is not None
 
 
@@ -136,7 +148,7 @@ def test_dividends_withholding_and_coupons_reach_the_pool(
 ) -> None:
     inputs = _fx_run(run_engines(db, fx_service), "USD").inputs
 
-    kinds = {d.kind for _id, d in inputs.dividends if d.instrument.currency == "USD"}
+    kinds = {d.kind for _id, d in inputs.dividends if d.amount.currency == "USD"}
     assert kinds == {DividendKind.CASH_DIVIDEND, DividendKind.WITHHOLDING_TAX}
     for synth_id, _dividend in inputs.dividends:
         assert 2 * 10**12 <= synth_id < 3 * 10**12
@@ -176,6 +188,7 @@ def test_engine_error_is_captured_per_instrument(
 ) -> None:
     """A CLOSE with no OPEN fails one contract, leaves the rest intact."""
     nq = FutureInstrument(
+        conid=13113679,
         symbol="NQ",
         currency="USD",
         contract_multiplier=Decimal("20"),

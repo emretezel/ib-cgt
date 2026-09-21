@@ -20,11 +20,12 @@ from ib_cgt.domain import (
     StockInstrument,
 )
 
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 GILT = BondInstrument(
     symbol="UKT 0 3/8 10/22/26", currency="GBP", isin="GB00BMGR2809", is_cgt_exempt=True
 )
 BRE = FutureInstrument(
+    conid=110828293,
     symbol="6LK6",
     currency="USD",
     contract_multiplier=Decimal("100000"),

@@ -54,7 +54,10 @@ def test_union_members_are_distinguishable() -> None:
 def test_cash_event_ref_is_a_fourth_union_member() -> None:
     ref = CashEventRef(cash_event_id=5)
     assert ref == CashEventRef(cash_event_id=5)
-    assert ref != DividendRef(dividend_id=5)
+    # Typed through the union so the inequality is a real runtime check
+    # rather than one mypy can prove non-overlapping statically.
+    other: FXEventSource = DividendRef(dividend_id=5)
+    assert ref != other
     sources: list[FXEventSource] = [ref]
     assert type(sources[0]).__name__ == "CashEventRef"
     with pytest.raises(ValueError, match="positive row id"):

@@ -26,6 +26,7 @@ from ib_cgt.domain import (
 def _es_mar() -> FutureInstrument:
     """ES expiring 2025-03-21."""
     return FutureInstrument(
+        conid=120172476,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -36,6 +37,7 @@ def _es_mar() -> FutureInstrument:
 def _es_jun() -> FutureInstrument:
     """ES expiring 2025-06-20."""
     return FutureInstrument(
+        conid=208418403,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -46,6 +48,7 @@ def _es_jun() -> FutureInstrument:
 def _nq_dec() -> FutureInstrument:
     """NQ expiring 2025-12-19."""
     return FutureInstrument(
+        conid=13113679,
         symbol="NQ",
         currency="USD",
         contract_multiplier=Decimal("20"),
@@ -61,7 +64,7 @@ def test_returns_empty_when_no_futures_exist(db: sqlite3.Connection) -> None:
 def test_returns_only_futures_when_other_classes_present(db: sqlite3.Connection) -> None:
     """Stocks, bonds, and FX rows must not appear in the result."""
     repo = InstrumentRepo(db)
-    repo.upsert(StockInstrument(symbol="AAPL", currency="USD"))
+    repo.upsert(StockInstrument(conid=66468935, symbol="AAPL", currency="USD"))
     repo.upsert(
         BondInstrument(
             isin="GB00BMTH8938",

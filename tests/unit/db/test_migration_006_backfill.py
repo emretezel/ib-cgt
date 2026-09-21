@@ -28,7 +28,7 @@ import pytest
 from ib_cgt.db import AccountRepo, StatementRepo, apply_migrations, open_memory_connection
 from ib_cgt.db.migrator import _apply_one, _ensure_bookkeeping_table
 from ib_cgt.domain import Account
-from tests.unit.db.legacy_schema import insert_legacy_statement
+from tests.unit.db.legacy_schema import insert_legacy_statement, insert_legacy_stock
 
 
 def _seed_account_and_statement(
@@ -57,10 +57,13 @@ def _seed_instrument(conn: sqlite3.Connection) -> int:
     The child table's PK doubles as an FK back to the parent, which
     enforces the one-to-one relationship.
     """
-    cur = conn.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
+    cur = conn.execute("INSERT INTO instruments (asset_class) VALUES ('stock')")
     instrument_id = int(cur.lastrowid or 0)
+    # Post-021 stocks are keyed by conid (this helper only runs against
+    # the fully migrated schema; the backfill test seeds its own rows).
     conn.execute(
-        "INSERT INTO stock_instruments (instrument_id, symbol, currency) VALUES (?, 'AAPL', 'USD')",
+        "INSERT INTO stock_instruments (instrument_id, conid, symbol, currency) "
+        "VALUES (?, 265598, 'AAPL', 'USD')",
         (instrument_id,),
     )
     return instrument_id
@@ -154,7 +157,8 @@ def test_backfill_assigns_dense_zero_based_indices_per_statement() -> None:
         source_path="/tmp/b.html",
         account_id="U1",
     )
-    iid = _seed_instrument(conn)
+    # The 001-005 schema predates `conid`, so seed the legacy shape.
+    iid = insert_legacy_stock(conn, symbol="AAPL", currency="USD")
 
     # Pre-006 schema requires distinct business tuples per row, so vary
     # `quantity` to keep the natural-key UNIQUE happy. Insert order

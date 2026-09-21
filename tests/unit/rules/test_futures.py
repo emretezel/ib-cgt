@@ -38,7 +38,7 @@ def _engine_with_open_close_rates() -> FutureRuleEngine:
 def test_wrong_asset_class_raises() -> None:
     """Passing a stock to FutureRuleEngine is a programming error."""
     engine = FutureRuleEngine(StubFXService({}))
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     with pytest.raises(WrongAssetClassError):
         engine.compute(instrument=aapl, trades=[])
 
@@ -528,25 +528,44 @@ def test_fx_dates_close_for_pnl_open_for_open_fee() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mixed-instrument input rejected
+# Identity is the caller's instrument_id, not the contract's fields
 # ---------------------------------------------------------------------------
 
 
-def test_trade_for_other_instrument_raises() -> None:
-    """A trade for a different instrument must be rejected."""
+def test_engine_does_not_key_identity_on_instrument_fields() -> None:
+    """A trade whose contract object differs in symbol is still processed.
+
+    The caller loads trades per `instruments.instrument_id`; the engine
+    never re-derives identity from symbol / expiry / conid, so a
+    renamed contract on the trade side is matched and the engine's own
+    instrument is stamped on the realisation.
+    """
     engine = _engine_with_open_close_rates()
     inst_es = es_future()
-    inst_other = es_future(expiry=date(2025, 6, 20))  # different expiry → distinct instrument
+    renamed = FutureInstrument(
+        conid=inst_es.conid,
+        symbol="ESH5",
+        currency="USD",
+        contract_multiplier=inst_es.contract_multiplier,
+        expiry_date=inst_es.expiry_date,
+    )
     trades = [
         (
             1,
             future_trade(
-                action=TradeAction.OPEN_LONG, on=_OPEN_DATE, qty=1, price=100, instrument=inst_other
+                action=TradeAction.OPEN_LONG, on=_OPEN_DATE, qty=1, price=100, instrument=renamed
+            ),
+        ),
+        (
+            2,
+            future_trade(
+                action=TradeAction.CLOSE_LONG, on=_CLOSE_DATE, qty=1, price=110, instrument=renamed
             ),
         ),
     ]
-    with pytest.raises(ValueError):
-        engine.compute(instrument=inst_es, trades=trades)
+    result = engine.compute(instrument=inst_es, trades=trades)
+    assert len(result.realisations) == 1
+    assert result.realisations[0].instrument == inst_es
 
 
 # ---------------------------------------------------------------------------

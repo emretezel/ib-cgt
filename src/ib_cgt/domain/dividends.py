@@ -10,12 +10,20 @@ holding, there is no per-unit price being negotiated, and the
 translate onto a dividend distribution.
 
 What dividends are, for this project, is a foreign-currency
-cashflow tied to a stock holding. They feed the FX rule engine via
+cashflow. They feed the FX rule engine via
 `rules.fx_cashflow.from_dividend` exactly as non-GBP stock trades
 and futures realisations already do — per HMRC CG78315, "foreign
 currency arising from any source" lands in the same per-currency
 S.104 pool. The CGT / income-tax treatment of the dividend itself
 is out of scope here; this module only models the cash leg.
+
+Because only the cash leg matters, a dividend is **not tied to an
+instrument**. It carries the IB security tag (`symbol`) purely as an
+audit label. This also sidesteps a real-world wrinkle: IB pays some
+ETF distributions in a currency other than the one it prices the
+listing's trades in (IEMI trades in GBP and pays USD), so the
+dividend's `amount` currency is simply the payment currency and
+nothing forces it to agree with any instrument.
 
 Direction is encoded in `kind` (`cash_dividend` and
 `payment_in_lieu` are pool acquisitions; `withholding_tax` is a
@@ -32,7 +40,6 @@ from datetime import date
 from enum import StrEnum
 
 from ib_cgt.domain.money import Money
-from ib_cgt.domain.trading import StockInstrument
 
 
 class InvalidDividendError(ValueError):
@@ -42,8 +49,8 @@ class InvalidDividendError(ValueError):
 class DividendKind(StrEnum):
     """Discriminator for the three dividend-section row variants.
 
-    `cash_dividend`: gross cash distribution received in the
-        instrument's listing currency. Inflow into the FX pool.
+    `cash_dividend`: gross cash distribution received, in the
+        payment currency. Inflow into the FX pool.
     `withholding_tax`: foreign-jurisdiction WHT debited at source
         on a `cash_dividend`. Outflow from the FX pool. Stored as
         a positive amount with `kind=WITHHOLDING_TAX` rather than
@@ -69,18 +76,18 @@ class Dividend:
 
     Attributes:
         account_id: IB account this dividend was paid into.
-        instrument: The stock the dividend was paid on. Bonds /
-            futures / FX pairs do not pay IB-statement dividends
-            in any of the corpora this project has seen, so the
-            field is typed narrowly as `StockInstrument` to make
-            the mapper's job loud-fail-on-mismatch rather than
-            silently accept e.g. a future.
+        symbol: The IB security tag printed on the row (the
+            `<SYMBOL>` of the `<SYMBOL>(<SECID>)` description prefix).
+            An audit label only — it is *not* resolved to an
+            instrument, because the cash leg is all the calculator
+            needs and IB's own tag is the most faithful thing to show.
         kind: One of `DividendKind` (see enum docstring).
         pay_date: The settlement / payment date — when the cash
             hits the foreign-currency balance and therefore the
             date whose FX rate is applied for GBP conversion.
-        amount: Strictly positive `Money` in the instrument's
-            currency. Direction is in `kind`.
+        amount: Strictly positive `Money` in the payment currency,
+            which may differ from the currency the stock trades in.
+            Direction is in `kind`.
         description: The raw IB description string verbatim
             (e.g. ``"AAPL(US0378331005) Cash Dividend USD 0.24
             per Share (Mixed Income)"``). Kept so `show dividend`
@@ -89,7 +96,7 @@ class Dividend:
     """
 
     account_id: str
-    instrument: StockInstrument
+    symbol: str
     kind: DividendKind
     pay_date: date
     amount: Money
@@ -99,22 +106,15 @@ class Dividend:
         """Validate the cross-field invariants the schema can't express."""
         if not self.account_id or not self.account_id.strip():
             raise InvalidDividendError("Dividend.account_id must be non-empty")
+        if not self.symbol or not self.symbol.strip():
+            raise InvalidDividendError("Dividend.symbol must be non-empty")
         if self.amount.amount <= 0:
             raise InvalidDividendError(
                 f"Dividend.amount must be strictly positive (got {self.amount.amount}); "
                 "direction is encoded in `kind`, not the sign of the amount."
             )
-        if self.amount.currency != self.instrument.currency:
-            raise InvalidDividendError(
-                f"Dividend.amount.currency ({self.amount.currency!r}) must match "
-                f"instrument.currency ({self.instrument.currency!r})"
-            )
         if not self.description or not self.description.strip():
             raise InvalidDividendError("Dividend.description must be non-empty")
 
 
-__all__ = [
-    "Dividend",
-    "DividendKind",
-    "InvalidDividendError",
-]
+__all__ = ["Dividend", "DividendKind", "InvalidDividendError"]

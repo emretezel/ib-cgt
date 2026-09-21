@@ -3,31 +3,35 @@
 The parser emits one `RawDividendRow` per row across the
 `tblCombDiv`, `tblWithholding`, and `tblChangeInDividend`
 sections. This module is the business-rules half: classify each
-row by `(section, description)`, extract the underlying stock
-symbol from the description, and produce a `Dividend` domain
-object the FX cashflow projector can consume.
+row by `(section, description)`, extract the IB security tag from
+the description, and produce a `Dividend` domain object the FX
+cashflow projector can consume.
 
 Scope (intentionally narrow, mirrors `corporate_actions.py`):
 
-* Only **stocks** — bonds / futures / FX pairs do not pay
-  IB-statement dividends in the corpora this project handles.
 * `tblCombDiv` rows whose description starts with
-  ``"<SYMBOL>(<ISIN>) Cash Dividend <CCY>"`` produce a
+  ``"<SYMBOL>(<SECID>) Cash Dividend <CCY>"`` produce a
   `Dividend(kind=CASH_DIVIDEND)`.
 * `tblCombDiv` rows whose description starts with
-  ``"<SYMBOL>(<ISIN>) Payment In Lieu Of Dividend"`` produce a
+  ``"<SYMBOL>(<SECID>) Payment In Lieu Of Dividend"`` produce a
   `Dividend(kind=PAYMENT_IN_LIEU)`. Stock-yield-enhancement
   programme rebates appear in this shape.
 * `tblWithholdingTax` rows whose description names a stock
   (``"<SYMBOL>(<SECID>) Cash Dividend … - US Tax"``) produce
   `Dividend(kind=WITHHOLDING_TAX)` with the absolute amount. Rows in
-  that section with no instrument behind them — withholding on
-  broker interest and its cancellation — are left to
-  `ingest/cash_events.py`; the two mappers partition the section
-  through `has_instrument_prefix`.
+  that section with no security tag — withholding on broker interest
+  and its cancellation — are left to `ingest/cash_events.py`; the two
+  mappers partition the section through `has_instrument_prefix`.
 * `tblChangeInDividend` rows are accrual *adjustments*, not
   cashflows — they're filtered out here so the FX pool only sees
   actual money movements.
+
+A dividend is **not resolved to an instrument** (migration 021). Only
+its cash leg feeds the calculator, so the `<SYMBOL>` is carried as an
+audit label and the `<SECID>` — sometimes an ISIN, sometimes IB's own
+conid — is left in the verbatim description. This also means the
+payment currency needs no reconciliation with the currency the stock
+trades in (IB pays some ETF distributions in a different currency).
 
 Anything inside the dividends section that does not match one of
 the recognised description prefixes raises `MappingError` —
@@ -44,7 +48,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Final
 
-from ib_cgt.domain import Dividend, DividendKind, Money, StockInstrument
+from ib_cgt.domain import Dividend, DividendKind, Money
 from ib_cgt.ingest.mapper import MappingError
 from ib_cgt.ingest.parser import ParsedStatement, RawDividendRow
 
@@ -57,23 +61,16 @@ from ib_cgt.ingest.parser import ParsedStatement, RawDividendRow
 # so tickers with spaces or dots survive. The bracketed slot is one
 # of two shapes IB has been observed to emit:
 #   * a 12-character ISIN (`IE00B2NPL135`), the common case for ETFs.
-#   * a 9-character internal security identifier (`102048570`), which
-#     IB sometimes substitutes when the ISIN is unavailable
-#     (observed on a JNKE 23-24 dividend row).
-# We accept anything non-empty alphanumeric to absorb both, then
-# discriminate inside the mapper: 12-character all-alpha-numeric
-# values are stored as `StockInstrument.isin`; the 9-digit shape is
-# discarded (we have no schema field for it and recovery via the
-# symbol is reliable enough for downstream lookups).
+#   * IB's own numeric contract id (`102048570`), which IB sometimes
+#     substitutes when the ISIN is unavailable (observed on JNKE
+#     dividend rows).
+# We accept anything non-empty alphanumeric to absorb both; neither is
+# interpreted, because a dividend is not tied to an instrument.
 _DESCRIPTION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?P<symbol>[A-Z0-9.\- ]+?)"
     r"\((?P<secid>[A-Z0-9]+)\)\s+"
     r"(?P<rest>.*)$"
 )
-# An ISIN is exactly 12 characters of uppercase alphanumerics. We
-# match the regex's `secid` capture against this to decide whether
-# to populate `StockInstrument.isin`.
-_ISIN_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z0-9]{12}$")
 
 # Section labels the parser emits — keep in lockstep with
 # `parser._DIVIDEND_SECTION_DIV_PREFIXES`.
@@ -112,7 +109,7 @@ def map_dividends(parsed: ParsedStatement) -> list[Dividend]:
     Raises:
         MappingError: On any row that cannot be classified (unknown
             description prefix in the dividends section, malformed
-            symbol/ISIN, unparseable amount or date). The error
+            symbol/secid, unparseable amount or date). The error
             carries the offending row's description so investigation
             is easy.
     """
@@ -137,7 +134,7 @@ def _classify(raw: RawDividendRow) -> DividendKind | None:
     """Return the `DividendKind` for `raw`, or `None` to skip.
 
     Withholding rows are WHT when they name a stock (the section
-    header fixes the kind, the prefix fixes the instrument) and are
+    header fixes the kind, the prefix fixes the security tag) and are
     skipped otherwise — they belong to the cash-event mapper.
     Dividend-section rows split into cash dividend vs payment-in-lieu
     by description-prefix membership. Anything else inside the
@@ -190,8 +187,6 @@ def _synthesize_one(
         )
 
     symbol = match.group("symbol").strip()
-    secid = match.group("secid")
-    isin = secid if _ISIN_RE.match(secid) else None
     pay_date = _parse_date(raw.date_text, raw.description)
     amount_native = abs(_parse_decimal(raw.amount_text, raw.description))
     if amount_native == 0:
@@ -204,10 +199,12 @@ def _synthesize_one(
             "expected a non-zero cash movement."
         )
 
-    instrument = StockInstrument(symbol=symbol, currency=raw.currency, isin=isin)
+    # The section header's currency is the payment currency — the
+    # only currency a dividend has. It is not reconciled with the
+    # currency the stock trades in (see module docstring).
     return Dividend(
         account_id=account_id,
-        instrument=instrument,
+        symbol=symbol,
         kind=kind,
         pay_date=pay_date,
         amount=Money.of(amount_native, raw.currency),
@@ -221,7 +218,7 @@ def _synthesize_one(
 
 
 def has_instrument_prefix(description: str) -> bool:
-    """True when `description` opens with IB's `<SYMBOL>(<SECID>)` instrument tag.
+    """True when `description` opens with IB's `<SYMBOL>(<SECID>)` security tag.
 
     Shared with `ingest/cash_events.py` so the two mappers partition
     the Withholding Tax section without duplicating the regex.

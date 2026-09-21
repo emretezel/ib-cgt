@@ -530,7 +530,7 @@ def test_malformed_currency_code_is_rejected() -> None:
 def test_non_fx_trade_raises_wrong_asset_class() -> None:
     """Feeding a stock trade in raises `WrongAssetClassError`."""
     engine = FXRuleEngine(MultiCcyStubFXService({}))
-    stock_inst = StockInstrument(symbol="ISF", currency="GBP")
+    stock_inst = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     trades: list[tuple[int, Trade]] = [
         (
             1,
@@ -761,7 +761,7 @@ def _dividend(
     """Build a `Dividend` for FX-engine integration tests."""
     return Dividend(
         account_id="U1",
-        instrument=StockInstrument(symbol=symbol, currency=currency),
+        symbol=symbol,
         kind=kind,
         pay_date=pay_date,
         amount=Money.of(Decimal(amount), currency),

@@ -438,24 +438,36 @@ def test_acquisitions_only() -> None:
     assert result.final_pool.total_cost_gbp == Money.gbp("1500")
 
 
-def test_mismatched_instrument_raises() -> None:
-    """Inputs referencing different instruments are rejected."""
-    other = StockInstrument(symbol="MSFT", currency="USD")
+def test_instrument_fields_on_inputs_are_not_identity() -> None:
+    """Inputs are grouped by the caller's `instrument_id`; fields are not compared.
+
+    A disposal whose instrument object carries a different display
+    symbol (IB renamed the listing) is matched against the
+    acquisitions it was loaded with, and the engine's instrument is
+    what appears on the output.
+    """
+    inst = aapl()
+    renamed = StockInstrument(conid=inst.conid, symbol="AAPL.OLD", currency="USD")
     engine = MatchingEngine()
-    with pytest.raises(ValueError):
-        engine.match(
-            instrument=aapl(),
-            acquisitions=[acq(trade_id=1, on=date(2024, 1, 1), qty=10, cost_gbp=100)],
-            disposals=[
-                disp(
-                    trade_id=10,
-                    on=date(2024, 6, 1),
-                    qty=10,
-                    proceeds_gbp=200,
-                    instrument=other,
-                )
-            ],
-        )
+    result = engine.match(
+        instrument=inst,
+        acquisitions=[acq(trade_id=1, on=date(2024, 1, 1), qty=10, cost_gbp=100)],
+        disposals=[
+            disp(
+                trade_id=10,
+                on=date(2024, 6, 1),
+                qty=10,
+                proceeds_gbp=200,
+                instrument=renamed,
+            )
+        ],
+    )
+    assert len(result.matched_disposals) == 1
+    assert result.matched_disposals[0].match_rule is MatchRule.SECTION_104
+    # The pool is the engine's; each matched chunk keeps the disposal's
+    # own instrument object (the caller stamped it), which is why the
+    # engine must not compare the two.
+    assert result.final_pool.instrument == inst
 
 
 def test_chronological_disposal_order_in_output() -> None:

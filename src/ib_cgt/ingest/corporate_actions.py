@@ -57,14 +57,16 @@ from typing import Final, Protocol
 from zoneinfo import ZoneInfo
 
 from ib_cgt.config import resolve_exempt_bonds_allowlist
-from ib_cgt.domain import BondInstrument, Money, StockInstrument, Trade, TradeAction
+from ib_cgt.domain import BondInstrument, Money, Trade, TradeAction
+from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.mapper import (
     DEFAULT_STATEMENT_TZ,
     MappingError,
     _canonicalise_gilt_symbol,
     _classify_bond_exempt,
+    build_stock_instrument,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawCorporateActionRow, RawInstrumentInfo
+from ib_cgt.ingest.parser import ParsedStatement, RawCorporateActionRow
 
 
 class FXConverter(Protocol):
@@ -165,6 +167,10 @@ def map_corporate_actions(
         return []
 
     grouped = _group_by_event(relevant)
+    # The merged-away stock must resolve to the same conid-keyed
+    # instrument its BUY trades did, so the synthesiser consults the
+    # statement's instrument table exactly as the trade mapper does.
+    index = InstrumentInfoIndex.from_parsed(parsed)
 
     out: list[Trade] = []
     for (_dt_text, _description), rows in sorted(grouped.items()):
@@ -172,6 +178,7 @@ def map_corporate_actions(
             _synthesize_one(
                 rows,
                 account_id=parsed.account_id,
+                index=index,
                 fx_service=fx_service,
                 assume_timezone=assume_timezone,
             )
@@ -190,6 +197,7 @@ class _MergerMatch:
 
     row: RawCorporateActionRow
     symbol: str
+    isin: str  # the `(<ISIN>)` after the symbol — fallback key into the instrument table
     proceeds_currency: str  # the CCY in `for <CCY> <PRICE> per Share`
 
 
@@ -206,6 +214,7 @@ def _filter_cash_mergers(rows: tuple[RawCorporateActionRow, ...]) -> list[_Merge
             _MergerMatch(
                 row=row,
                 symbol=match.group("symbol").strip(),
+                isin=match.group("isin"),
                 proceeds_currency=match.group("ccy"),
             )
         )
@@ -235,6 +244,7 @@ def _synthesize_one(
     matches: list[_MergerMatch],
     *,
     account_id: str,
+    index: InstrumentInfoIndex,
     fx_service: FXConverter,
     assume_timezone: ZoneInfo,
 ) -> Trade:
@@ -285,9 +295,14 @@ def _synthesize_one(
 
     price_per_share = proceeds_in_listing.amount / quantity
 
-    instrument = StockInstrument(
-        symbol=disposal_match.symbol,
-        currency=listing_currency,
+    # Resolve to the conid-keyed instrument. The description's ISIN is
+    # the fallback for the case where the merger row still prints the
+    # old symbol of a renamed listing.
+    instrument = build_stock_instrument(
+        disposal_match.symbol,
+        listing_currency,
+        index,
+        security_id=disposal_match.isin,
     )
 
     return Trade(
@@ -374,19 +389,11 @@ def map_bond_maturities(
             are real bugs in the source data or the parser; failing
             loudly is better than silently dropping a disposal.
     """
-    # Index the bond instrument-info rows by ISIN so the maturity
-    # synthesiser can recover the canonical Symbol / Description from
-    # the description's `(ISIN)` capture. Symbol-keyed lookup is kept
-    # as a fallback for older statements where the bonds-shaped table
-    # is absent.
-    info_by_isin: dict[str, RawInstrumentInfo] = {
-        info.security_id: info
-        for info in parsed.instruments
-        if info.asset_class == "Bonds" and info.security_id
-    }
-    info_by_symbol: dict[str, RawInstrumentInfo] = {
-        info.symbol: info for info in parsed.instruments if info.asset_class == "Bonds"
-    }
+    # The maturity synthesiser recovers the canonical Symbol /
+    # Description from the instrument table through the description's
+    # `(ISIN)` capture, with a symbol-keyed fallback for older
+    # statements where the bonds-shaped table is absent.
+    index = InstrumentInfoIndex.from_parsed(parsed)
     overrides = resolve_exempt_bonds_allowlist()
 
     out: list[Trade] = []
@@ -400,8 +407,7 @@ def map_bond_maturities(
             _synthesize_bond_maturity(
                 row=row,
                 match=match,
-                info_by_isin=info_by_isin,
-                info_by_symbol=info_by_symbol,
+                index=index,
                 overrides=overrides,
                 account_id=parsed.account_id,
                 assume_timezone=assume_timezone,
@@ -414,8 +420,7 @@ def _synthesize_bond_maturity(
     *,
     row: RawCorporateActionRow,
     match: re.Match[str],
-    info_by_isin: dict[str, RawInstrumentInfo],
-    info_by_symbol: dict[str, RawInstrumentInfo],
+    index: InstrumentInfoIndex,
     overrides: frozenset[str],
     account_id: str,
     assume_timezone: ZoneInfo,
@@ -446,7 +451,7 @@ def _synthesize_bond_maturity(
     # Financial Instrument Information section. ISIN keying is the
     # primary path; the regex-captured raw symbol is a fallback for
     # older statements that lack the bonds-shaped table.
-    info = info_by_isin.get(isin) or info_by_symbol.get(raw_symbol)
+    info = index.by_security_id("Bonds", isin) or index.by_symbol("Bonds", raw_symbol)
     canonical_symbol = (
         _canonicalise_gilt_symbol(info.symbol)
         if info is not None

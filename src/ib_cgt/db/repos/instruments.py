@@ -1,14 +1,25 @@
 """Repository for the parent `instruments` table and its four child tables.
 
-Schema overview (post-migration 003)
+Schema overview (post-migration 021)
 ------------------------------------
 The persistence layer mirrors the domain's discriminated `Instrument`
 hierarchy with class-table inheritance:
 
-* `instruments` — thin parent: id, asset_class discriminator, ISIN.
+* `instruments` — thin parent: surrogate id + asset_class discriminator.
 * `stock_instruments`, `bond_instruments`, `future_instruments`,
   `fx_instruments` — one child per asset class, holding that class's
-  natural-key columns as `NOT NULL` and a per-class `UNIQUE`.
+  natural key as `NOT NULL UNIQUE` plus its display / contract fields.
+
+Natural keys (what `upsert` recognises an instrument by):
+
+* stocks and futures — IB's `conid`, stable across statements even
+  when IB renames the symbol (migration 021);
+* bonds — the ISIN (migration 014);
+* FX pairs — `(symbol, currency, fx_base, fx_quote)`.
+
+Everything else on a child row is an attribute, not identity: `symbol`
+is refreshed from the latest statement on every hit, and the surrogate
+`instrument_id` is the only identity the calculator compares.
 
 Why the split? The pre-003 single-table design had nullable subclass
 columns and a UNIQUE that included them. SQLite treats `NULL` as
@@ -66,33 +77,24 @@ class InstrumentRepo:
         parent INSERT and the child INSERT cannot leave the schema in
         an inconsistent half-written state.
 
-        Bond identity (post-migration 014) is the ISIN. On a hit:
+        On a hit the display attributes are refreshed from the incoming
+        instrument, because a later statement is the more authoritative
+        rendering of the same contract:
 
-        * `is_cgt_exempt` is **promoted, not demoted** — the flag is
-          OR-merged with the existing value so an exempt gilt cannot
-          be silently downgraded by a coupon-ingest path that passes
-          a `False` placeholder.
-        * `symbol` is updated to the new (canonical) value if it has
-          drifted — IB's canonical Description column is more
-          authoritative than older stored display text.
-        * `isin` does not change (it IS the natural key); a new
-          instrument with a non-matching ISIN simply doesn't hit
-          this branch and goes through the INSERT path instead.
+        * stocks — `symbol` and `currency` (IB renamed `JNKEz` to
+          `JNKE`; the trade currency comes from the trades / positions
+          that own it);
+        * futures — `symbol` only; multiplier and expiry are contract
+          facts fixed at insert;
+        * bonds — `symbol`, and `is_cgt_exempt` is **promoted, not
+          demoted** (OR-merged) so an exempt gilt cannot be silently
+          downgraded by a coupon-ingest path that passes a `False`
+          placeholder;
+        * FX pairs — nothing; every column is part of the key.
         """
         existing = self._find_id_by_natural_key(instrument)
         if existing is not None:
-            if isinstance(instrument, BondInstrument):
-                self._conn.execute(
-                    "UPDATE bond_instruments "
-                    "   SET is_cgt_exempt = MAX(is_cgt_exempt, ?), "
-                    "       symbol        = ? "
-                    " WHERE instrument_id = ?",
-                    (
-                        1 if instrument.is_cgt_exempt else 0,
-                        instrument.symbol,
-                        existing,
-                    ),
-                )
+            self._refresh_child(existing, instrument)
             return existing
 
         # The connection is in autocommit mode (`isolation_level=None`),
@@ -103,8 +105,8 @@ class InstrumentRepo:
         # unit of work rather than committed on its own.
         with transaction(self._conn):
             cursor = self._conn.execute(
-                "INSERT INTO instruments (asset_class, isin) VALUES (?, ?)",
-                (instrument.asset_class.value, instrument.isin),
+                "INSERT INTO instruments (asset_class) VALUES (?)",
+                (instrument.asset_class.value,),
             )
             instrument_id = int(cursor.lastrowid or 0)
             self._insert_child(instrument_id, instrument)
@@ -125,15 +127,12 @@ class InstrumentRepo:
                 prevent.
         """
         parent = self._conn.execute(
-            "SELECT asset_class, isin FROM instruments WHERE instrument_id = ?",
+            "SELECT asset_class FROM instruments WHERE instrument_id = ?",
             (instrument_id,),
         ).fetchone()
         if parent is None:
             raise KeyError(instrument_id)
-
-        asset_class = AssetClass(parent["asset_class"])
-        isin = parent["isin"]
-        return self._load_child(instrument_id, asset_class, isin)
+        return self._load_child(instrument_id, AssetClass(parent["asset_class"]))
 
     def find_id(self, instrument: AnyInstrument) -> int | None:
         """Return the stored id for `instrument`, or `None` if not present.
@@ -149,12 +148,15 @@ class InstrumentRepo:
     ) -> list[tuple[int, AnyInstrument]]:
         """Return every stored instrument of `asset_class` with this `(symbol, currency)`.
 
-        A looser lookup than the natural key, for callers that only
-        have the display symbol — the Open Positions mapper resolving a
-        held-over futures contract whose statement lacks an instrument-
-        information row. Futures may legitimately return several rows
-        (one per expiry sharing a root symbol); the caller decides what
-        an ambiguous result means. FX pairs are keyed on the pair symbol.
+        A looser lookup than the natural key, for the one ingest-time
+        caller that has no key to hand: the Open Positions mapper
+        resolving a held-over stock or futures contract whose statement
+        lacks an instrument-information row (and therefore a conid).
+        Several rows may come back — two expiries sharing a root symbol,
+        or a renamed listing whose old and new symbols are both in the
+        table — and the caller decides what an ambiguous result means.
+        This is a display-field lookup and must never be used as
+        identity by the calculator.
         """
         table = {
             AssetClass.STOCK: "stock_instruments",
@@ -179,48 +181,42 @@ class InstrumentRepo:
         Drives the `ib-cgt match stocks` debug command — the same
         shape as `list_futures` but for `StockInstrument`s. The
         result is ordered by `(symbol, currency)` so the rendered
-        output is stable run-to-run, including the ambiguous case
-        of two stocks with the same symbol on different exchanges
-        (which `(symbol, currency)` UNIQUE distinguishes via
-        `stock_instruments`'s natural-key index).
+        output is stable run-to-run.
 
         Args:
             symbol: If supplied, restricts to stocks with that exact
-                symbol. The `(symbol, currency)` UNIQUE on
-                `stock_instruments` allows multiple instruments
-                sharing a symbol if they trade in different
-                currencies, so this filter narrows by symbol but
-                does not necessarily pin a single instrument.
+                symbol. Symbol is display text, not identity: two
+                listings of one issuer in different currencies are two
+                conids that may share a symbol, so this filter narrows
+                but does not necessarily pin a single instrument.
 
         Returns:
             A list of `(instrument_id, StockInstrument)` pairs.
             Empty when no stock rows match the filter.
         """
-        # Join the parent only for the optional ISIN; everything else
-        # we need is on the child table. The ix_stock_instruments_*
-        # indexes cover both the symbol filter and the ORDER BY.
+        # Everything we need lives on the child table. The
+        # `ix_stock_instruments_symbol_currency` index covers both the
+        # symbol filter and the ORDER BY.
         clauses: list[str] = []
         params: list[object] = []
         if symbol is not None:
-            clauses.append("s.symbol = ?")
+            clauses.append("symbol = ?")
             params.append(symbol)
         where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
         sql = (
-            "SELECT s.instrument_id, s.symbol, s.currency, p.isin "
-            "FROM stock_instruments AS s "
-            "JOIN instruments AS p ON p.instrument_id = s.instrument_id"
+            "SELECT instrument_id, conid, symbol, currency FROM stock_instruments"
             + where_sql
-            + " ORDER BY s.symbol, s.currency"
+            + " ORDER BY symbol, currency"
         )
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [
             (
                 int(r["instrument_id"]),
                 StockInstrument(
+                    conid=int(r["conid"]),
                     symbol=r["symbol"],
                     currency=r["currency"],
-                    isin=r["isin"],
                 ),
             )
             for r in rows
@@ -236,9 +232,8 @@ class InstrumentRepo:
         Drives the `ib-cgt bonds list` debug command — the same shape as
         `list_stocks` / `list_futures`. Ordered by `(symbol, currency)` so
         the rendered output is stable run-to-run, including the case of
-        two bonds sharing a symbol across currencies (which the
-        `(symbol, currency)` UNIQUE on `bond_instruments` allows in
-        principle, even if no real corpus has produced one).
+        two bonds sharing a symbol across currencies (which the ISIN key
+        allows in principle, even if no real corpus has produced one).
 
         Args:
             symbol: If supplied, restricts to bonds with that exact
@@ -296,32 +291,28 @@ class InstrumentRepo:
             A list of `(instrument_id, FutureInstrument)` pairs. Empty
             when no future rows match the filter.
         """
-        # Join the parent only for the optional ISIN; everything else
-        # we need lives on the child table. The ix_future_instruments_*
-        # indexes cover both the symbol filter and the ORDER BY.
+        # Everything we need lives on the child table. The
+        # `ix_future_instruments_symbol_currency` index serves the
+        # symbol filter; the ORDER BY sorts a few hundred rows at most.
         clauses: list[str] = []
         params: list[object] = []
         if symbol is not None:
-            clauses.append("f.symbol = ?")
+            clauses.append("symbol = ?")
             params.append(symbol)
         where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
         sql = (
-            "SELECT f.instrument_id, f.symbol, f.currency, "
-            "       f.contract_multiplier, f.expiry_date, p.isin "
-            "FROM future_instruments AS f "
-            "JOIN instruments AS p ON p.instrument_id = f.instrument_id"
-            + where_sql
-            + " ORDER BY f.symbol, f.expiry_date"
+            "SELECT instrument_id, conid, symbol, currency, contract_multiplier, expiry_date "
+            "FROM future_instruments" + where_sql + " ORDER BY symbol, expiry_date"
         )
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [
             (
                 int(r["instrument_id"]),
                 FutureInstrument(
+                    conid=int(r["conid"]),
                     symbol=r["symbol"],
                     currency=r["currency"],
-                    isin=r["isin"],
                     contract_multiplier=text_to_dec(r["contract_multiplier"]),
                     expiry_date=text_to_date(r["expiry_date"]),
                 ),
@@ -336,11 +327,11 @@ class InstrumentRepo:
     def _insert_child(self, instrument_id: int, instrument: AnyInstrument) -> None:
         """Insert the matching child row for an already-inserted parent."""
         match instrument:
-            case StockInstrument(symbol=symbol, currency=currency):
+            case StockInstrument(conid=conid, symbol=symbol, currency=currency):
                 self._conn.execute(
                     "INSERT INTO stock_instruments "
-                    "(instrument_id, symbol, currency) VALUES (?, ?, ?)",
-                    (instrument_id, symbol, currency),
+                    "(instrument_id, conid, symbol, currency) VALUES (?, ?, ?, ?)",
+                    (instrument_id, conid, symbol, currency),
                 )
             case BondInstrument(
                 isin=isin,
@@ -348,13 +339,6 @@ class InstrumentRepo:
                 currency=currency,
                 is_cgt_exempt=is_cgt_exempt,
             ):
-                if isin is None:
-                    raise ValueError(
-                        f"BondInstrument {symbol!r} ({currency}) has no ISIN. "
-                        "Migration 014 made ISIN the bond's natural key; every "
-                        "bond must carry one. Check the ingest mapper / "
-                        "synthesiser that produced this instrument."
-                    )
                 self._conn.execute(
                     "INSERT INTO bond_instruments "
                     "(instrument_id, isin, symbol, currency, is_cgt_exempt) "
@@ -362,6 +346,7 @@ class InstrumentRepo:
                     (instrument_id, isin, symbol, currency, 1 if is_cgt_exempt else 0),
                 )
             case FutureInstrument(
+                conid=conid,
                 symbol=symbol,
                 currency=currency,
                 contract_multiplier=mult,
@@ -369,10 +354,11 @@ class InstrumentRepo:
             ):
                 self._conn.execute(
                     "INSERT INTO future_instruments "
-                    "(instrument_id, symbol, currency, contract_multiplier, expiry_date) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(instrument_id, conid, symbol, currency, contract_multiplier, expiry_date) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         instrument_id,
+                        conid,
                         symbol,
                         currency,
                         dec_to_text(mult),
@@ -389,21 +375,49 @@ class InstrumentRepo:
             case _:  # pragma: no cover — exhaustive via AnyInstrument union
                 assert_never(instrument)
 
+    def _refresh_child(self, instrument_id: int, instrument: AnyInstrument) -> None:
+        """Bring an existing child row's display attributes up to date.
+
+        Called by `upsert` on a natural-key hit. Only non-identity
+        attributes are touched — see the `upsert` docstring for the
+        per-class list and the reasoning.
+        """
+        match instrument:
+            case StockInstrument(symbol=symbol, currency=currency):
+                self._conn.execute(
+                    "UPDATE stock_instruments SET symbol = ?, currency = ? WHERE instrument_id = ?",
+                    (symbol, currency, instrument_id),
+                )
+            case BondInstrument(symbol=symbol, is_cgt_exempt=is_cgt_exempt):
+                self._conn.execute(
+                    "UPDATE bond_instruments "
+                    "   SET is_cgt_exempt = MAX(is_cgt_exempt, ?), "
+                    "       symbol        = ? "
+                    " WHERE instrument_id = ?",
+                    (1 if is_cgt_exempt else 0, symbol, instrument_id),
+                )
+            case FutureInstrument(symbol=symbol):
+                self._conn.execute(
+                    "UPDATE future_instruments SET symbol = ? WHERE instrument_id = ?",
+                    (symbol, instrument_id),
+                )
+            case FXInstrument():
+                # Every column of an FX row is part of its natural key,
+                # so a hit means the row is already exactly right.
+                pass
+            case _:  # pragma: no cover — exhaustive via AnyInstrument union
+                assert_never(instrument)
+
     # ------------------------------------------------------------------
     # Internals — read dispatch
     # ------------------------------------------------------------------
 
-    def _load_child(
-        self,
-        instrument_id: int,
-        asset_class: AssetClass,
-        isin: str | None,
-    ) -> AnyInstrument:
-        """Reconstruct the domain subclass from the parent + matching child."""
+    def _load_child(self, instrument_id: int, asset_class: AssetClass) -> AnyInstrument:
+        """Reconstruct the domain subclass from the matching child row."""
         match asset_class:
             case AssetClass.STOCK:
                 row = self._conn.execute(
-                    "SELECT symbol, currency FROM stock_instruments WHERE instrument_id = ?",
+                    "SELECT conid, symbol, currency FROM stock_instruments WHERE instrument_id = ?",
                     (instrument_id,),
                 ).fetchone()
                 if row is None:
@@ -411,7 +425,11 @@ class InstrumentRepo:
                         f"instrument {instrument_id} marked stock but missing "
                         "from stock_instruments"
                     )
-                return StockInstrument(symbol=row["symbol"], currency=row["currency"], isin=isin)
+                return StockInstrument(
+                    conid=int(row["conid"]),
+                    symbol=row["symbol"],
+                    currency=row["currency"],
+                )
 
             case AssetClass.BOND:
                 row = self._conn.execute(
@@ -423,9 +441,6 @@ class InstrumentRepo:
                     raise RuntimeError(
                         f"instrument {instrument_id} marked bond but missing from bond_instruments"
                     )
-                # Bond identity is `bond_instruments.isin` (post-014).
-                # Parent `instruments.isin` is preserved for cross-class
-                # joins, but the child column is authoritative.
                 return BondInstrument(
                     symbol=row["symbol"],
                     currency=row["currency"],
@@ -435,7 +450,7 @@ class InstrumentRepo:
 
             case AssetClass.FUTURE:
                 row = self._conn.execute(
-                    "SELECT symbol, currency, contract_multiplier, expiry_date "
+                    "SELECT conid, symbol, currency, contract_multiplier, expiry_date "
                     "FROM future_instruments WHERE instrument_id = ?",
                     (instrument_id,),
                 ).fetchone()
@@ -445,9 +460,9 @@ class InstrumentRepo:
                         "from future_instruments"
                     )
                 return FutureInstrument(
+                    conid=int(row["conid"]),
                     symbol=row["symbol"],
                     currency=row["currency"],
-                    isin=isin,
                     contract_multiplier=text_to_dec(row["contract_multiplier"]),
                     expiry_date=text_to_date(row["expiry_date"]),
                 )
@@ -465,7 +480,6 @@ class InstrumentRepo:
                 return FXInstrument(
                     symbol=row["symbol"],
                     currency=row["currency"],
-                    isin=isin,
                     currency_pair=CurrencyPair(base=row["fx_base"], quote=row["fx_quote"]),
                 )
 
@@ -482,32 +496,24 @@ class InstrumentRepo:
         Each branch hits the relevant child's natural-key UNIQUE index,
         which is the same index `INSERT` would conflict on — so a hit
         here predicts a conflict on insert and lets `upsert` skip the
-        write path entirely.
+        write path entirely. Symbol, currency, multiplier and expiry
+        never take part: they are attributes of the row, not its key.
         """
         match instrument:
-            case StockInstrument(symbol=symbol, currency=currency):
+            case StockInstrument(conid=conid):
                 row = self._conn.execute(
-                    "SELECT instrument_id FROM stock_instruments WHERE symbol = ? AND currency = ?",
-                    (symbol, currency),
+                    "SELECT instrument_id FROM stock_instruments WHERE conid = ?",
+                    (conid,),
                 ).fetchone()
             case BondInstrument(isin=isin):
-                # Migration 014 made ISIN the bond's natural key.
-                # An ISIN-less bond cannot match anything — fall
-                # through with row=None so the caller takes the
-                # INSERT path (which will then raise via
-                # `_insert_child` because ISIN is mandatory).
-                if isin is None:
-                    row = None
-                else:
-                    row = self._conn.execute(
-                        "SELECT instrument_id FROM bond_instruments WHERE isin = ?",
-                        (isin,),
-                    ).fetchone()
-            case FutureInstrument(symbol=symbol, currency=currency, expiry_date=expiry):
                 row = self._conn.execute(
-                    "SELECT instrument_id FROM future_instruments "
-                    "WHERE symbol = ? AND currency = ? AND expiry_date = ?",
-                    (symbol, currency, date_to_text(expiry)),
+                    "SELECT instrument_id FROM bond_instruments WHERE isin = ?",
+                    (isin,),
+                ).fetchone()
+            case FutureInstrument(conid=conid):
+                row = self._conn.execute(
+                    "SELECT instrument_id FROM future_instruments WHERE conid = ?",
+                    (conid,),
                 ).fetchone()
             case FXInstrument(symbol=symbol, currency=currency, currency_pair=pair):
                 row = self._conn.execute(

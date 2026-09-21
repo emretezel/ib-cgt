@@ -19,6 +19,15 @@ arising from any source"). The CGT / income-tax treatment of the
 dividend itself is out of scope; only the cash inflow/outflow is
 modelled here.
 
+Because only the cash leg matters, a dividend is **not linked to an
+instrument** (migration `021`), exactly like a cash event. The IB
+security tag (`SYMBOL` from the `SYMBOL(SECID)` description prefix)
+is kept as plain `symbol` text for audit labels. This also removes a
+modelling trap: IB pays some ETF distributions in a currency other
+than the one it prices the listing's trades in (IEMI trades in GBP
+and pays USD), and under the old `(symbol, currency)` stock key each
+such dividend created a phantom instrument with no trades.
+
 A separate table from `trades` rather than synthesised `Trade` rows
 because dividends are a structurally different event: the holding
 survives, no quantity of shares is transacted, and there is no
@@ -35,11 +44,11 @@ do not.
 |---|---|---|---|
 | `dividend_id` | `INTEGER` | No (PK) | Surrogate id; auto-issued by `INTEGER PRIMARY KEY`. |
 | `account_id` | `TEXT` | No (FK) | Owning IB account. |
-| `instrument_id` | `INTEGER` | No (FK) | The stock the dividend was paid on. |
+| `symbol` | `TEXT` | No | The IB security tag printed on the row (`AAPL` from `AAPL(US0378331005) Cash Dividend …`). An audit label, not a reference: nothing joins it to `stock_instruments`. CHECK-constrained non-empty. |
 | `kind` | `TEXT` | No | One of `cash_dividend`, `withholding_tax`, `payment_in_lieu` (CHECK-constrained). |
 | `pay_date` | `TEXT` | No | `YYYY-MM-DD` payment date — when the cash hits the foreign-currency balance. The FX rate at this date is what the projector applies for GBP conversion. |
 | `amount_native` | `TEXT` | No | Decimal string, **strictly positive**. Direction of cash movement is encoded in `kind`, never via a sign on the amount (mirrors the `Trade.quantity > 0` / sign-on-`action` convention). |
-| `currency` | `TEXT` | No | ISO-4217 currency of `amount_native`. |
+| `currency` | `TEXT` | No | ISO-4217 currency of `amount_native` — the payment currency, which may differ from the currency the stock trades in. |
 | `description` | `TEXT` | No | Raw IB description string verbatim (e.g. `"AAPL(US0378331005) Cash Dividend USD 0.24 per Share (Mixed Income)"`). The forensic anchor that lets a future `show dividend <id>` audit command reconcile a stored row to its source HTML row. |
 | `statement_row_index` | `INTEGER` | No | Zero-based offset within the dividend section of the source statement; assigned at ingest from `enumerate(map_dividends(...))`. Independent of the `trades.statement_row_index` space — each table owns its own row-index counter. |
 | `source_statement_hash` | `TEXT` | No (FK) | Provenance — the statement this row was parsed from. |
@@ -54,8 +63,9 @@ and date encoding conventions.
 ## Foreign keys
 
 - `account_id` → [`accounts.account_id`](./accounts.md) — default `RESTRICT`.
-- `instrument_id` → [`instruments.instrument_id`](./instruments.md) — default `RESTRICT`.
 - `source_statement_hash` → [`statements.statement_hash`](./statements.md) — `ON DELETE CASCADE`.
+
+No `instrument_id` (since migration `021`): see the purpose section.
 
 The cascade is what makes `ib-cgt ingest --replace` and
 `ib-cgt db reset` clean: deleting a `statements` row also removes
@@ -79,12 +89,12 @@ every dividend that pointed at it.
   reclassified as return-of-capital) requires a migration that
   expands the CHECK list.
 - `statement_row_index >= 0` — sanity guard.
+- `length(symbol) > 0` — the security tag is never blank.
 
 ## Indexes
 
 | Name | Columns | Query pattern |
 |---|---|---|
-| `ix_dividends_instrument_pay` | `(instrument_id, pay_date)` | Hot path for any future per-instrument dividend audit command (mirrors `ix_trades_instrument_dt`). |
 | `ix_dividends_pay_currency` | `(currency, pay_date)` | Drives `DividendRepo.for_currency` — the bulk filter the FX cashflow projector uses to pull every USD / EUR / etc. dividend in chronological order. |
 | `ix_dividends_statement` | `(source_statement_hash)` | Lets `ingest --replace` find rows to cascade-delete by statement hash without scanning the table. |
 
@@ -119,13 +129,58 @@ every dividend that pointed at it.
 
 ## Sample (first 5 rows)
 
-```
-SELECT dividend_id, account_id, instrument_id, kind, pay_date,
-       amount_native, currency, description, statement_row_index
-FROM dividends
-LIMIT 5;
-```
+Captured after migration `021` with
+`SELECT dividend_id, account_id, symbol, kind, pay_date, amount_native, currency, description, statement_row_index FROM dividends LIMIT 5;`
+from the live DB, rendered as `column = value` blocks.
 
-(empty on a fresh DB; populated after the first ingest of a
-statement carrying a `tblCombDiv_<acct>Body` or
-`tblWithholdingTax_<acct>Body` section.)
+```
+        dividend_id = 1
+         account_id = U1004320
+             symbol = RGR
+               kind = cash_dividend
+           pay_date = 2017-11-30
+      amount_native = 33.60
+           currency = USD
+        description = RGR(US8641591081) Cash Dividend 0.21000000 USD per Share (Ordinary Dividend)
+statement_row_index = 0
+
+        dividend_id = 2
+         account_id = U1004320
+             symbol = MOV
+               kind = cash_dividend
+           pay_date = 2017-12-15
+      amount_native = 39.00
+           currency = USD
+        description = MOV(US6245801062) Cash Dividend 0.13000000 USD per Share (Ordinary Dividend)
+statement_row_index = 1
+
+        dividend_id = 3
+         account_id = U1004320
+             symbol = BIG
+               kind = cash_dividend
+           pay_date = 2017-12-29
+      amount_native = 37.51
+           currency = USD
+        description = BIG(US0893021032) Cash Dividend 0.25000000 USD per Share (Ordinary Dividend)
+statement_row_index = 2
+
+        dividend_id = 4
+         account_id = U1004320
+             symbol = BBBY
+               kind = cash_dividend
+           pay_date = 2018-01-16
+      amount_native = 30.00
+           currency = USD
+        description = BBBY(US0758961009) Cash Dividend 0.15000000 USD per Share (Ordinary Dividend)
+statement_row_index = 3
+
+        dividend_id = 5
+         account_id = U1004320
+             symbol = BKE
+               kind = cash_dividend
+           pay_date = 2018-01-26
+      amount_native = 100.00
+           currency = USD
+        description = BKE(US1184401065) Cash Dividend 0.25000000 USD per Share (Ordinary Dividend)
+statement_row_index = 4
+```

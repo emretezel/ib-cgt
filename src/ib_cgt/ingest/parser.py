@@ -127,7 +127,13 @@ class RawInstrumentInfo:
       Maturity | Code`. Populates `security_id` (the bond's ISIN)
       and `maturity_text`.
 
-    The two new fields default to `None` so the bonds path is opt-
+    Both shapes (and the stocks-shaped table, which mirrors the bonds
+    one without `Issuer` / `Maturity`) carry `Conid`, IB's contract id.
+    It is kept as raw text here — `conid_text` — because the parser's
+    contract is "don't interpret"; the mapper turns it into the `int`
+    that keys `stock_instruments` / `future_instruments`.
+
+    The optional fields default to `None` so each table shape is opt-
     in: a stocks-only or futures-only statement parses unchanged.
     """
 
@@ -140,6 +146,7 @@ class RawInstrumentInfo:
     security_id: str | None = None
     maturity_text: str | None = None
     issuer_text: str | None = None
+    conid_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -336,6 +343,9 @@ _TRADE_COLUMN_ALIASES: Final[dict[str, str]] = {
 _INSTRUMENT_COLUMN_ALIASES: Final[dict[str, str]] = {
     "Symbol": "symbol",
     "Description": "description",
+    # IB's contract id — printed on every table shape and the natural
+    # key of stocks and futures (migration 021).
+    "Conid": "conid",
     "Multiplier": "multiplier",
     "Expiry": "expiry",
     "Listing Exch": "listing_exch",
@@ -784,6 +794,7 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
         security_id = _optional_cell(cells, column_map, "security_id")
         maturity_text = _optional_cell(cells, column_map, "maturity")
         issuer_text = _optional_cell(cells, column_map, "issuer")
+        conid_text = _optional_cell(cells, column_map, "conid")
 
         rows.append(
             RawInstrumentInfo(
@@ -796,6 +807,7 @@ def _parse_one_instruments_table(table: Tag) -> list[RawInstrumentInfo]:
                 security_id=security_id,
                 maturity_text=maturity_text,
                 issuer_text=issuer_text,
+                conid_text=conid_text,
             )
         )
 

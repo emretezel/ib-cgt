@@ -30,11 +30,13 @@ def _conn() -> sqlite3.Connection:
 
 
 def _instrument(conn: sqlite3.Connection, symbol: str = "AAPL") -> int:
-    cur = conn.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
+    cur = conn.execute("INSERT INTO instruments (asset_class) VALUES ('stock')")
     iid = int(cur.lastrowid or 0)
+    # Post-021 stocks are keyed by conid; derive a unique one from the id.
     conn.execute(
-        "INSERT INTO stock_instruments (instrument_id, symbol, currency) VALUES (?, ?, 'USD')",
-        (iid, symbol),
+        "INSERT INTO stock_instruments (instrument_id, conid, symbol, currency) "
+        "VALUES (?, ?, ?, 'USD')",
+        (iid, 100_000 + iid, symbol),
     )
     return iid
 

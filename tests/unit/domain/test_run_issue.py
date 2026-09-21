@@ -12,7 +12,7 @@ from ib_cgt.domain import (
     StockInstrument,
 )
 
-AAPL = StockInstrument(symbol="AAPL", currency="USD")
+AAPL = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def test_every_kind_has_the_planned_severity() -> None:

@@ -112,7 +112,7 @@ def test_stock_in_gbp_returns_none() -> None:
     """A GBP-listed stock has no FX impact — projector returns None."""
     fx = _StubFx({})
     pool = make_pool_instrument("USD")
-    inst = StockInstrument(symbol="ISF", currency="GBP")
+    inst = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
     trade = stock_trade(
         action=TradeAction.BUY, on=date(2024, 5, 1), qty=10, price=100, instrument=inst
     )
@@ -177,6 +177,7 @@ def test_future_fee_in_gbp_returns_none() -> None:
     fx = _StubFx({})
     pool = make_pool_instrument("USD")
     gbp_future = FutureInstrument(
+        conid=83890152,
         symbol="FTSE",
         currency="GBP",
         contract_multiplier=Decimal("10"),
@@ -288,6 +289,7 @@ def test_realisation_in_gbp_returns_none() -> None:
     fx = _StubFx({})
     pool = make_pool_instrument("USD")
     gbp_future = FutureInstrument(
+        conid=83890152,
         symbol="FTSE",
         currency="GBP",
         contract_multiplier=Decimal("10"),

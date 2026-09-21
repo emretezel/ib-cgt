@@ -24,6 +24,7 @@ from ib_cgt.domain import (
     Trade,
     TradeAction,
 )
+from tests.conid import fake_conid
 
 # ---------------------------------------------------------------------------
 # Default instruments
@@ -32,7 +33,7 @@ from ib_cgt.domain import (
 
 def aapl() -> StockInstrument:
     """Plain stock for matching-engine tests."""
-    return StockInstrument(symbol="AAPL", currency="USD")
+    return StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def es_future(
@@ -43,6 +44,7 @@ def es_future(
 ) -> FutureInstrument:
     """E-mini S&P futures contract — the workhorse for futures tests."""
     return FutureInstrument(
+        conid=fake_conid("ES", currency, expiry),
         symbol="ES",
         currency=currency,
         contract_multiplier=multiplier,

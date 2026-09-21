@@ -64,7 +64,7 @@ def _seed(conn: sqlite3.Connection) -> None:
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
     )
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     TradeRepo(conn).insert_many(
         [
             Trade(

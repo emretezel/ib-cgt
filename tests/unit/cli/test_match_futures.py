@@ -59,6 +59,7 @@ def runner() -> CliRunner:
 def _es_dec25() -> FutureInstrument:
     """ES Dec-2025 future (USD-denominated)."""
     return FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -69,6 +70,7 @@ def _es_dec25() -> FutureInstrument:
 def _nq_dec25() -> FutureInstrument:
     """NQ Dec-2025 future (USD-denominated)."""
     return FutureInstrument(
+        conid=13113679,
         symbol="NQ",
         currency="USD",
         contract_multiplier=Decimal("20"),
@@ -79,6 +81,7 @@ def _nq_dec25() -> FutureInstrument:
 def _cl_jun25() -> FutureInstrument:
     """CL Jun-2025 future (USD-denominated)."""
     return FutureInstrument(
+        conid=100697936,
         symbol="CL",
         currency="USD",
         contract_multiplier=Decimal("1000"),
@@ -389,6 +392,7 @@ def test_match_futures_collects_errors_in_trailing_block(
     monkeypatch.setenv("COLUMNS", "260")
 
     eur_future = FutureInstrument(
+        conid=130541099,
         symbol="FDAX",
         currency="EUR",
         contract_multiplier=Decimal("25"),

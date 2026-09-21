@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from ib_cgt.db import AccountRepo, StatementRepo, TradeRepo
 from ib_cgt.domain import Account, Money, StockInstrument, Trade, TradeAction
+from tests.conid import fake_conid
 
 _UK = ZoneInfo("Europe/London")
 
@@ -23,7 +24,7 @@ def _trade(
     dt = datetime(2024, 5, day, 9, 30, tzinfo=_UK)
     return Trade(
         account_id=account,
-        instrument=StockInstrument(symbol=symbol, currency="USD"),
+        instrument=StockInstrument(conid=fake_conid(symbol, "USD"), symbol=symbol, currency="USD"),
         action=TradeAction.BUY,
         trade_datetime=dt,
         trade_date=dt.date(),

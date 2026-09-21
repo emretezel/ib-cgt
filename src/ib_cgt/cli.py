@@ -918,8 +918,15 @@ def _render_match_futures_errors(runs: Sequence[FutureEngineRun]) -> None:
 
 
 def _instrument_divider(instrument: FutureInstrument) -> str:
-    """Stable label used in section dividers and error rows."""
-    return f"{instrument.symbol} {instrument.expiry_date.isoformat()} ({instrument.currency})"
+    """Stable label used in section dividers and error rows.
+
+    The conid is appended because the symbol is display text IB may
+    rename between statements; the contract id is what stays constant.
+    """
+    return (
+        f"{instrument.symbol} {instrument.expiry_date.isoformat()} ({instrument.currency}) "
+        f"conid={instrument.conid}"
+    )
 
 
 def _realisation_to_cells(realisation: FutureRealisation) -> tuple[str, ...]:
@@ -1319,8 +1326,13 @@ def _render_match_stocks_errors(runs: Sequence[StockEngineRun]) -> None:
 
 
 def _stock_divider(instrument: StockInstrument) -> str:
-    """Stable label used in section dividers and error rows."""
-    return f"{instrument.symbol} ({instrument.currency})"
+    """Stable label used in section dividers and error rows.
+
+    The conid is appended because the symbol is display text IB may
+    rename between statements (`JNKEz` → `JNKE`); the contract id is
+    what stays constant.
+    """
+    return f"{instrument.symbol} ({instrument.currency}) conid={instrument.conid}"
 
 
 def _matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -> tuple[str, ...]:
@@ -1532,7 +1544,7 @@ def _build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
             f"open={realisation.open_trade_id} close={realisation.close_trade_id}"
         )
     for synth_id, dividend in inputs.dividends:
-        out[synth_id] = f"dividend {dividend.instrument.symbol} {dividend.kind.value}"
+        out[synth_id] = f"dividend {dividend.symbol} {dividend.kind.value}"
     for synth_id, coupon in inputs.bond_coupons:
         out[synth_id] = f"bond coupon {coupon.instrument.symbol}"
     for synth_id, event in inputs.cash_events:
@@ -2050,7 +2062,7 @@ def _render_match_bonds_exempt(runs: Sequence[BondEngineRun]) -> None:
         table.add_row(
             instrument.symbol,
             instrument.currency,
-            instrument.isin or "[dim]—[/]",
+            instrument.isin,
             str(exempt.exempt_buy_count),
             str(exempt.exempt_sell_count),
             _format_money_2dp(exempt.total_buy_native),
@@ -2375,6 +2387,7 @@ def _render_show_trade_extras(
     # the same arithmetic the relevant rule engine uses, so the
     # dossier reads the exact figures `match *` would feed forward.
     if isinstance(instrument, StockInstrument):
+        table.add_row("Conid", str(instrument.conid))
         if trade.action is TradeAction.BUY:
             native_total = trade.price.amount * trade.quantity + trade.fees.amount
             label = "Native cost (price*qty + fees)"
@@ -2404,6 +2417,7 @@ def _render_show_trade_extras(
     elif isinstance(instrument, FutureInstrument):
         table.add_row(
             "Contract",
+            f"conid={instrument.conid}  "
             f"multiplier={instrument.contract_multiplier}  "
             f"expiry={instrument.expiry_date.isoformat()}",
         )
@@ -3220,7 +3234,7 @@ def _render_bonds(rows: list[tuple[int, BondInstrument]], db_path: Path) -> None
             str(instrument_id),
             bond.symbol,
             bond.currency,
-            bond.isin or "[dim]—[/]",
+            bond.isin,
             flag_text,
         )
 

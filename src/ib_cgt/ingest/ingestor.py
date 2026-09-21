@@ -71,13 +71,12 @@ class IngestResult:
             so the CLI can surface them; matching treats them
             identically to ordinary sells.
         skipped_maturity_count: Maturity rows the synthesiser produced
-            that were dropped because no existing bond instrument
-            matches the `(symbol, currency)` IB used in the maturity
-            description. The trade-side may have ingested the same
-            underlying gilt under a yield-suffixed alias; ISIN-based
-            instrument unification is a future enhancement, and until
-            it lands these rows are surfaced as a warning rather than
-            polluting `bond_instruments`.
+            that were dropped because no bond with the ISIN the
+            maturity description names has ever been bought — neither
+            in the database nor earlier in this statement. A
+            redemption with no purchase behind it would create an
+            orphan `bond_instruments` row that no BUY covers, so these
+            rows are surfaced as a warning instead.
         inserted_count: How many of those were new rows. On a repeat
             ingest of a modified statement this can be less than
             `trade_count` if some trades were already present from a
@@ -208,18 +207,13 @@ def ingest_statement(
     # `statement_row_index` enumeration in `TradeRepo.insert_many`
     # produces stable identities across re-ingests.
     #
-    # IB's Bond Maturity description carries the bond's *canonical*
-    # symbol (e.g. ``"UKT 0 1/4 01/31/25"``), while the trades section
-    # may have ingested the same underlying gilt under one or more
-    # *yield-suffixed* aliases (``"UKT 0 1/4 01/31/25 5.26994388%"``).
-    # Until ISIN-based instrument unification lands, allowing the
-    # synthesised SELL through would create an orphan
-    # `bond_instruments` row that no `BUY` ever covers, polluting the
-    # debug views and surfacing as an `UnmatchedDisposalError` in
-    # `match bonds`. The filter below drops any maturity whose
-    # `(symbol, currency)` doesn't already match an existing bond
-    # instrument; the user is told which were skipped so they can
-    # follow up.
+    # A maturity row names its bond by ISIN — the bond's identity — so
+    # a redemption of a bond this corpus has never bought is a data
+    # gap, not a disposal: letting the synthesised SELL through would
+    # create an orphan `bond_instruments` row that no `BUY` covers and
+    # surface as an `UnmatchedDisposalError` in `match bonds`. The
+    # filter below drops any maturity whose ISIN has no BUY behind it;
+    # the user is told which were skipped so they can follow up.
     candidate_maturities = map_bond_maturities(parsed)
     maturity_trades, skipped_maturity_trades = _filter_maturities_with_known_instruments(
         candidate_maturities,
@@ -354,14 +348,16 @@ def _resolve_leftover_positions(
 ) -> tuple[list[StatementPosition], list[RawOpenPositionRow]]:
     """Resolve position rows the statement's own instrument table could not.
 
-    A futures contract held over a year end appears in the Open
-    Positions section of a legacy statement that lacks an instrument-
-    information row for it, because it was not traded in that period.
-    The contract was traded — and so stored — in an earlier statement,
-    so a `(symbol, currency)` lookup against `future_instruments`
-    finds it. Exactly one hit resolves the row; none or several (the
-    same root symbol on two expiries) leave it unresolved, and the
-    caller reports the symbol rather than guessing.
+    A contract held over a year end can appear in the Open Positions
+    section of a legacy statement that lacks an instrument-information
+    row for it (and therefore a conid), because it was not traded in
+    that period. It was traded — and so stored — in an earlier
+    statement, so a `(symbol, currency)` lookup against the child
+    table finds it. Exactly one hit resolves the row; none or several
+    (the same root symbol on two expiries, or a renamed listing stored
+    under its old symbol) leave it unresolved, and the caller reports
+    the symbol rather than guessing. This is the one place ingestion
+    falls back to display fields; the calculator never does.
     """
     resolved: list[StatementPosition] = []
     unresolved: list[RawOpenPositionRow] = []
@@ -405,28 +401,24 @@ def _filter_maturities_with_known_instruments(
 ) -> tuple[list[Trade], list[Trade]]:
     """Split synthesised bond-maturity trades into kept vs skipped.
 
-    A maturity is kept only when the `(symbol, currency)` it claims to
-    redeem already has at least one BUY trade in the DB — i.e. an open
-    holding the redemption could plausibly be settling. Without this
-    guard, a maturity row whose IB-rendered symbol differs from the
-    trade-side aliases (the user's gilts are stored under yield-
-    suffixed symbols like `"UKT 0 1/4 01/31/25 5.26994388%"` while the
-    maturity row uses the canonical `"UKT 0 1/4 01/31/25"`) would
-    silently create a new orphan `bond_instruments` row that no BUY
-    ever covers — polluting `match bonds` and surfacing as an
-    `UnmatchedDisposalError`. Skipped maturities are returned so the
-    CLI can warn the user; ISIN-level instrument unification is the
-    proper long-term reconciliation path.
+    A maturity is kept only when the bond it redeems — identified by
+    ISIN, the bond's natural key — already has at least one BUY trade
+    in the DB or earlier in this statement, i.e. an open holding the
+    redemption could plausibly be settling. A redemption with no
+    purchase behind it is a data gap (a bond bought before the
+    ingested history starts); letting it through would create an
+    orphan `bond_instruments` row that no BUY ever covers, polluting
+    `match bonds` and surfacing as an `UnmatchedDisposalError`.
+    Skipped maturities are returned so the CLI can warn the user.
 
     Args:
         candidates: Trades produced by `map_bond_maturities`.
         conn: Open SQLite connection — read-only for this lookup.
         in_flight: Trades already mapped this run that haven't yet been
-            persisted (regular trades + merger synth). Their
-            `(symbol, currency)` BUY pairs count as covered for the
-            purpose of the filter, otherwise a fresh statement that
-            buys *and* matures the same bond in one ingest would have
-            its maturity dropped.
+            persisted (regular trades + merger synth). Their bond BUY
+            ISINs count as covered for the purpose of the filter,
+            otherwise a fresh statement that buys *and* matures the
+            same bond in one ingest would have its maturity dropped.
 
     Returns:
         `(kept, skipped)`. The two lists partition `candidates`. Order
@@ -435,36 +427,32 @@ def _filter_maturities_with_known_instruments(
     if not candidates:
         return [], []
 
-    keys: set[tuple[str, str]] = {
-        (t.instrument.symbol, t.instrument.currency)
-        for t in candidates
-        if isinstance(t.instrument, BondInstrument)
+    isins: set[str] = {
+        t.instrument.isin for t in candidates if isinstance(t.instrument, BondInstrument)
     }
-    if not keys:
+    if not isins:
         return [], list(candidates)
 
-    placeholders = ",".join(["(?, ?)"] * len(keys))
-    flat: list[str] = [val for pair in keys for val in pair]
+    placeholders = ",".join(["?"] * len(isins))
     sql = (
-        "SELECT DISTINCT b.symbol, b.currency "
+        "SELECT DISTINCT b.isin "
         "FROM bond_instruments AS b "
         "JOIN trades AS t ON t.instrument_id = b.instrument_id "
         "WHERE t.action = 'buy' "
-        f"AND (b.symbol, b.currency) IN (VALUES {placeholders})"
+        f"AND b.isin IN ({placeholders})"
     )
-    rows = conn.execute(sql, flat).fetchall()
-    known: set[tuple[str, str]] = {(r["symbol"], r["currency"]) for r in rows}
+    rows = conn.execute(sql, sorted(isins)).fetchall()
+    known: set[str] = {str(r["isin"]) for r in rows}
 
     # Add this-statement BUYs that haven't been persisted yet.
     for trade in in_flight:
         if isinstance(trade.instrument, BondInstrument) and trade.action.value == "buy":
-            known.add((trade.instrument.symbol, trade.instrument.currency))
+            known.add(trade.instrument.isin)
 
     kept: list[Trade] = []
     skipped: list[Trade] = []
     for trade in candidates:
-        key = (trade.instrument.symbol, trade.instrument.currency)
-        if key in known:
+        if isinstance(trade.instrument, BondInstrument) and trade.instrument.isin in known:
             kept.append(trade)
         else:
             skipped.append(trade)

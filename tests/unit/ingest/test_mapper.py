@@ -36,6 +36,20 @@ def _stock_row(quantity_text: str = "30", symbol: str = "CNKY") -> RawTradeRow:
     )
 
 
+def _stock_info(symbol: str = "CNKY", conid: str | None = "123456789") -> RawInstrumentInfo:
+    """Stocks-shaped Financial Instrument Information row — the conid source."""
+    return RawInstrumentInfo(
+        asset_class="Stocks",
+        symbol=symbol,
+        description=f"{symbol} PLC",
+        multiplier_text="1",
+        expiry_text=None,
+        listing_exch="LSE",
+        security_id="GB00B0000001",
+        conid_text=conid,
+    )
+
+
 def _make(
     trades: list[RawTradeRow], instruments: list[RawInstrumentInfo] | None = None
 ) -> ParsedStatement:
@@ -56,20 +70,54 @@ def _make(
 
 
 def test_stock_buy_and_sell() -> None:
-    parsed = _make([_stock_row("30"), _stock_row("-10")])
+    parsed = _make([_stock_row("30"), _stock_row("-10")], [_stock_info()])
     trades = map_rows(parsed)
     assert len(trades) == 2
     assert trades[0].action is TradeAction.BUY
     assert trades[0].quantity == Decimal("30")
     assert isinstance(trades[0].instrument, StockInstrument)
     assert trades[0].instrument.currency == "GBP"
+    # The conid comes from the instrument-information row, parsed to int.
+    assert trades[0].instrument.conid == 123456789
     assert trades[1].action is TradeAction.SELL
     assert trades[1].quantity == Decimal("10")
 
 
+def test_stock_without_instrument_info_row_raises() -> None:
+    """Stocks are keyed by conid, so a stock with no FII row is a loud failure."""
+    parsed = _make([_stock_row()])
+    with pytest.raises(MappingError, match="need Conid"):
+        map_rows(parsed)
+
+
+def test_stock_instrument_info_row_without_conid_raises() -> None:
+    """An FII row whose Conid cell is blank cannot key a stock."""
+    parsed = _make([_stock_row()], [_stock_info(conid=None)])
+    with pytest.raises(MappingError, match="no Conid"):
+        map_rows(parsed)
+
+
+def test_garbled_conid_raises() -> None:
+    """A non-numeric Conid cell is a parse failure, not a silent zero."""
+    parsed = _make([_stock_row()], [_stock_info(conid="12-34")])
+    with pytest.raises(MappingError, match="Unparseable Conid"):
+        map_rows(parsed)
+
+
+def test_stock_symbol_comes_from_the_instrument_table() -> None:
+    """The FII `Symbol` cell is the canonical rendering used for display.
+
+    Within one statement the trade-row symbol and the FII symbol are
+    the same string, so this is a no-op in practice; it pins down
+    which side wins if they ever differ.
+    """
+    parsed = _make([_stock_row()], [_stock_info()])
+    assert map_rows(parsed)[0].instrument.symbol == "CNKY"
+
+
 def test_stock_fees_normalised_positive() -> None:
     """IB prints Comm/Fee as a debit (negative); domain requires fees >= 0."""
-    parsed = _make([_stock_row()])
+    parsed = _make([_stock_row()], [_stock_info()])
     trade = map_rows(parsed)[0]
     assert trade.fees.amount == Decimal("1.00")
     assert trade.fees.currency == "GBP"
@@ -86,7 +134,7 @@ def test_stock_thousands_commas_parsed() -> None:
         fees_text="0",
         code="O",
     )
-    trade = map_rows(_make([row]))[0]
+    trade = map_rows(_make([row], [_stock_info("BRK.A")]))[0]
     assert trade.quantity == Decimal("1000")
     assert trade.price.amount == Decimal("1234.56")
 
@@ -232,7 +280,7 @@ def test_bond_price_rescaled_to_cash_per_unit(ib_price: str, expected_per_unit: 
 
 def test_stock_price_not_rescaled() -> None:
     """Only bond prices are rescaled — stocks (and other classes) are unchanged."""
-    parsed = _make([_stock_row()])
+    parsed = _make([_stock_row()], [_stock_info()])
     trade = map_rows(parsed)[0]
     # `_stock_row` carries `price_text="204.82"`; /100 would give 2.0482.
     assert trade.price.amount == Decimal("204.82")
@@ -256,7 +304,7 @@ def _futures_row(quantity_text: str, code: str, symbol: str = "6LF5") -> RawTrad
     )
 
 
-def _6lf5_info() -> RawInstrumentInfo:
+def _6lf5_info(conid: str | None = "397721297") -> RawInstrumentInfo:
     return RawInstrumentInfo(
         asset_class="Futures",
         symbol="6LF5",
@@ -264,6 +312,7 @@ def _6lf5_info() -> RawInstrumentInfo:
         multiplier_text="100,000",
         expiry_text="2024-12-31",
         listing_exch="CME",
+        conid_text=conid,
     )
 
 
@@ -287,6 +336,7 @@ def test_futures_actions(qty: str, code: str, expected: TradeAction) -> None:
     assert isinstance(trade.instrument, FutureInstrument)
     assert trade.instrument.contract_multiplier == Decimal("100000")
     assert trade.instrument.expiry_date == date(2024, 12, 31)
+    assert trade.instrument.conid == 397721297
     # Quantity is always positive; sign lives in the action.
     assert trade.quantity == abs(Decimal(qty))
 
@@ -294,6 +344,13 @@ def test_futures_actions(qty: str, code: str, expected: TradeAction) -> None:
 def test_futures_missing_instrument_info_raises() -> None:
     parsed = _make([_futures_row("1", "O")], instruments=[])
     with pytest.raises(MappingError, match="Financial Instrument Information"):
+        map_rows(parsed)
+
+
+def test_futures_instrument_info_without_conid_raises() -> None:
+    """A futures FII row with no Conid cannot key the contract."""
+    parsed = _make([_futures_row("1", "O")], [_6lf5_info(conid=None)])
+    with pytest.raises(MappingError, match="no Conid"):
         map_rows(parsed)
 
 
@@ -518,7 +575,7 @@ def test_default_tz_is_europe_london() -> None:
         fees_text="0",
         code="O",
     )
-    trade = map_rows(_make([row]))[0]
+    trade = map_rows(_make([row], [_stock_info()]))[0]
     assert trade.trade_datetime.tzinfo is DEFAULT_STATEMENT_TZ
     assert trade.trade_datetime.astimezone(UTC) == datetime(2024, 4, 5, 20, 41, 2, tzinfo=UTC)
     assert trade.trade_date == date(2024, 4, 5)
@@ -536,7 +593,7 @@ def test_custom_tz_applied() -> None:
         code="O",
     )
     ny = ZoneInfo("America/New_York")
-    trade = map_rows(_make([row]), assume_timezone=ny)[0]
+    trade = map_rows(_make([row], [_stock_info("AAPL")]), assume_timezone=ny)[0]
     assert trade.trade_datetime.tzinfo is ny
     # 23:45 NY on 2024-05-01 is 2024-05-02 04:45 London — the UK-local
     # projection rolls to the next day.

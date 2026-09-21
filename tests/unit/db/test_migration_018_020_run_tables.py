@@ -19,10 +19,10 @@ from ib_cgt.domain import Money, TaxYear
 def _conn() -> tuple[sqlite3.Connection, int]:
     conn = open_memory_connection()
     apply_migrations(conn)
-    conn.execute("INSERT INTO instruments (asset_class, isin) VALUES ('future', NULL)")
+    conn.execute("INSERT INTO instruments (asset_class) VALUES ('future')")
     conn.execute(
-        "INSERT INTO future_instruments (instrument_id, symbol, currency, contract_multiplier, "
-        "expiry_date) VALUES (1, 'ES', 'USD', '50', '2025-12-19')"
+        "INSERT INTO future_instruments (instrument_id, conid, symbol, currency, "
+        "contract_multiplier, expiry_date) VALUES (1, 495512563, 'ES', 'USD', '50', '2025-12-19')"
     )
     run_id = TaxRunRepo(conn).create(TaxYear(2024), Money.gbp("0"))
     return conn, run_id

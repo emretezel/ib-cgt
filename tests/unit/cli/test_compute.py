@@ -91,6 +91,7 @@ def test_engine_error_exits_one_but_still_persists(runner: CliRunner, populated_
     conn = open_connection(populated_db)
     try:
         nq = FutureInstrument(
+            conid=13113679,
             symbol="NQ",
             currency="USD",
             contract_multiplier=Decimal("20"),

@@ -37,11 +37,14 @@ def test_dividends_indexes_exist(db: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='dividends'"
     ).fetchall()
     names = {r["name"] for r in rows}
+    # `ix_dividends_instrument_pay` went with the `instrument_id` column
+    # in migration 021; the two remaining indexes still serve the FX
+    # projector's currency scan and the statement cascade.
     assert {
-        "ix_dividends_instrument_pay",
         "ix_dividends_pay_currency",
         "ix_dividends_statement",
     }.issubset(names)
+    assert "ix_dividends_instrument_pay" not in names
 
 
 def test_kind_check_rejects_unknown_label(db: sqlite3.Connection) -> None:
@@ -55,20 +58,13 @@ def test_kind_check_rejects_unknown_label(db: sqlite3.Connection) -> None:
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
     )
-    # Insert a stock instrument so the FK passes.
-    db.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
-    instrument_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
-    db.execute(
-        "INSERT INTO stock_instruments (instrument_id, symbol, currency) VALUES (?, ?, ?)",
-        (instrument_id, "FOO", "USD"),
-    )
     with pytest.raises(sqlite3.IntegrityError):
         db.execute(
-            "INSERT INTO dividends (account_id, instrument_id, kind, pay_date, "
+            "INSERT INTO dividends (account_id, symbol, kind, pay_date, "
             "amount_native, currency, description, statement_row_index, "
             "source_statement_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("U1", instrument_id, "interest", "2024-05-01", "10", "USD", "x", 0, "hash-x"),
+            ("U1", "FOO", "interest", "2024-05-01", "10", "USD", "x", 0, "hash-x"),
         )
 
 
@@ -83,18 +79,12 @@ def test_cascade_delete_on_statement_clears_dividends(db: sqlite3.Connection) ->
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
     )
-    db.execute("INSERT INTO instruments (asset_class, isin) VALUES ('stock', NULL)")
-    instrument_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
     db.execute(
-        "INSERT INTO stock_instruments (instrument_id, symbol, currency) VALUES (?, ?, ?)",
-        (instrument_id, "BAR", "USD"),
-    )
-    db.execute(
-        "INSERT INTO dividends (account_id, instrument_id, kind, pay_date, "
+        "INSERT INTO dividends (account_id, symbol, kind, pay_date, "
         "amount_native, currency, description, statement_row_index, "
         "source_statement_hash) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("U1", instrument_id, "cash_dividend", "2024-05-01", "10", "USD", "x", 0, "hash-y"),
+        ("U1", "BAR", "cash_dividend", "2024-05-01", "10", "USD", "x", 0, "hash-y"),
     )
     assert db.execute("SELECT COUNT(*) AS n FROM dividends").fetchone()["n"] == 1
 

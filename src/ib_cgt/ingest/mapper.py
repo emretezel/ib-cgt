@@ -6,8 +6,11 @@ domain shapes the rest of the library consumes.
 
 Asset-class handling, one function per class:
 
-* **Stocks**   — `StockInstrument`; `BUY` if signed qty > 0 else `SELL`.
-* **Bonds**    — `BondInstrument`; `BUY` if signed qty > 0 else `SELL`.
+* **Stocks**   — `StockInstrument` keyed by IB's `conid`, looked up in
+                 the statement's Financial Instrument Information
+                 section by symbol; `BUY` if signed qty > 0 else `SELL`.
+* **Bonds**    — `BondInstrument` keyed by ISIN; `BUY` if signed qty > 0
+                 else `SELL`.
                  The `is_cgt_exempt` flag is inferred at ingest time by
                  `_classify_bond_exempt`: the description from the
                  statement's Financial Instrument Information section
@@ -20,10 +23,17 @@ Asset-class handling, one function per class:
                  `accrued_interest=None`; the `BondRuleEngine` reads
                  it when present and is forward-compatible with a
                  future parser change that wires the column through.
-* **Futures**  — `FutureInstrument` with `contract_multiplier` and
-                 `expiry_date` looked up from the statement's Financial
-                 Instrument Information section (`RawInstrumentInfo`).
-                 Action comes from `(sign(qty), code)`.
+* **Futures**  — `FutureInstrument` keyed by IB's `conid`, with
+                 `contract_multiplier` and `expiry_date`, all looked up
+                 from the statement's Financial Instrument Information
+                 section (`RawInstrumentInfo`). Action comes from
+                 `(sign(qty), code)`.
+
+The Financial Instrument Information lookups go through one
+`InstrumentInfoIndex` per statement (built in `map_rows`); the
+`build_*_instrument` helpers are public so the open-positions,
+corporate-actions and bond-coupon mappers resolve a symbol to exactly
+the same instrument identity the trade mapper does.
 * **Forex**    — `FXInstrument`, pair from the `EUR.GBP`-style symbol.
                  Quantity sign gives direction just like stocks.
 
@@ -68,6 +78,7 @@ from ib_cgt.domain import (
     Trade,
     TradeAction,
 )
+from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo, RawTradeRow
 
 # ---------------------------------------------------------------------------
@@ -152,13 +163,10 @@ def map_rows(
             asset class, missing futures metadata, unrecognised code).
             The error carries the row so tests can assert on it.
     """
-    # Pre-index instrument metadata by (asset_class, symbol). Futures are
-    # the only class that needs the lookup today, but indexing keeps the
-    # API uniform and allows future asset classes (e.g. options) to
-    # plug in without re-iterating the list.
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo] = {
-        (info.asset_class, info.symbol): info for info in parsed.instruments
-    }
+    # Index the Financial Instrument Information rows once. Stocks and
+    # futures need it for their conid, bonds for their ISIN — only FX
+    # rows build their instrument from the trade row alone.
+    index = InstrumentInfoIndex.from_parsed(parsed)
 
     # Running per-symbol position for futures — consulted when a row
     # carries a mixed `C;O` code to decide whether it's a pure close
@@ -184,7 +192,7 @@ def map_rows(
             _map_one(
                 raw,
                 account_id=parsed.account_id,
-                info_by_symbol=info_by_symbol,
+                index=index,
                 futures_pos=futures_pos,
                 assume_timezone=assume_timezone,
             )
@@ -201,7 +209,7 @@ def _map_one(
     raw: RawTradeRow,
     *,
     account_id: str,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
     futures_pos: dict[str, Decimal],
     assume_timezone: ZoneInfo,
 ) -> list[Trade]:
@@ -222,13 +230,13 @@ def _map_one(
     instrument: AnyInstrument
     events: list[tuple[TradeAction, Decimal]]
     if raw.asset_class in _STOCK_LABELS:
-        instrument, action = _build_stock(raw, signed_qty)
+        instrument, action = _build_stock(raw, signed_qty, index)
         events = [(action, abs(signed_qty))]
     elif raw.asset_class in _BOND_LABELS:
-        instrument, action = _build_bond(raw, signed_qty, info_by_symbol)
+        instrument, action = _build_bond(raw, signed_qty, index)
         events = [(action, abs(signed_qty))]
     elif raw.asset_class in _FUTURE_LABELS:
-        instrument = _build_future_instrument(raw, info_by_symbol)
+        instrument = build_future_instrument(raw.symbol, raw.currency, index)
         prior_pos = futures_pos.get(raw.symbol, Decimal(0))
         events = _derive_futures_events(signed_qty, raw.code, prior_pos, raw)
         futures_pos[raw.symbol] = prior_pos + signed_qty
@@ -298,17 +306,94 @@ def _map_one(
 # ---------------------------------------------------------------------------
 
 
-def _build_stock(raw: RawTradeRow, signed_qty: Decimal) -> tuple[StockInstrument, TradeAction]:
+def _build_stock(
+    raw: RawTradeRow,
+    signed_qty: Decimal,
+    index: InstrumentInfoIndex,
+) -> tuple[StockInstrument, TradeAction]:
     """Map a Stocks row to (StockInstrument, BUY|SELL)."""
     action = TradeAction.BUY if signed_qty > 0 else TradeAction.SELL
-    instrument = StockInstrument(symbol=raw.symbol, currency=raw.currency)
-    return instrument, action
+    return build_stock_instrument(raw.symbol, raw.currency, index), action
+
+
+def build_stock_instrument(
+    symbol: str,
+    currency: str,
+    index: InstrumentInfoIndex,
+    *,
+    security_id: str | None = None,
+) -> StockInstrument:
+    """Resolve a statement stock symbol to its conid-keyed `StockInstrument`.
+
+    Shared by the trade mapper, the Open Positions mapper and the
+    cash-merger synthesiser so a stock held, traded or merged away
+    resolves to one identity. The conid comes from the statement's
+    Financial Instrument Information section, looked up by symbol
+    first (IB prints a symbol consistently within one statement) and
+    then, when the caller has one, by `security_id` — the ISIN a
+    merger description carries — which survives a symbol rename
+    between the section that named the stock and the instrument
+    table.
+
+    Args:
+        symbol: The symbol as printed in the section being mapped.
+        currency: The currency IB prices the stock's trades in (the
+            section currency of the trade / position row).
+        index: The statement's instrument-information index.
+        security_id: Optional ISIN from the source row's description,
+            used as a fallback lookup.
+
+    Raises:
+        MappingError: No instrument-information row with a conid can
+            be resolved for `symbol`. Every statement vintage prints
+            the Stocks table with a `Conid` column, so this indicates
+            a stock that appears in a trade / position / merger row
+            but nowhere in the instrument table.
+    """
+    info = index.by_symbol("Stocks", symbol)
+    if info is None and security_id is not None:
+        info = index.by_security_id("Stocks", security_id)
+    if info is None:
+        raise MappingError(
+            f"Stock row for symbol {symbol!r} has no matching entry in the "
+            "Financial Instrument Information section (need Conid)."
+        )
+    return StockInstrument(
+        conid=_parse_conid(info.conid_text, symbol),
+        # The instrument table's Symbol column is the canonical current
+        # rendering; the source row's symbol is the same string when the
+        # lookup was by symbol, and the older name when it was by ISIN.
+        symbol=info.symbol,
+        currency=currency,
+    )
+
+
+def _parse_conid(text: str | None, symbol: str) -> int:
+    """Turn the instrument-information `Conid` cell into the domain `int`.
+
+    IB prints the contract id as a plain run of digits. Anything else —
+    a missing cell on a table shape that should carry one, or a garbled
+    value — is a loud failure, because a stock or future with no conid
+    has no identity in this model.
+    """
+    if text is None or not text.strip():
+        raise MappingError(
+            f"Financial Instrument Information row for {symbol!r} has no Conid; "
+            "stocks and futures are keyed by IB's contract id."
+        )
+    cleaned = text.strip()
+    if not cleaned.isdigit():
+        raise MappingError(f"Unparseable Conid {text!r} for {symbol!r}")
+    conid = int(cleaned)
+    if conid <= 0:
+        raise MappingError(f"Conid must be positive, got {text!r} for {symbol!r}")
+    return conid
 
 
 def _build_bond(
     raw: RawTradeRow,
     signed_qty: Decimal,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
 ) -> tuple[BondInstrument, TradeAction]:
     """Map a Bonds row to (BondInstrument, BUY|SELL).
 
@@ -329,13 +414,13 @@ def _build_bond(
     `IB_CGT_BONDS_EXEMPT` and the parser.
     """
     action = TradeAction.BUY if signed_qty > 0 else TradeAction.SELL
-    return build_bond_instrument(raw.symbol, raw.currency, info_by_symbol), action
+    return build_bond_instrument(raw.symbol, raw.currency, index), action
 
 
 def build_bond_instrument(
     symbol: str,
     currency: str,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
 ) -> BondInstrument:
     """Resolve a statement bond symbol to its ISIN-keyed `BondInstrument`.
 
@@ -348,7 +433,7 @@ def build_bond_instrument(
         MappingError: No instrument-info row with a Security ID can
             be resolved for `symbol`.
     """
-    info = resolve_bond_info(symbol, info_by_symbol)
+    info = resolve_bond_info(symbol, index)
     if info is None or not info.security_id:
         raise MappingError(
             f"Bond row for symbol {symbol!r} has no resolvable ISIN. "
@@ -386,7 +471,7 @@ def build_bond_instrument(
 
 def resolve_bond_info(
     symbol: str,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
 ) -> RawInstrumentInfo | None:
     """Look up the Financial Instrument Information row for a bond.
 
@@ -411,23 +496,21 @@ def resolve_bond_info(
     Public (no leading underscore) so the corporate-actions and
     bond-coupons mappers can share it.
     """
-    direct = info_by_symbol.get(("Bonds", symbol))
+    direct = index.by_symbol("Bonds", symbol)
     if direct is not None:
         return direct
 
     canonical = _canonicalise_gilt_symbol(symbol)
     if canonical != symbol:
-        canonical_hit = info_by_symbol.get(("Bonds", canonical))
+        canonical_hit = index.by_symbol("Bonds", canonical)
         if canonical_hit is not None:
             return canonical_hit
 
     # Description-keyed fallback: scan the bond rows for one whose
     # canonicalised Symbol or Description matches the canonical
-    # trade-row symbol. The dict is small (≤ a few dozen rows in
+    # trade-row symbol. The table is small (≤ a few dozen rows in
     # practice), so the linear scan is fine.
-    for (asset_class, _info_symbol), info in info_by_symbol.items():
-        if asset_class != "Bonds":
-            continue
+    for info in index.rows_for("Bonds"):
         if _canonicalise_gilt_symbol(info.symbol) == canonical:
             return info
         if info.description and info.description == canonical:
@@ -509,36 +592,29 @@ def _classify_bond_exempt(
     return currency == "GBP" and symbol.startswith(_UK_GILT_SYMBOL_PREFIX)
 
 
-def _build_future_instrument(
-    raw: RawTradeRow,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
-) -> FutureInstrument:
-    """Resolve multiplier + expiry from the instruments side-table."""
-    return build_future_instrument(raw.symbol, raw.currency, info_by_symbol)
-
-
 def build_future_instrument(
     symbol: str,
     currency: str,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
 ) -> FutureInstrument:
-    """Resolve a statement futures symbol to its `FutureInstrument`.
+    """Resolve a statement futures symbol to its conid-keyed `FutureInstrument`.
 
     Shared by the trade mapper and the Open Positions mapper. The
-    multiplier and expiry come from the Financial Instrument
+    conid, multiplier and expiry come from the Financial Instrument
     Information section — the statement's own instrument table — so
     a contract held and a contract traded resolve to one identity.
 
     Raises:
-        MappingError: No instrument-info row carries both a
+        MappingError: No instrument-info row carries a conid, a
             multiplier and an expiry for `symbol`.
     """
-    info = info_by_symbol.get(("Futures", symbol))
+    info = index.by_symbol("Futures", symbol)
     if info is None or info.multiplier_text is None or info.expiry_text is None:
         raise MappingError(
             f"Futures row for symbol {symbol!r} has no matching entry in the "
-            "Financial Instrument Information section (need Multiplier + Expiry)."
+            "Financial Instrument Information section (need Conid + Multiplier + Expiry)."
         )
+    conid = _parse_conid(info.conid_text, symbol)
 
     # IB prints multipliers with thousand separators (e.g. "100,000"). Strip
     # them before Decimal parsing — the raw value should be a clean number.
@@ -557,6 +633,7 @@ def build_future_instrument(
         ) from exc
 
     return FutureInstrument(
+        conid=conid,
         symbol=symbol,
         currency=currency,
         contract_multiplier=multiplier,
@@ -751,6 +828,7 @@ __all__ = [
     "MappingError",
     "build_bond_instrument",
     "build_future_instrument",
+    "build_stock_instrument",
     "map_rows",
     "resolve_bond_info",
 ]

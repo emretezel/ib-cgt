@@ -9,10 +9,10 @@ import pytest
 
 from ib_cgt.domain.disposal import DirectAcquisition, FutureRealisation, MatchedDisposal
 from ib_cgt.domain.enums import AssetClass, MatchRule
-from ib_cgt.domain.money import Money
+from ib_cgt.domain.money import CurrencyPair, Money
 from ib_cgt.domain.report import AssetClassSummary, TaxYearReport
 from ib_cgt.domain.tax_year import TaxYear
-from ib_cgt.domain.trading import CurrencyPair, FutureInstrument, FXInstrument, StockInstrument
+from ib_cgt.domain.trading import FutureInstrument, FXInstrument, StockInstrument
 
 
 def _stock_summary(net: str, gains: str = "0", losses: str = "0") -> AssetClassSummary:
@@ -30,7 +30,7 @@ def _stock_summary(net: str, gains: str = "0", losses: str = "0") -> AssetClassS
 def _matched_disposal() -> MatchedDisposal:
     return MatchedDisposal(
         disposal_trade_id=2,
-        instrument=StockInstrument(symbol="AAPL", currency="USD"),
+        instrument=StockInstrument(conid=66468935, symbol="AAPL", currency="USD"),
         disposal_date=date(2024, 9, 1),
         match_rule=MatchRule.SAME_DAY,
         matched_quantity=Decimal("5"),
@@ -152,6 +152,7 @@ def test_tax_year_report_empty_summaries_nets_zero() -> None:
 
 def _realisation(*, close: date, pnl: str, fees: str = "2") -> FutureRealisation:
     es = FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
@@ -179,7 +180,7 @@ def _chunk(
     *, on: date, proceeds: str, cost: str, asset: AssetClass = AssetClass.STOCK
 ) -> MatchedDisposal:
     instrument = (
-        StockInstrument(symbol="AAPL", currency="USD")
+        StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
         if asset is AssetClass.STOCK
         else FXInstrument(
             symbol="USD", currency="USD", currency_pair=CurrencyPair(base="USD", quote="GBP")

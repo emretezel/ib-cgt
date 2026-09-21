@@ -44,6 +44,7 @@ from ib_cgt.domain import (
     Trade,
     TradeAction,
 )
+from tests.conid import fake_conid
 
 from .conftest import TEST_BASE_URL
 
@@ -69,7 +70,9 @@ def _seed_instrument(conn: sqlite3.Connection, *, currency: str, symbol: str) ->
     required. A few tests still exercise the trade path, for which
     `_seed_full_trade` is the heavier helper below.
     """
-    InstrumentRepo(conn).upsert(StockInstrument(symbol=symbol, currency=currency))
+    InstrumentRepo(conn).upsert(
+        StockInstrument(conid=fake_conid(symbol, currency), symbol=symbol, currency=currency)
+    )
 
 
 def _seed_full_trade(conn: sqlite3.Connection, *, currency: str, trade_date: date) -> None:
@@ -93,7 +96,11 @@ def _seed_full_trade(conn: sqlite3.Connection, *, currency: str, trade_date: dat
 
     trade = Trade(
         account_id="U0001",
-        instrument=StockInstrument(symbol=f"AAPL{currency}", currency=currency, isin=None),
+        instrument=StockInstrument(
+            conid=fake_conid(f"AAPL{currency}", currency),
+            symbol=f"AAPL{currency}",
+            currency=currency,
+        ),
         action=TradeAction.BUY,
         trade_datetime=datetime.combine(trade_date, datetime.min.time()).replace(tzinfo=UTC),
         trade_date=trade_date,

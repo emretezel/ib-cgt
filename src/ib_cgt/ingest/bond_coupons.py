@@ -5,7 +5,8 @@ The parser emits one `RawCashRow` per row across the
 credit interest accruals — out of scope here. This module is the
 business-rules half: filter to rows whose description matches the
 `"Bond Coupon Payment (<symbol> - <long_description>)"` shape,
-resolve the `(symbol, currency)` to a `BondInstrument`, and produce
+resolve the symbol to its ISIN-keyed `BondInstrument` through the
+statement's Financial Instrument Information section, and produce
 a `BondCoupon` the FX cashflow projector can consume.
 
 Scope (intentionally narrow, mirrors `corporate_actions.py` and
@@ -19,13 +20,14 @@ Scope (intentionally narrow, mirrors `corporate_actions.py` and
   ingestion runs after trade ingestion in the same statement, so
   the bond's instrument row already exists with the gilt
   classifier's verdict applied. We construct a `BondInstrument`
-  with the same `(symbol, currency)` as the trade row, and
-  `is_cgt_exempt=False` is a placeholder — the persistence layer
-  uses `(symbol, currency)` as the natural key, so the existing
-  row's flag wins. (See `InstrumentRepo.upsert` notes.)
-* Bonds that have not been seen in the Trades section yet raise
-  `MappingError` — loud-fail discipline so a coupon for an unknown
-  bond is investigated rather than silently dropped.
+  with the same ISIN as the trade row, and `is_cgt_exempt=False` is
+  a placeholder — the persistence layer keys bonds on ISIN and only
+  ever promotes the flag, so the existing row's verdict wins. (See
+  `InstrumentRepo.upsert` notes.)
+* Coupon rows whose symbol resolves to no instrument-information
+  row with a Security ID raise `MappingError` — loud-fail discipline
+  so a coupon for an unknown bond is investigated rather than
+  silently dropped.
 
 Author: Emre Tezel
 """
@@ -38,12 +40,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Final
 
 from ib_cgt.domain import BondCoupon, BondInstrument, Money
+from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.mapper import (
     MappingError,
     _canonicalise_gilt_symbol,
     resolve_bond_info,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawInstrumentInfo
+from ib_cgt.ingest.parser import ParsedStatement, RawCashRow
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,15 +108,13 @@ def map_bond_coupons(parsed: ParsedStatement) -> list[BondCoupon]:
             broker-interest / accrual rows that this module
             deliberately ignores.
     """
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo] = {
-        ("Bonds", info.symbol): info for info in parsed.instruments if info.asset_class == "Bonds"
-    }
+    index = InstrumentInfoIndex.from_parsed(parsed)
 
     out: list[BondCoupon] = []
     for raw in parsed.cash_rows:
         if raw.section != _SECTION_INTEREST:
             continue
-        coupon = _try_synthesize(raw, parsed.account_id, info_by_symbol)
+        coupon = _try_synthesize(raw, parsed.account_id, index)
         if coupon is not None:
             out.append(coupon)
     return out
@@ -127,7 +128,7 @@ def map_bond_coupons(parsed: ParsedStatement) -> list[BondCoupon]:
 def _try_synthesize(
     raw: RawCashRow,
     account_id: str,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
+    index: InstrumentInfoIndex,
 ) -> BondCoupon | None:
     """Build one `BondCoupon` if `raw` is a coupon row, else `None`.
 
@@ -157,7 +158,7 @@ def _try_synthesize(
     # section. The coupon description carries only the IB symbol and
     # the long-description tail; ISIN is recovered by walking
     # exact-symbol → canonical-symbol → description-keyed fallbacks.
-    info = resolve_bond_info(symbol, info_by_symbol)
+    info = resolve_bond_info(symbol, index)
     if info is None or not info.security_id:
         raise MappingError(
             f"Bond coupon row for symbol {symbol!r} has no resolvable ISIN. "

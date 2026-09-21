@@ -59,12 +59,19 @@ def test_parse_asset_class_and_currency_tags_on_rows() -> None:
 
 def test_parse_extracts_instrument_info() -> None:
     parsed = parse_statement(_load("mixed_tiny.htm"))
-    assert len(parsed.instruments) == 1
-    info = parsed.instruments[0]
-    assert info.symbol == "6LF5"
+    by_symbol = {info.symbol: info for info in parsed.instruments}
+    assert set(by_symbol) == {"6LF5", "CNKY"}
+    info = by_symbol["6LF5"]
+    assert info.asset_class == "Futures"
     assert info.multiplier_text == "100,000"
     assert info.expiry_text == "2024-12-31"
     assert info.listing_exch == "CME"
+    # `Conid` is kept as raw text; the mapper converts it.
+    assert info.conid_text == "397721297"
+    stock = by_symbol["CNKY"]
+    assert stock.asset_class == "Stocks"
+    assert stock.conid_text == "123456789"
+    assert stock.security_id == "GB00B0000001"
 
 
 def test_parse_ignores_column_order() -> None:

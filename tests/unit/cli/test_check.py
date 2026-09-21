@@ -68,8 +68,8 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
             period_start=date(2024, 4, 6),
             period_end=date(2025, 4, 5),
         )
-        isf = StockInstrument(symbol="ISF", currency="GBP")
-        aapl = StockInstrument(symbol="AAPL", currency="USD")
+        isf = StockInstrument(conid=68499944, symbol="ISF", currency="GBP")
+        aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
         TradeRepo(conn).insert_many(
             [
                 Trade(

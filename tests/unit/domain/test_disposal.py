@@ -25,12 +25,13 @@ from ib_cgt.domain.trading import FutureInstrument, StockInstrument
 
 
 def _aapl() -> StockInstrument:
-    return StockInstrument(symbol="AAPL", currency="USD")
+    return StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
 
 
 def _es_future() -> FutureInstrument:
     """Sample futures contract for tests — ES (E-mini S&P) Mar25."""
     return FutureInstrument(
+        conid=120172476,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),

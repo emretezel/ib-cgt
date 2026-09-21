@@ -20,7 +20,6 @@ from ib_cgt.domain import (
     Dividend,
     DividendKind,
     Money,
-    StockInstrument,
 )
 from ib_cgt.rules.fx_cashflow import from_dividend, make_pool_instrument
 
@@ -55,7 +54,7 @@ def _div(
     """Build a `Dividend` from terse keyword args."""
     return Dividend(
         account_id="U1",
-        instrument=StockInstrument(symbol=symbol, currency=currency),
+        symbol=symbol,
         kind=kind,
         pay_date=pay_date,
         amount=Money.of(Decimal(amount), currency),

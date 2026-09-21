@@ -42,6 +42,7 @@ from .conftest import StubFXService
 def _gilt() -> BondInstrument:
     """A typical UK gilt — exempt by ingest classifier."""
     return BondInstrument(
+        isin="XS5472299552",
         symbol="UKT 0 1/8 01/30/26",
         currency="GBP",
         is_cgt_exempt=True,
@@ -51,6 +52,7 @@ def _gilt() -> BondInstrument:
 def _corp_bond_gbp() -> BondInstrument:
     """Hypothetical non-exempt GBP corporate bond."""
     return BondInstrument(
+        isin="XS5398125331",
         symbol="ACME 5 2030",
         currency="GBP",
         is_cgt_exempt=False,
@@ -60,6 +62,7 @@ def _corp_bond_gbp() -> BondInstrument:
 def _corp_bond_usd() -> BondInstrument:
     """Hypothetical non-exempt USD corporate bond — exercises FX path."""
     return BondInstrument(
+        isin="XS7570569767",
         symbol="ACME 5 2030 USD",
         currency="USD",
         is_cgt_exempt=False,
@@ -277,21 +280,30 @@ def test_non_exempt_usd_bond_uses_fx_at_trade_date() -> None:
 def test_wrong_asset_class_raises() -> None:
     """Passing a non-bond instrument raises immediately."""
     engine = BondRuleEngine(StubFXService({}))
-    stock = StockInstrument(symbol="AAPL", currency="USD")
+    stock = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     with pytest.raises(WrongAssetClassError):
         engine.compute(stock, [])
 
 
-def test_mixed_instrument_raises_value_error() -> None:
-    """A trade for a different bond than the engine was asked about fails."""
+def test_engine_does_not_key_identity_on_instrument_fields() -> None:
+    """Identity is the caller's `instrument_id`; the bond's fields are not compared.
+
+    A trade whose bond object differs from the engine's in display
+    symbol is processed as the same instrument, and the engine's own
+    instrument is stamped on the output.
+    """
     engine = BondRuleEngine(StubFXService({}))
     bond_a = _corp_bond_gbp()
-    bond_b = BondInstrument(symbol="OTHER", currency="GBP", is_cgt_exempt=False)
-    trade = _bond_trade(
-        action=TradeAction.BUY, on=date(2024, 5, 1), qty=1, price=100, instrument=bond_b
+    renamed = BondInstrument(
+        isin=bond_a.isin, symbol="ACME 5 2030 (old)", currency="GBP", is_cgt_exempt=False
     )
-    with pytest.raises(ValueError, match="different bond"):
-        engine.compute(bond_a, [(1, trade)])
+    trade = _bond_trade(
+        action=TradeAction.BUY, on=date(2024, 5, 1), qty=1, price=100, instrument=renamed
+    )
+    result = engine.compute(bond_a, [(1, trade)])
+    assert isinstance(result, MatchingResult)
+    assert result.final_pool.quantity == Decimal(1)
+    assert result.final_pool.instrument == bond_a
 
 
 def test_invalid_action_on_non_exempt_bond_raises() -> None:
@@ -327,17 +339,24 @@ def test_invalid_action_on_non_exempt_bond_raises() -> None:
     assert "open_long" in exc_info.value.detail
 
 
-def test_mixed_instrument_on_exempt_bond_also_raises() -> None:
-    """Exempt branch validates instrument identity too — mixing
-    instruments would silently pollute the audit aggregate."""
+def test_exempt_branch_does_not_key_identity_on_instrument_fields() -> None:
+    """The exempt aggregate is built from whatever the caller grouped by id.
+
+    IB renders one gilt under several yield-suffixed symbols; the
+    engine must not treat a display-symbol difference as a different
+    instrument.
+    """
     engine = BondRuleEngine(StubFXService({}))
     gilt_a = _gilt()
-    gilt_b = BondInstrument(symbol="UKT 1 2030", currency="GBP", is_cgt_exempt=True)
-    trade = _bond_trade(
-        action=TradeAction.BUY, on=date(2024, 5, 1), qty=1, price=100, instrument=gilt_b
+    alias = BondInstrument(
+        isin=gilt_a.isin, symbol="UKT 0 1/8 01/30/26 3.52%", currency="GBP", is_cgt_exempt=True
     )
-    with pytest.raises(ValueError, match="different bond"):
-        engine.compute(gilt_a, [(1, trade)])
+    trade = _bond_trade(
+        action=TradeAction.BUY, on=date(2024, 5, 1), qty=1, price=100, instrument=alias
+    )
+    result = engine.compute(gilt_a, [(1, trade)])
+    assert isinstance(result, ExemptBondResult)
+    assert result.exempt_buy_count == 1
 
 
 def test_non_exempt_open_short_is_strict_by_default() -> None:

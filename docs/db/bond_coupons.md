@@ -81,7 +81,7 @@ every coupon that pointed at it.
 
 | Name | Columns | Query pattern |
 |---|---|---|
-| `ix_bond_coupons_instrument_pay` | `(instrument_id, pay_date)` | Hot path for a future per-bond coupon audit command (mirrors `ix_dividends_instrument_pay`). |
+| `ix_bond_coupons_instrument_pay` | `(instrument_id, pay_date)` | Hot path for a future per-bond coupon audit command (mirrors `ix_trades_instrument_dt`). |
 | `ix_bond_coupons_pay_currency` | `(currency, pay_date)` | Drives `BondCouponRepo.for_currency` — the bulk filter the FX cashflow projector uses to pull every USD / EUR / JPY coupon in chronological order. |
 | `ix_bond_coupons_statement` | `(source_statement_hash)` | Lets `ingest --replace` find rows to cascade-delete by statement hash without scanning the table. |
 

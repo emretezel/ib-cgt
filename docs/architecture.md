@@ -82,15 +82,28 @@ where noted.
    so the unit invariant `price * quantity == settlement cash` holds —
    IB quotes bond prices as a percentage of par (`98.602` = 98.602% of
    face value) while every other asset class uses true per-unit prices.
-   **Bond identity is the ISIN** (per migration 014): the mapper
-   resolves every trade-row symbol against the bonds-shaped Financial
-   Instrument Information table's `Security ID` column, canonicalises
-   the display symbol via `_canonicalise_gilt_symbol` (strips
-   yield-percent and IB-code suffixes from gilt symbols so all lots
-   of one gilt collapse to one instrument), and rejects with
-   `MappingError` any bond row that has no resolvable ISIN. The
-   `Issuer` column carries the gilt-classifier signal
-   (`"United Kingdom Gilt …"`); `Description` is the canonical name.
+   **Instrument identity at ingest is the class's natural key, and in
+   the calculator it is `instruments.instrument_id`.** IB renames
+   symbols between statements (`JNKEz` became `JNKE`), so symbol is
+   display text everywhere; the rule engines never compare symbol,
+   ISIN, conid or expiry — they process whatever trades the runner
+   loaded for one `instrument_id`.
+   * **Stocks and futures are keyed by IB's `conid`** (migration 021),
+     read from the `Conid` column that every Financial Instrument
+     Information table carries. The mapper resolves each trade-row
+     symbol to its instrument-information row (through one
+     `InstrumentInfoIndex` per statement) and rejects with
+     `MappingError` any stock or future with no such row.
+   * **Bond identity is the ISIN** (migration 014): the mapper
+     resolves every trade-row symbol against the bonds-shaped table's
+     `Security ID` column, canonicalises the display symbol via
+     `_canonicalise_gilt_symbol` (strips yield-percent and IB-code
+     suffixes from gilt symbols so all lots of one gilt collapse to
+     one instrument), and rejects with `MappingError` any bond row
+     that has no resolvable ISIN. The `Issuer` column carries the
+     gilt-classifier signal (`"United Kingdom Gilt …"`);
+     `Description` is the canonical name.
+   * **FX pairs** get no conid from IB and stay keyed by the pair.
    The parser also walks `tblCorporateActions_*Body` divs;
    `ingest/corporate_actions.py` materialises two CGT-relevant shapes
    into synthesized `SELL` trades that the rule engines treat as
@@ -126,12 +139,16 @@ where noted.
      place every vintage prints the range in a fixed shape;
    * the **Open Positions** section as `statement_positions` — the
      broker's own end-of-period view, resolved to the same
-     instruments the trades use (a held-over futures contract with
-     no instrument-information row is resolved against contracts
-     already in the DB, and reported if that fails);
+     instruments the trades use (a held-over stock or futures
+     contract with no instrument-information row, hence no conid, is
+     resolved by symbol against instruments already in the DB, and
+     reported if that fails);
    * **dividends and withholding tax** under IB's real
      `tblWithholdingTax_` div id (an earlier prefix mismatch silently
-     dropped every withholding row);
+     dropped every withholding row). Dividend rows are
+     instrument-less: only their cash leg feeds the FX pools, the IB
+     security tag is kept as text, and the payment currency is
+     whatever the section says (IEMI trades in GBP but pays USD);
    * the **cash-shaped sections** — Interest (minus the bond coupons
      `bond_coupons` owns), Deposits & Withdrawals (minus transfers
      between the taxpayer's own accounts), Fees, and the

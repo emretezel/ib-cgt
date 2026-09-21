@@ -14,7 +14,7 @@ from datetime import date
 from decimal import Decimal
 
 from ib_cgt.db import AccountRepo, DividendRepo, StatementRepo
-from ib_cgt.domain import Account, Dividend, DividendKind, Money, StockInstrument
+from ib_cgt.domain import Account, Dividend, DividendKind, Money
 
 
 def _seed_statement(db: sqlite3.Connection, statement_hash: str = "hash-1") -> None:
@@ -42,7 +42,7 @@ def _make_div(
     """Build a `Dividend` from terse keyword args."""
     return Dividend(
         account_id="U1",
-        instrument=StockInstrument(symbol=symbol, currency=currency),
+        symbol=symbol,
         kind=kind,
         pay_date=pay_date,
         amount=Money.of(Decimal(amount), currency),
@@ -66,8 +66,8 @@ def test_insert_and_for_currency_round_trip(db: sqlite3.Connection) -> None:
     out = repo.for_currency("USD")
     assert len(out) == 2
     # Ordered by pay_date ASC.
-    assert out[0][1].instrument.symbol == "AAPL"
-    assert out[1][1].instrument.symbol == "MSFT"
+    assert out[0][1].symbol == "AAPL"
+    assert out[1][1].symbol == "MSFT"
 
 
 def test_for_currency_filters_by_currency_and_dates(db: sqlite3.Connection) -> None:
@@ -83,7 +83,7 @@ def test_for_currency_filters_by_currency_and_dates(db: sqlite3.Connection) -> N
         source_statement_hash="hash-1",
     )
     in_range = repo.for_currency("USD", since=date(2024, 1, 1), until=date(2024, 6, 30))
-    assert [d.instrument.symbol for _id, d in in_range] == ["AAPL"]
+    assert [d.symbol for _id, d in in_range] == ["AAPL"]
 
 
 def test_insert_many_idempotent_under_repeated_call(db: sqlite3.Connection) -> None:

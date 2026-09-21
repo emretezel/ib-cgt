@@ -43,7 +43,11 @@ def _aapl_buy(account_id: str = "U1", day: int = 15) -> Trade:
     """Construct a canonical AAPL buy Trade at 14:00 UK time on 2024-07-<day>."""
     return Trade(
         account_id=account_id,
-        instrument=StockInstrument(symbol="AAPL", currency="USD", isin="US0378331005"),
+        instrument=StockInstrument(
+            conid=66468935,
+            symbol="AAPL",
+            currency="USD",
+        ),
         action=TradeAction.BUY,
         trade_datetime=datetime(2024, 7, day, 14, 0, tzinfo=_UK),
         trade_date=date(2024, 7, day),
@@ -196,7 +200,7 @@ def _trade(
 def test_signed_quantity_nets_buys_and_sells(db: sqlite3.Connection) -> None:
     _seed_account_and_statement(db)
     repo = TradeRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     repo.insert_many(
         [
             _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),
@@ -213,12 +217,14 @@ def test_signed_quantity_futures_actions(db: sqlite3.Connection) -> None:
     _seed_account_and_statement(db)
     repo = TradeRepo(db)
     es = FutureInstrument(
+        conid=14826456,
         symbol="ES",
         currency="USD",
         contract_multiplier=Decimal("50"),
         expiry_date=date(2025, 12, 19),
     )
     cl = FutureInstrument(
+        conid=100697936,
         symbol="CL",
         currency="USD",
         contract_multiplier=Decimal("1000"),
@@ -241,7 +247,7 @@ def test_signed_quantity_futures_actions(db: sqlite3.Connection) -> None:
 def test_signed_quantity_omits_flat_instruments(db: sqlite3.Connection) -> None:
     _seed_account_and_statement(db)
     repo = TradeRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     repo.insert_many(
         [
             _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),
@@ -256,7 +262,7 @@ def test_signed_quantity_honours_up_to_and_account(db: sqlite3.Connection) -> No
     _seed_account_and_statement(db)
     _seed_account_and_statement(db, account_id="U2", statement_hash="hash-b")
     repo = TradeRepo(db)
-    aapl = StockInstrument(symbol="AAPL", currency="USD")
+    aapl = StockInstrument(conid=66468935, symbol="AAPL", currency="USD")
     repo.insert_many(
         [
             _trade(aapl, TradeAction.BUY, date(2024, 7, 1), "10"),

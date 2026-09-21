@@ -3,18 +3,18 @@
 The parser emits one `RawOpenPositionRow` per symbol still held on
 the last day of the statement period. This module resolves each row
 to the same instrument identity the trade mapper produces — a stock
-by `(symbol, currency)`, a bond by ISIN through the Financial
-Instrument Information section, a futures contract by its multiplier
-and expiry from that same section — so the trade-derived position and
-the statement position can be compared instrument for instrument.
+or a futures contract by its IB `conid`, a bond by its ISIN, all
+read from the statement's Financial Instrument Information section —
+so the trade-derived position and the statement position can be
+compared instrument for instrument.
 
-Resolution is FII-based and pure. A held-over futures contract on a
-legacy statement (traded in an earlier year, never touched in this
-one) can lack an instrument-information row; such rows are returned
-to the caller as leftovers rather than raised, because the ingestor
-can still resolve them against contracts already in the database.
-Nothing here decides whether a position *should* be there — that is
-the calculator's reconciliation.
+Resolution is FII-based and pure. A held-over position on a legacy
+statement (traded in an earlier year, never touched in this one) can
+lack an instrument-information row; such rows are returned to the
+caller as leftovers rather than raised, because the ingestor can
+still resolve them by symbol against instruments already in the
+database. Nothing here decides whether a position *should* be there —
+that is the calculator's reconciliation.
 
 Author: Emre Tezel
 """
@@ -23,13 +23,15 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
-from ib_cgt.domain import AnyInstrument, StatementPosition, StockInstrument
+from ib_cgt.domain import AnyInstrument, StatementPosition
+from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.mapper import (
     MappingError,
     build_bond_instrument,
     build_future_instrument,
+    build_stock_instrument,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo, RawOpenPositionRow
+from ib_cgt.ingest.parser import ParsedStatement, RawOpenPositionRow
 
 # Section labels, post-normalisation, that the mapper handles. Mirrors
 # the trade mapper's label sets; anything else (options, which the
@@ -51,19 +53,18 @@ def map_open_positions(
     Returns:
         `(positions, leftovers)` — the resolved positions in statement
         order, and the rows whose instrument could not be built from
-        this statement's instrument-information section (bonds with
-        no Security ID, futures with no multiplier / expiry row). The
-        ingestor resolves leftovers against instruments already in the
-        database and reports whatever is still unknown.
+        this statement's instrument-information section (a stock or
+        futures contract with no row, hence no conid; a bond with no
+        Security ID). The ingestor resolves leftovers against
+        instruments already in the database and reports whatever is
+        still unknown.
 
     Raises:
         MappingError: On a row that is malformed rather than merely
             unresolvable — an unparseable quantity, or an asset class
             this mapper does not model.
     """
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo] = {
-        (info.asset_class, info.symbol): info for info in parsed.instruments
-    }
+    index = InstrumentInfoIndex.from_parsed(parsed)
     positions: list[StatementPosition] = []
     leftovers: list[RawOpenPositionRow] = []
     for raw in parsed.open_positions:
@@ -81,7 +82,7 @@ def map_open_positions(
             # matches "a flat instrument has no row".
             continue
         try:
-            instrument = _resolve_instrument(raw, info_by_symbol)
+            instrument = _resolve_instrument(raw, index)
         except MappingError:
             leftovers.append(raw)
             continue
@@ -95,17 +96,14 @@ def map_open_positions(
     return positions, leftovers
 
 
-def _resolve_instrument(
-    raw: RawOpenPositionRow,
-    info_by_symbol: dict[tuple[str, str], RawInstrumentInfo],
-) -> AnyInstrument:
+def _resolve_instrument(raw: RawOpenPositionRow, index: InstrumentInfoIndex) -> AnyInstrument:
     """Build the instrument a position row refers to, from this statement alone."""
     if raw.asset_class in _STOCK_LABELS:
-        return StockInstrument(symbol=raw.symbol, currency=raw.currency)
+        return build_stock_instrument(raw.symbol, raw.currency, index)
     if raw.asset_class in _BOND_LABELS:
-        return build_bond_instrument(raw.symbol, raw.currency, info_by_symbol)
+        return build_bond_instrument(raw.symbol, raw.currency, index)
     # `map_open_positions` has already rejected every other label.
-    return build_future_instrument(raw.symbol, raw.currency, info_by_symbol)
+    return build_future_instrument(raw.symbol, raw.currency, index)
 
 
 def _parse_quantity(raw: RawOpenPositionRow) -> Decimal:

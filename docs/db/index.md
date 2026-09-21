@@ -7,6 +7,8 @@ its rows, and a sample of the first five rows currently stored.
 Use the per-table pages below as the entry point when reasoning about a
 specific table; this index page covers cross-cutting concerns
 (connection, encoding conventions, ER overview) that apply everywhere.
+For a one-page summary of every table's columns, keys, constraints
+and indexes, see [`schema.md`](./schema.md).
 
 ## Storage location
 
@@ -24,7 +26,7 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`20`** (`001_initial.sql` through `020_tax_run_issues.sql`
+`21`** (`001_initial.sql` through `021_instrument_conid_identity.sql`
 all applied — see [`schema_migrations.md`](./schema_migrations.md) for
 the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
@@ -37,15 +39,15 @@ deployed.
 |---|---|---|
 | `schema_migrations` | Bookkeeping for applied migration versions | [`schema_migrations.md`](./schema_migrations.md) |
 | `accounts` | One row per Interactive Brokers account | [`accounts.md`](./accounts.md) |
-| `instruments` | Thin parent: id, asset-class discriminator, ISIN | [`instruments.md`](./instruments.md) |
-| `stock_instruments` | Asset-class child of `instruments` for equity listings | [`stock_instruments.md`](./stock_instruments.md) |
+| `instruments` | Thin parent: id, asset-class discriminator | [`instruments.md`](./instruments.md) |
+| `stock_instruments` | Asset-class child of `instruments` for equity listings (keyed by IB `conid`) | [`stock_instruments.md`](./stock_instruments.md) |
 | `bond_instruments` | Asset-class child of `instruments` for bonds (ISIN-keyed, with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
-| `future_instruments` | Asset-class child of `instruments` for futures (multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
+| `future_instruments` | Asset-class child of `instruments` for futures (keyed by IB `conid`; multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
 | `statements` | One row per imported IB HTML statement (idempotency, covered period) | [`statements.md`](./statements.md) |
 | `statement_positions` | One row per instrument open on a statement's last day (the Open Positions section) | [`statement_positions.md`](./statement_positions.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
-| `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax) | [`dividends.md`](./dividends.md) |
+| `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax); instrument-less, the IB security tag is kept as text | [`dividends.md`](./dividends.md) |
 | `bond_coupons` | One row per bond coupon payment from IB's Interest section | [`bond_coupons.md`](./bond_coupons.md) |
 | `cash_events` | One row per instrument-less cash movement (broker interest, external transfers, fees, interest withholding) | [`cash_events.md`](./cash_events.md) |
 | `fx_rates` | Cached daily Frankfurter FX rates | [`fx_rates.md`](./fx_rates.md) |
@@ -60,9 +62,9 @@ deployed.
 ```
 accounts (account_id) ──┐
                         ├── statements ── trades ──────────── instruments ── {stock,bond,future,fx}_instruments
-                        │             ├─ dividends ──────────┘  ▲
-                        │             ├─ bond_coupons ───────┘  │
+                        │             ├─ bond_coupons ───────┘  ▲
                         │             ├─ statement_positions ─┘  │
+                        │             ├─ dividends                │
                         │             └─ cash_events              │
 tax_runs ──┬─ matched_disposals ────────────────────────────────┤
            ├─ future_realisations ──────────────────────────────┤
@@ -72,12 +74,18 @@ tax_runs ──┬─ matched_disposals ─────────────�
 fx_rates (standalone cache; no FK in or out)
 ```
 
-`instruments` is a thin parent (id + discriminator + ISIN); each row
-has exactly one matching child row in one of `stock_instruments`,
+`instruments` is a thin parent (id + discriminator); each row has
+exactly one matching child row in one of `stock_instruments`,
 `bond_instruments`, `future_instruments`, or `fx_instruments`,
-selected by `instruments.asset_class`. Trade and disposal references
-target the parent so callers don't need to know the discriminator
-when joining.
+selected by `instruments.asset_class`. Each child owns its class's
+natural key — IB's `conid` for stocks and futures, the ISIN for bonds,
+the pair for FX — which is how ingestion recognises the same
+instrument across statements (IB renames symbols; it never changes a
+conid). Trade and disposal references target the parent so callers
+don't need to know the discriminator when joining, and the surrogate
+`instrument_id` is the only identity the calculator compares.
+`dividends` and `cash_events` are deliberately instrument-less: only
+their cash leg feeds the FX pools.
 
 Foreign-key chain in detail:
 
@@ -86,7 +94,6 @@ Foreign-key chain in detail:
 - `trades.instrument_id`               → `instruments.instrument_id`
 - `trades.source_statement_hash`       → `statements.statement_hash` `ON DELETE CASCADE`
 - `dividends.account_id`               → `accounts.account_id`
-- `dividends.instrument_id`            → `instruments.instrument_id`
 - `dividends.source_statement_hash`    → `statements.statement_hash` `ON DELETE CASCADE`
 - `bond_coupons.account_id`            → `accounts.account_id`
 - `bond_coupons.instrument_id`         → `instruments.instrument_id`
@@ -111,7 +118,7 @@ Foreign-key chain in detail:
 
 | View | Purpose |
 |---|---|
-| `v_instruments` | UNION-ALL of the four asset-class children with the parent, projecting the unified pre-003 column shape so external readers do not need to know about the per-class split. Callers that filter by `symbol` or `currency` (CLI's FX-sync `DISTINCT currency`, `TradeRepo.list_filtered`'s symbol join) target this view. |
+| `v_instruments` | UNION-ALL of the four asset-class children with the parent, projecting one flat column shape (`isin` from bonds only, `conid` from stocks and futures only) so external readers do not need to know about the per-class split. Callers that filter by `symbol` or `currency` (CLI's FX-sync `DISTINCT currency`, `TradeRepo.list_filtered`'s symbol join) target this view. |
 
 The view does not duplicate truth — it is a read-time projection only,
 which is the use CLAUDE.md §3 explicitly allows.

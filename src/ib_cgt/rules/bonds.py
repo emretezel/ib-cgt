@@ -167,8 +167,6 @@ class BondRuleEngine:
                 rejects `OPEN_*`/`CLOSE_*` for non-future
                 instruments, but the engine guards in-memory
                 malformed `Trade` objects too.
-            ValueError: A trade in `trades` references a different
-                instrument than `instrument`.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
                 (strict mode only) when a non-exempt bond's disposal
                 still carries residual quantity after all four passes.
@@ -179,17 +177,11 @@ class BondRuleEngine:
                 instrument_class=type(instrument).__name__,
             )
 
-        # Validate every trade up front — same-instrument check applies
-        # to both branches because we want a clear error early in the
-        # exempt path too (silently aggregating mixed-instrument trades
-        # into ExemptBondResult would be a silent data bug).
-        for trade_id, trade in trades:
-            if trade.instrument != instrument:
-                raise ValueError(
-                    f"BondRuleEngine.compute: trade_id={trade_id} belongs to "
-                    f"a different bond than {instrument.symbol}"
-                )
-
+        # Per-instrument engine: `trades` is the history of exactly one
+        # `instruments.instrument_id`, loaded as such by the caller. No
+        # field-based identity check is made here — the ISIN is the
+        # ingest-time key and the symbol is display text; the surrogate
+        # id the caller grouped by is the only identity in this system.
         if instrument.is_cgt_exempt:
             return self._exempt_summary(instrument, trades)
 
