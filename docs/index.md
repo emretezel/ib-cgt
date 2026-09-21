@@ -27,8 +27,19 @@ implementation status.
 ## Setup
 
 ```bash
-conda env update -f environment.yml
+conda env create -f environment.yml   # first time
+conda env update -f environment.yml   # refresh an existing env
 conda activate ib-cgt
+```
+
+`environment.yml` pins the interpreter (Python 3.12) and installs the exact
+package versions recorded in `requirements.lock`, which `uv` compiles from the
+version ranges declared in `pyproject.toml`. After changing dependencies in
+`pyproject.toml`, refresh the lock and then the env:
+
+```bash
+uv pip compile pyproject.toml --extra dev --python-version 3.12 -o requirements.lock
+conda env update -f environment.yml
 ```
 
 ## Development checks

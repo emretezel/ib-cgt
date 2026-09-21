@@ -1,15 +1,34 @@
 # Reproducible setup for the ib-cgt conda env.
+#
 # Usage:
 #   conda env create -f environment.yml      (first time, if env doesn't exist)
-#   conda env update -f environment.yml      (refresh)
-# The env's Python version is pinned; actual Python deps come from
-# `pip install -e ".[dev]"` driven by pyproject.toml (rule 10).
+#   conda env update -f environment.yml      (refresh after the lock changes)
+#
+# Two layers, each with a single source of truth:
+#   - conda (conda-forge only) pins the interpreter and provides `uv`, the
+#     CLI used to maintain the lock file. Nothing else comes from conda.
+#   - pip installs the exact versions in requirements.lock, then the project
+#     itself in editable mode. pyproject.toml declares version *ranges*;
+#     requirements.lock is the resolved snapshot of those ranges.
+#
+# Refresh the lock (from inside the env) after changing deps in pyproject.toml,
+# or to pick up newer releases within the declared ranges:
+#   uv pip compile pyproject.toml --extra dev --python-version 3.12 -o requirements.lock
+#   conda env update -f environment.yml
+#
+# Note: conda >= 25 gates Anaconda's `defaults` channel behind its Terms of
+# Service and checks them for every `defaults` entry in your condarc, even
+# though this env never uses that channel. Either accept the ToS
+# (`conda tos accept ...`) or remove `defaults` from your condarc.
 
 name: ib-cgt
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
-  - python=3.12
+  - python=3.12.14
   - pip
+  - uv
   - pip:
+      - -r requirements.lock
       - -e .[dev]

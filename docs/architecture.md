@@ -22,8 +22,9 @@ page in the same commit.
   cached locally in SQLite.
 - **Persistence**: SQLite — single-user desktop tool; rule 5–7 in `AGENTS.md`
   expects an explicit, indexed SQL design.
-- **Python**: 3.12, `ib-cgt` conda env, `pyproject.toml`-driven build, ruff +
-  mypy (strict) + pytest gates.
+- **Python**: 3.12, `ib-cgt` conda env, `pyproject.toml`-driven build with
+  exact versions locked in `requirements.lock`, ruff + mypy (strict) + pytest
+  gates.
 
 ## UK CGT rules the design honours
 
@@ -260,6 +261,7 @@ Rules:
 ib-cgt/
 ├── pyproject.toml
 ├── environment.yml
+├── requirements.lock
 ├── AGENTS.md  /  CLAUDE.md  (mirror)
 ├── LICENSE
 ├── .gitignore

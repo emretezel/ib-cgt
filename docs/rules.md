@@ -95,7 +95,7 @@ engine = MatchingEngine()
 result = engine.match(
     instrument=instrument,
     acquisitions=[...],  # Sequence[Acquisition], GBP, any order
-    disposals=[...],     # Sequence[Disposal], GBP, any order
+    disposals=[...],  # Sequence[Disposal], GBP, any order
 )
 ```
 
@@ -226,7 +226,7 @@ Pro-rata attribution drains 25 % of every lot:
 from ib_cgt.fx import FXService
 from ib_cgt.rules import StockRuleEngine
 
-engine = StockRuleEngine(fx)            # fx implements FXConverter Protocol
+engine = StockRuleEngine(fx)  # fx implements FXConverter Protocol
 result = engine.compute(instrument, trades)
 ```
 
@@ -313,7 +313,7 @@ basis trade id at the domain level).
 from ib_cgt.fx import FXService
 from ib_cgt.rules import FutureRuleEngine
 
-engine = FutureRuleEngine(fx)            # fx implements FXConverter Protocol
+engine = FutureRuleEngine(fx)  # fx implements FXConverter Protocol
 result = engine.compute(instrument, trades)
 ```
 
@@ -436,17 +436,17 @@ All four live in `ib_cgt.rules`.
 from ib_cgt.fx import FXService
 from ib_cgt.rules import FXRuleEngine
 
-engine = FXRuleEngine(fx)            # fx implements FXConverter Protocol
+engine = FXRuleEngine(fx)  # fx implements FXConverter Protocol
 result = engine.compute(
     "USD",
     forex_trades=forex_trades,
     stock_trades=non_gbp_stock_trades,
     future_trades=non_gbp_future_trades,
     future_realisations=realisations,  # from FutureRuleEngine
-    dividends=non_gbp_dividends,       # from DividendRepo.for_currency
-    bond_coupons=non_gbp_bond_coupons, # from BondCouponRepo.for_currency
-    bond_trades=non_gbp_bond_trades,   # real trade ids, like stocks
-    cash_events=non_gbp_cash_events,   # from CashEventRepo.for_currency
+    dividends=non_gbp_dividends,  # from DividendRepo.for_currency
+    bond_coupons=non_gbp_bond_coupons,  # from BondCouponRepo.for_currency
+    bond_trades=non_gbp_bond_trades,  # real trade ids, like stocks
+    cash_events=non_gbp_cash_events,  # from CashEventRepo.for_currency
 )
 ```
 
