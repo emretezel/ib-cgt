@@ -28,6 +28,21 @@ Asset-class handling, one function per class:
                  from the statement's Financial Instrument Information
                  section (`RawInstrumentInfo`). Action comes from
                  `(sign(qty), code)`.
+* **Options**  — `OptionInstrument` keyed by IB's `conid`, with the
+                 underlying, multiplier, expiry, strike and right from
+                 the options-shaped Financial Instrument Information
+                 table. The trade row's symbol is IB's display form
+                 (`XSP 20DEC14 140.0 P`) while the table's `Symbol`
+                 cell holds OCC codes (`XSP 141220P00140000`, several
+                 when IB renamed the root) and its `Description` the
+                 display form — sometimes under a different root
+                 (`XSPAM 20DEC14 140.0 P`). `resolve_option_info` tries
+                 the exact symbol, the exact description, then the
+                 parsed series key (root, expiry, right, strike)
+                 against every rendering the row offers. Action comes
+                 from `(sign(qty), code)` as for futures, with the
+                 `Ep` / `Ex` / `A` code tokens turning a close into a
+                 lapse, an exercise or an assignment.
 
 The Financial Instrument Information lookups go through one
 `InstrumentInfoIndex` per statement (built in `map_rows`); the
@@ -63,7 +78,8 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -76,6 +92,8 @@ from ib_cgt.domain import (
     FutureInstrument,
     FXInstrument,
     Money,
+    OptionInstrument,
+    OptionRight,
     StockInstrument,
     Trade,
     TradeAction,
@@ -97,18 +115,51 @@ class MappingError(ValueError):
 # ---------------------------------------------------------------------------
 
 # The asset-class label printed in IB's section header → logical key we
-# branch on. Any label outside this set is currently unsupported; the
-# mapper raises rather than silently dropping rows.
-# `"Equity and Index Options"` is *not* listed here: the parser drops
-# rows inside that section before they reach the mapper (see
-# `parser._IGNORED_ASSET_CLASSES`). Excluding the label here is
-# defence-in-depth — if a future parser regression let an option row
-# through, the catch-all `else` below will raise `MappingError`
-# loudly rather than silently treat it as a stock.
+# branch on. Any label outside these sets is unsupported; the mapper
+# raises rather than silently dropping rows.
 _STOCK_LABELS: Final[frozenset[str]] = frozenset({"Stocks"})
 _BOND_LABELS: Final[frozenset[str]] = frozenset({"Bonds", "Corporate and Municipal Bonds"})
 _FUTURE_LABELS: Final[frozenset[str]] = frozenset({"Futures"})
 _FX_LABELS: Final[frozenset[str]] = frozenset({"Forex"})
+# Exchange-traded options. IB prints equity and index options under the
+# first label; options on futures — the same "traded option" under TCGA
+# 1992 s.144(8) — under the second, with the same table shapes.
+OPTION_LABELS: Final[frozenset[str]] = frozenset({"Equity and Index Options", "Options On Futures"})
+
+# The IB display form of an option series: `<root> <DDMMMYY> <strike> <C|P>`
+# (`XAUUSD 21DEC12 1920.0 C`, `XSP 20DEC14 140.0 P`). The root may itself
+# contain spaces, so it is matched lazily up to the date token.
+_OPTION_DISPLAY_RE: Final = re.compile(
+    r"^(?P<root>.+?)\s+(?P<expiry>\d{2}[A-Z]{3}\d{2})\s+(?P<strike>\d+(?:\.\d+)?)\s+(?P<right>[CP])$"
+)
+_OPTION_DISPLAY_EXPIRY_FORMAT: Final = "%d%b%y"
+
+# The OCC form IB prints in the instrument table's `Symbol` cell:
+# `<root> <YYMMDD><C|P><strike x 1000, eight digits>` — `TUR   190517P00022000`.
+_OPTION_OCC_RE: Final = re.compile(
+    r"^(?P<root>\S+)\s+(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$"
+)
+_OPTION_OCC_EXPIRY_FORMAT: Final = "%y%m%d"
+_OPTION_OCC_STRIKE_DIVISOR: Final = Decimal(1000)
+
+# `Type` column values → right. IB prints the single letter; the words
+# are accepted so a hand-built fixture can spell it out.
+_OPTION_RIGHTS: Final[dict[str, OptionRight]] = {
+    "C": OptionRight.CALL,
+    "CALL": OptionRight.CALL,
+    "P": OptionRight.PUT,
+    "PUT": OptionRight.PUT,
+}
+
+# Code tokens that say *how* an option position closed. `Ep` is IB's
+# "Resulted from an Expired Position", `Ex` "Exercise", `A` "Assignment".
+# Every other token (`P` partial fill, `L` liquidation, ...) is ignored.
+_LAPSE_TOKEN: Final = "Ep"
+_EXERCISE_TOKEN: Final = "Ex"
+_ASSIGNMENT_TOKEN: Final = "A"
+_OPTION_QUALIFIERS: Final[frozenset[str]] = frozenset(
+    {_LAPSE_TOKEN, _EXERCISE_TOKEN, _ASSIGNMENT_TOKEN}
+)
 
 # UK gilt classifier signals. The IB Financial Instrument Information
 # section's `Description` column reads `"United Kingdom Gilt UKT …"`
@@ -161,15 +212,16 @@ def map_rows(parsed: ParsedStatement) -> list[Trade]:
     # rows build their instrument from the trade row alone.
     index = InstrumentInfoIndex.from_parsed(parsed)
 
-    # Running per-symbol position for futures — consulted when a row
-    # carries a mixed `C;O` code to decide whether it's a pure close
-    # (O flag spurious) or a genuine reversal that needs splitting into
-    # a close leg + an open leg. The state is statement-local; contracts
-    # that were opened in an earlier year start this walk at 0, which
-    # is correct for the front-month futures that produce these rows in
-    # practice. Keyed on symbol alone because a parsed statement belongs
-    # to a single primary account.
-    futures_pos: dict[str, Decimal] = {}
+    # Running per-symbol position for futures and options — consulted
+    # when a row carries a mixed `C;O` code to decide whether it's a
+    # pure close (O flag spurious) or a genuine reversal that needs
+    # splitting into a close leg + an open leg. The state is
+    # statement-local; contracts that were opened in an earlier year
+    # start this walk at 0, which is correct for the front-month
+    # futures that produce these rows in practice. Keyed on symbol
+    # alone because a parsed statement belongs to a single primary
+    # account and IB prints one symbol per contract within a statement.
+    running_pos: dict[str, Decimal] = {}
 
     # Drop matched `Ep`/`Ca` amendment pairs among Forex rows before
     # mapping. IB posts these triads on physically-settled futures
@@ -186,7 +238,7 @@ def map_rows(parsed: ParsedStatement) -> list[Trade]:
                 raw,
                 account_id=parsed.account_id,
                 index=index,
-                futures_pos=futures_pos,
+                running_pos=running_pos,
                 time_zone=parsed.time_zone,
             )
         )
@@ -203,15 +255,16 @@ def _map_one(
     *,
     account_id: str,
     index: InstrumentInfoIndex,
-    futures_pos: dict[str, Decimal],
+    running_pos: dict[str, Decimal],
     time_zone: ZoneInfo,
 ) -> list[Trade]:
     """Dispatch a single raw row into one or more `Trade` objects.
 
     Almost every row produces exactly one `Trade`. The one exception is a
-    futures row with a mixed `C;O` code that reverses the position through
-    zero — that becomes two trades (a close leg + an open leg of opposite
-    direction). See `_derive_futures_events` for the disambiguation.
+    futures or options row with a mixed `C;O` code that reverses the
+    position through zero — that becomes two trades (a close leg + an
+    open leg of opposite direction). See `_derive_open_close_events` for
+    the disambiguation.
     """
     # Parse the timestamp and the signed quantity once — every asset
     # class needs both, and doing it here keeps the per-class code tidy.
@@ -230,9 +283,14 @@ def _map_one(
         events = [(action, abs(signed_qty))]
     elif raw.asset_class in _FUTURE_LABELS:
         instrument = build_future_instrument(raw.symbol, raw.currency, index)
-        prior_pos = futures_pos.get(raw.symbol, Decimal(0))
-        events = _derive_futures_events(signed_qty, raw.code, prior_pos, raw)
-        futures_pos[raw.symbol] = prior_pos + signed_qty
+        prior_pos = running_pos.get(raw.symbol, Decimal(0))
+        events = _derive_open_close_events(signed_qty, _code_tokens(raw.code), prior_pos, raw)
+        running_pos[raw.symbol] = prior_pos + signed_qty
+    elif raw.asset_class in OPTION_LABELS:
+        instrument = build_option_instrument(raw.symbol, raw.currency, index)
+        prior_pos = running_pos.get(raw.symbol, Decimal(0))
+        events = _derive_option_events(signed_qty, raw.code, prior_pos, raw)
+        running_pos[raw.symbol] = prior_pos + signed_qty
     elif raw.asset_class in _FX_LABELS:
         instrument, action = _build_fx(raw, signed_qty)
         events = [(action, abs(signed_qty))]
@@ -634,6 +692,242 @@ def build_future_instrument(
     )
 
 
+def build_option_instrument(
+    symbol: str,
+    currency: str,
+    index: InstrumentInfoIndex,
+) -> OptionInstrument:
+    """Resolve a statement option symbol to its conid-keyed `OptionInstrument`.
+
+    Shared by the trade mapper and the Open Positions mapper so an
+    option held and an option traded resolve to one identity. The
+    conid, multiplier, expiry, strike, right and underlying come from
+    the options-shaped Financial Instrument Information row found by
+    `resolve_option_info`; the stored display symbol is that row's
+    `Description` (IB's display form under the root the table uses),
+    which is also what the Open Positions section prints.
+
+    The columns are authoritative where present; a fact a row does not
+    print (an older vintage without `Strike`, say) falls back to the
+    series key parsed from the description or the symbol, so a row is
+    only rejected when a fact is printed nowhere.
+
+    Raises:
+        MappingError: No row resolves for `symbol`, or the row lacks a
+            conid, a multiplier, or one of the series facts.
+    """
+    info = resolve_option_info(symbol, index)
+    if info is None:
+        raise MappingError(
+            f"Option row for symbol {symbol!r} has no matching entry in the Financial "
+            "Instrument Information section (tried the symbol, the description and the "
+            "series key)."
+        )
+    conid = _parse_conid(info.conid_text, symbol)
+    if info.multiplier_text is None:
+        raise MappingError(
+            f"Financial Instrument Information row for option {symbol!r} has no Multiplier."
+        )
+    try:
+        multiplier = Decimal(info.multiplier_text.replace(",", ""))
+    except InvalidOperation as exc:
+        raise MappingError(
+            f"Unparseable option multiplier {info.multiplier_text!r} for {symbol!r}"
+        ) from exc
+
+    # The series facts: columns first, the parsed key as the fallback.
+    parsed_key = _series_key_from_display(info.description) or _series_key_from_display(symbol)
+    expiry = _option_expiry(info, symbol, parsed_key)
+    strike = _option_strike(info, symbol, parsed_key)
+    right = _option_right(info, symbol, parsed_key)
+    underlying = info.underlying or (parsed_key.root if parsed_key is not None else None)
+    if not underlying:
+        raise MappingError(
+            f"Financial Instrument Information row for option {symbol!r} names no underlying."
+        )
+
+    return OptionInstrument(
+        conid=conid,
+        # The description is IB's display form under the table's own
+        # root — what the Open Positions section prints too. The trade
+        # row's symbol may use an older root (`XSP` for `XSPAM`).
+        symbol=info.description or symbol,
+        currency=currency,
+        underlying=underlying,
+        contract_multiplier=multiplier,
+        expiry_date=expiry,
+        strike=strike,
+        right=right,
+    )
+
+
+def resolve_option_info(symbol: str, index: InstrumentInfoIndex) -> RawInstrumentInfo | None:
+    """Look up the Financial Instrument Information row for an option series.
+
+    IB prints the same series under several renderings: the trade row
+    carries the display form (`XSP 20DEC14 140.0 P`), the table's
+    `Symbol` cell one or more OCC codes (`XSPAM 141220P00140000, XSP
+    141220P00140000` after a root rename), and its `Description` the
+    display form under the table's own root (`XSPAM 20DEC14 140.0 P`).
+    Three lookups in priority order:
+
+    1. **Exact symbol** — the table's `Symbol` cell equals the trade
+       symbol (the 2019 `TUR` vintage prints the display form there).
+    2. **Exact description** — the 2012 files print the display form
+       as the description.
+    3. **Series key** — the trade symbol parsed to (root, expiry,
+       right, strike) equals a key of the row: from its description,
+       from any OCC code in its `Symbol` cell, or from its
+       `Underlying` / `Expiry` / `Type` / `Strike` columns. This is
+       what resolves `XSP 20DEC14 140.0 P` to the `XSPAM` row.
+
+    Public so the Open Positions mapper shares the resolution.
+
+    Raises:
+        MappingError: Several rows carry the trade symbol's series key
+            — the statement names one series twice and the mapper must
+            not guess.
+    """
+    for label in OPTION_LABELS:
+        direct = index.by_symbol(label, symbol)
+        if direct is not None:
+            return direct
+    rows = [info for label in sorted(OPTION_LABELS) for info in index.rows_for(label)]
+    by_description = [info for info in rows if info.description == symbol]
+    if len(by_description) == 1:
+        return by_description[0]
+
+    key = _series_key_from_display(symbol) or _series_key_from_occ(symbol)
+    if key is None:
+        return None
+    matches = [info for info in rows if key in _series_keys_of(info)]
+    if len(matches) > 1:
+        raise MappingError(
+            f"Option symbol {symbol!r} matches {len(matches)} Financial Instrument "
+            f"Information rows: {[info.symbol for info in matches]}"
+        )
+    return matches[0] if matches else None
+
+
+@dataclass(frozen=True, slots=True)
+class _OptionSeriesKey:
+    """What identifies one option series whatever IB calls it: root, expiry, right, strike.
+
+    `Decimal` equality is numeric, so a `140.0` strike parsed from the
+    display form and a `140` strike from the `Strike` column (or the
+    OCC `00140000`) compare — and hash — equal.
+    """
+
+    root: str
+    expiry: date
+    right: OptionRight
+    strike: Decimal
+
+
+def _series_key_from_display(text: str) -> _OptionSeriesKey | None:
+    """Parse IB's display form (`XSP 20DEC14 140.0 P`), or `None` if `text` is not one."""
+    match = _OPTION_DISPLAY_RE.match(text.strip())
+    if match is None:
+        return None
+    try:
+        expiry = datetime.strptime(match.group("expiry"), _OPTION_DISPLAY_EXPIRY_FORMAT).date()
+    except ValueError:
+        return None
+    return _OptionSeriesKey(
+        root=match.group("root"),
+        expiry=expiry,
+        right=_OPTION_RIGHTS[match.group("right")],
+        strike=Decimal(match.group("strike")),
+    )
+
+
+def _series_key_from_occ(text: str) -> _OptionSeriesKey | None:
+    """Parse an OCC code (`XSPAM 141220P00140000`), or `None` if `text` is not one."""
+    match = _OPTION_OCC_RE.match(text.strip())
+    if match is None:
+        return None
+    try:
+        expiry = datetime.strptime(match.group("expiry"), _OPTION_OCC_EXPIRY_FORMAT).date()
+    except ValueError:
+        return None
+    return _OptionSeriesKey(
+        root=match.group("root"),
+        expiry=expiry,
+        right=_OPTION_RIGHTS[match.group("right")],
+        strike=Decimal(match.group("strike")) / _OPTION_OCC_STRIKE_DIVISOR,
+    )
+
+
+def _series_key_from_columns(info: RawInstrumentInfo) -> _OptionSeriesKey | None:
+    """The key the row's own columns spell out, or `None` when any is missing or malformed."""
+    if not (info.underlying and info.expiry_text and info.type_text and info.strike_text):
+        return None
+    right = _OPTION_RIGHTS.get(info.type_text.strip().upper())
+    if right is None:
+        return None
+    try:
+        expiry = datetime.strptime(info.expiry_text, "%Y-%m-%d").date()
+        strike = Decimal(info.strike_text.replace(",", ""))
+    except (ValueError, InvalidOperation):
+        return None
+    return _OptionSeriesKey(root=info.underlying, expiry=expiry, right=right, strike=strike)
+
+
+def _series_keys_of(info: RawInstrumentInfo) -> set[_OptionSeriesKey]:
+    """Every series key one instrument-information row can be recognised by."""
+    keys: set[_OptionSeriesKey] = set()
+    for text in (info.description, *info.symbol.split(",")):
+        for key in (_series_key_from_display(text), _series_key_from_occ(text)):
+            if key is not None:
+                keys.add(key)
+    from_columns = _series_key_from_columns(info)
+    if from_columns is not None:
+        keys.add(from_columns)
+    return keys
+
+
+def _option_expiry(info: RawInstrumentInfo, symbol: str, key: _OptionSeriesKey | None) -> date:
+    """The series' expiry: the `Expiry` column, else the parsed key."""
+    if info.expiry_text is not None:
+        try:
+            return datetime.strptime(info.expiry_text, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise MappingError(
+                f"Unparseable option expiry {info.expiry_text!r} for {symbol!r}"
+            ) from exc
+    if key is not None:
+        return key.expiry
+    raise MappingError(f"Financial Instrument Information row for option {symbol!r} has no Expiry.")
+
+
+def _option_strike(info: RawInstrumentInfo, symbol: str, key: _OptionSeriesKey | None) -> Decimal:
+    """The series' strike: the `Strike` column, else the parsed key."""
+    if info.strike_text is not None:
+        try:
+            return Decimal(info.strike_text.replace(",", ""))
+        except InvalidOperation as exc:
+            raise MappingError(
+                f"Unparseable option strike {info.strike_text!r} for {symbol!r}"
+            ) from exc
+    if key is not None:
+        return key.strike
+    raise MappingError(f"Financial Instrument Information row for option {symbol!r} has no Strike.")
+
+
+def _option_right(
+    info: RawInstrumentInfo, symbol: str, key: _OptionSeriesKey | None
+) -> OptionRight:
+    """The series' right: the `Type` column (`C` / `P`), else the parsed key."""
+    if info.type_text is not None:
+        right = _OPTION_RIGHTS.get(info.type_text.strip().upper())
+        if right is None:
+            raise MappingError(f"Unknown option type {info.type_text!r} for {symbol!r}")
+        return right
+    if key is not None:
+        return key.right
+    raise MappingError(f"Financial Instrument Information row for option {symbol!r} has no Type.")
+
+
 def _build_fx(raw: RawTradeRow, signed_qty: Decimal) -> tuple[FXInstrument, TradeAction]:
     """Map a Forex row to (FXInstrument, BUY|SELL)."""
     # IB symbol is `BASE.QUOTE`, e.g. "EUR.GBP".
@@ -740,19 +1034,95 @@ def _collapse_ep_ca_pairs(rows: tuple[RawTradeRow, ...]) -> list[RawTradeRow]:
     return [row for row, keep_it in zip(rows, keep, strict=True) if keep_it]
 
 
-def _derive_futures_events(
+def _code_tokens(code: str) -> frozenset[str]:
+    """Split IB's `;`-separated `Code` cell into its flags (`C;Ep` → {`C`, `Ep`}).
+
+    Membership is tested on whole tokens so a flag can never be found
+    inside another (`Ca`, IB's cancel marker, is not a close).
+    """
+    return frozenset(token.strip() for token in code.split(";") if token.strip())
+
+
+def _derive_option_events(
     signed_qty: Decimal,
     code: str,
     prior_pos: Decimal,
     raw: RawTradeRow,
 ) -> list[tuple[TradeAction, Decimal]]:
-    """Return `(action, positive_qty)` events this futures row represents.
+    """Return `(action, positive_qty)` events this option row represents.
 
-    Normally one event. A `C;O` code — which IB prints when an aggregated
-    fill has both a closing and an opening character — produces either
-    one event (when the numeric columns describe a pure close and the `O`
-    flag is spurious accounting noise) or two events (when the row
-    reverses the position through zero).
+    An option row opens and closes exactly as a futures row does (the
+    sign x flag table of `_derive_open_close_events`), and can carry one
+    qualifier token saying *how* the close happened, which turns the
+    close into its own tax event:
+
+    | token | on a long close  | on a short close |
+    |-------|------------------|------------------|
+    | `Ep`  | `LAPSE_LONG`     | `LAPSE_SHORT`    |
+    | `Ex`  | `EXERCISE_LONG`  | error            |
+    | `A`   | error            | `ASSIGN_SHORT`   |
+
+    IB prints the qualifier beside the close flag (`C;Ep`, `C;Ex`); a
+    qualifier on its own is read as a close too, since none of the
+    three can open anything. A qualifier on an open leg, on a reversal
+    row, or on the wrong side of the position is a `MappingError` — the
+    row contradicts itself and guessing would mis-tax it.
+    """
+    tokens = _code_tokens(code)
+    qualifiers = tokens & _OPTION_QUALIFIERS
+    if len(qualifiers) > 1:
+        raise MappingError(
+            f"Option code {code!r} carries more than one of Ep / Ex / A (row: {raw})"
+        )
+    if qualifiers:
+        tokens = tokens | {"C"}
+    events = _derive_open_close_events(signed_qty, tokens, prior_pos, raw)
+    if not qualifiers:
+        return events
+    (qualifier,) = qualifiers
+    if len(events) != 1 or events[0][0] in (TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT):
+        raise MappingError(
+            f"Option code {code!r} qualifies a close but the row opens a position (row: {raw})"
+        )
+    action, quantity = events[0]
+    return [(_qualify_option_close(action, qualifier, raw), quantity)]
+
+
+def _qualify_option_close(action: TradeAction, qualifier: str, raw: RawTradeRow) -> TradeAction:
+    """Turn a `CLOSE_LONG` / `CLOSE_SHORT` into the qualified action the token names."""
+    closes_long = action is TradeAction.CLOSE_LONG
+    if qualifier == _LAPSE_TOKEN:
+        return TradeAction.LAPSE_LONG if closes_long else TradeAction.LAPSE_SHORT
+    if qualifier == _EXERCISE_TOKEN:
+        if closes_long:
+            return TradeAction.EXERCISE_LONG
+        raise MappingError(
+            f"Option code {raw.code!r} marks an exercise on a short position; IB marks the "
+            f"writer's side with 'A' (row: {raw})"
+        )
+    if closes_long:
+        raise MappingError(
+            f"Option code {raw.code!r} marks an assignment on a long position; IB marks the "
+            f"holder's side with 'Ex' (row: {raw})"
+        )
+    return TradeAction.ASSIGN_SHORT
+
+
+def _derive_open_close_events(
+    signed_qty: Decimal,
+    tokens: frozenset[str],
+    prior_pos: Decimal,
+    raw: RawTradeRow,
+) -> list[tuple[TradeAction, Decimal]]:
+    """Return `(action, positive_qty)` events an open / close coded row represents.
+
+    Shared by futures and options — both are positions IB flags `O`
+    (open) and `C` (close). Normally one event. A `C;O` code — which
+    IB prints when an aggregated fill has both a closing and an
+    opening character — produces either one event (when the numeric
+    columns describe a pure close and the `O` flag is spurious
+    accounting noise) or two events (when the row reverses the
+    position through zero).
 
     The disambiguation uses the running position `prior_pos`:
 
@@ -763,7 +1133,7 @@ def _derive_futures_events(
       `|prior_pos|` first, then OPEN for `|new_pos|` in the opposite
       direction.
 
-    Single-letter codes (`O`, `C`, `O;P`, `C;P`, `C;Ep`) skip the
+    Single-flag codes (`O`, `C`, `O;P`, `C;P`, `C;Ep`) skip the
     reversal logic and use the sign x flag table directly:
 
     | qty sign | flag | action        |
@@ -773,21 +1143,21 @@ def _derive_futures_events(
     |   -      |  O   | OPEN_SHORT    |
     |   +      |  C   | CLOSE_SHORT   |
 
-    `Ep` ("Resulted from an Expired Position" per IB's code legend) is
-    the physical-settlement / cash-expiry marker. It rides on a `C`
-    close — e.g. `C;Ep` — and is treated as an ordinary close; the
-    membership check `"O" in code` is False for `Ep`, so these rows
-    route correctly through the `has_close`-only branch below. The
+    For futures, `Ep` ("Resulted from an Expired Position" per IB's
+    code legend) is the physical-settlement / cash-expiry marker. It
+    rides on a `C` close — e.g. `C;Ep` — and is an ordinary close. The
     currency-leg deliveries that accompany physically-settled FX
     futures arrive as separate `Ep`-coded rows in the Forex section
-    and feed the FX pools via the normal BUY/SELL mapping.
+    and feed the FX pools via the normal BUY/SELL mapping. For options
+    the same token means a lapse, which `_derive_option_events` reads
+    after this function has settled the open / close question.
     """
-    has_open = "O" in code
-    has_close = "C" in code
+    has_open = "O" in tokens
+    has_close = "C" in tokens
     if not (has_open or has_close):
-        raise MappingError(f"Futures code {code!r} contains neither 'O' nor 'C' (row: {raw})")
+        raise MappingError(f"Code {raw.code!r} contains neither 'O' nor 'C' (row: {raw})")
     if signed_qty == 0:
-        raise MappingError(f"Futures row has zero quantity, cannot derive action (row: {raw})")
+        raise MappingError(f"Row has zero quantity, cannot derive action (row: {raw})")
 
     if has_open and has_close:
         new_pos = prior_pos + signed_qty
@@ -826,11 +1196,14 @@ def _derive_futures_events(
 
 
 __all__ = [
+    "OPTION_LABELS",
     "MappingError",
     "build_bond_instrument",
     "build_future_instrument",
+    "build_option_instrument",
     "build_stock_instrument",
     "map_rows",
     "parse_statement_datetime",
     "resolve_bond_info",
+    "resolve_option_info",
 ]

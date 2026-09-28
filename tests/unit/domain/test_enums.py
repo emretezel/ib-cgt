@@ -7,7 +7,13 @@ persisted data, CSV exports, and JSON reports.
 
 from __future__ import annotations
 
-from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
+from ib_cgt.domain.enums import (
+    AssetClass,
+    MatchRule,
+    OptionCloseKind,
+    OptionRight,
+    TradeAction,
+)
 
 
 def test_asset_class_values() -> None:
@@ -15,6 +21,17 @@ def test_asset_class_values() -> None:
     assert AssetClass.BOND.value == "bond"
     assert AssetClass.FUTURE.value == "future"
     assert AssetClass.FX.value == "fx"
+    assert AssetClass.OPTION.value == "option"
+
+
+def test_option_enum_values() -> None:
+    assert {r.value for r in OptionRight} == {"call", "put"}
+    assert {k.value for k in OptionCloseKind} == {
+        "purchase",
+        "lapse",
+        "assignment",
+        "cash_settlement",
+    }
 
 
 def test_asset_class_str_coercion() -> None:
@@ -37,11 +54,16 @@ def test_trade_action_values() -> None:
     assert TradeAction.CLOSE_LONG.value == "close_long"
     assert TradeAction.OPEN_SHORT.value == "open_short"
     assert TradeAction.CLOSE_SHORT.value == "close_short"
+    # The qualified option closes — each its own tax event under s.144.
+    assert TradeAction.LAPSE_LONG.value == "lapse_long"
+    assert TradeAction.EXERCISE_LONG.value == "exercise_long"
+    assert TradeAction.LAPSE_SHORT.value == "lapse_short"
+    assert TradeAction.ASSIGN_SHORT.value == "assign_short"
 
 
 def test_enum_membership_is_closed() -> None:
-    # Sanity: the four asset classes are exactly the ones in scope.
-    assert {a.value for a in AssetClass} == {"stock", "bond", "future", "fx"}
+    # Sanity: the five asset classes are exactly the ones in scope.
+    assert {a.value for a in AssetClass} == {"stock", "bond", "future", "fx", "option"}
     assert {r.value for r in MatchRule} == {
         "same_day",
         "bed_and_breakfast",

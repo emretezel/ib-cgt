@@ -124,44 +124,46 @@ def test_parse_title_fallback() -> None:
     assert parsed.instruments == ()
 
 
-def test_parse_skips_equity_and_index_options_trades() -> None:
-    """Rows under "Equity and Index Options" must not become RawTradeRows.
+def test_parse_reads_equity_and_index_options_trades() -> None:
+    """Rows under "Equity and Index Options" become RawTradeRows of that class.
 
-    Stock options are out of scope; ingesting them as stocks would let
-    OCC-formatted symbols (e.g. `TUR 17MAY19 22.0 P`) silently flow into
-    the stocks pipeline. The fixture also carries a Stocks row and a
-    Forex row bracketing the options block — both must survive, which
-    is what proves the filter is a row-level skip rather than a parser
-    abort.
+    The fixture carries a Stocks row and a Forex row bracketing the
+    options block; all three survive in file order, each under its own
+    asset class, and the option row keeps its `C;Ex` code for the
+    mapper.
     """
     parsed = parse_statement(_load("with_equity_options.htm"))
-    symbols = [row.symbol for row in parsed.trades]
-    assert "TUR 17MAY19 22.0 P" not in symbols
-    # The stock and forex rows on either side of the options block
-    # remain intact.
-    assert "TUR" in symbols
-    assert "EUR.GBP" in symbols
-    # And no row carries the dropped asset class.
-    asset_classes = {row.asset_class for row in parsed.trades}
-    assert "Equity and Index Options" not in asset_classes
+    assert [row.symbol for row in parsed.trades] == ["TUR", "TUR 17MAY19 22.0 P", "EUR.GBP"]
+    option = parsed.trades[1]
+    assert option.asset_class == "Equity and Index Options"
+    assert option.currency == "USD"
+    assert option.quantity_text == "-15"
+    assert option.price_text == "0.0000"
+    assert option.code == "C;Ex"
 
 
-def test_parse_skips_equity_and_index_options_instruments() -> None:
-    """The Financial Instrument Information section is filtered symmetrically."""
+def test_parse_reads_equity_and_index_options_instruments() -> None:
+    """The Financial Instrument Information section carries the option row too."""
     parsed = parse_statement(_load("with_equity_options.htm"))
-    info_symbols = [info.symbol for info in parsed.instruments]
-    assert "TUR 17MAY19 22.0 P" not in info_symbols
-    info_classes = {info.asset_class for info in parsed.instruments}
-    assert "Equity and Index Options" not in info_classes
+    option = next(i for i in parsed.instruments if i.asset_class == "Equity and Index Options")
+    assert option.symbol == "TUR 17MAY19 22.0 P"
+    assert option.description == "TUR 17MAY19 PUT 22.0"
+    assert option.conid_text == "654321"
+    assert option.underlying == "TUR"
+    assert option.multiplier_text == "100"
+    assert option.expiry_text == "2019-05-17"
+    # This older vintage prints no `Type` / `Strike` columns.
+    assert option.type_text is None
+    assert option.strike_text is None
 
 
-def test_parse_skips_options_with_custodian_suffix() -> None:
+def test_parse_reads_options_with_custodian_suffix() -> None:
     """The legacy custodian-suffixed options header is recognised.
 
     Older (2017-2018) statements emit the section header as
     `"Equity and Index Options - Held with Interactive Brokers..."`.
-    `_normalize_asset_class` strips the suffix before the filter
-    lookup, so the row must still be dropped.
+    `_normalize_asset_class` strips the suffix, so the row is read
+    under the canonical label.
     """
     legacy_label = (
         "Equity and Index Options - Held with Interactive Brokers (U.K.) "
@@ -189,7 +191,9 @@ def test_parse_skips_options_with_custodian_suffix() -> None:
     </tr></tbody>
     </table></div>{_NOTE_HTML}</body></html>""".encode()
     parsed = parse_statement(html)
-    assert parsed.trades == ()
+    (row,) = parsed.trades
+    assert row.asset_class == "Equity and Index Options"
+    assert row.symbol == "TUR 17MAY19 22.0 P"
 
 
 def test_parse_extracts_corporate_action_rows() -> None:
@@ -424,13 +428,14 @@ def test_parse_withholding_tax_section_under_real_div_id() -> None:
 
 
 def test_parse_open_positions_rows() -> None:
-    """Every stock / bond / futures row is emitted with its class and currency."""
+    """Every stock / option / bond / futures row is emitted with its class and currency."""
     parsed = parse_statement(_load("with_open_positions.htm"))
     rows = {(row.asset_class, row.symbol): row for row in parsed.open_positions}
     assert set(rows) == {
         ("Stocks", "IEAA"),
         ("Stocks", "IEMI"),
         ("Stocks", "TSLA"),
+        ("Equity and Index Options", "TUR 17MAY26 22.0 P"),
         ("Bonds", "UKT 0 3/8 10/22/26"),
         ("Futures", "6LK6"),
         ("Futures", "CBK6"),
@@ -438,6 +443,7 @@ def test_parse_open_positions_rows() -> None:
     assert rows[("Stocks", "IEAA")].currency == "EUR"
     assert rows[("Stocks", "IEMI")].currency == "USD"
     assert rows[("Futures", "6LK6")].currency == "USD"
+    assert rows[("Equity and Index Options", "TUR 17MAY26 22.0 P")].multiplier_text == "100"
 
 
 def test_parse_open_positions_keeps_thousand_separators_and_sign() -> None:
@@ -480,16 +486,16 @@ def test_parse_open_positions_normalises_legacy_asset_label() -> None:
     """`Stocks - Held with …` collapses to `Stocks` exactly as for trades."""
     parsed = parse_statement(_load("with_open_positions.htm"))
     labels = {row.asset_class for row in parsed.open_positions}
-    assert labels == {"Stocks", "Bonds", "Futures"}
+    assert labels == {"Stocks", "Equity and Index Options", "Bonds", "Futures"}
 
 
-def test_parse_open_positions_skips_options_subtotals_and_totals() -> None:
-    """Options rows, `subtotal` / `total` rows and the custodian header never surface."""
+def test_parse_open_positions_skips_subtotals_and_totals() -> None:
+    """`subtotal` / `total` rows and the custodian header never surface; every real row does."""
     parsed = parse_statement(_load("with_open_positions.htm"))
     symbols = [row.symbol for row in parsed.open_positions]
-    assert "TUR 17MAY26 22.0 P" not in symbols
+    assert "TUR 17MAY26 22.0 P" in symbols
     assert not any(symbol.startswith("Total") for symbol in symbols)
-    assert len(symbols) == 6
+    assert len(symbols) == 7
 
 
 def test_parse_open_positions_absent_section_yields_empty_tuple() -> None:

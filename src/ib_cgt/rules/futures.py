@@ -333,7 +333,7 @@ class FutureRuleEngine:
             if qty_step == slice_.qty_remaining:
                 open_fee_share = slice_.fee_remaining
             elif slice_.original_qty > 0 and slice_.fee_total > 0:
-                open_fee_share = slice_.fee_total * (qty_step / slice_.original_qty)
+                open_fee_share = slice_.fee_total * qty_step / slice_.original_qty
             else:
                 open_fee_share = Decimal(0)
 
@@ -341,7 +341,7 @@ class FutureRuleEngine:
             if qty_step == close_qty_remaining:
                 close_fee_share = close_fee_remaining
             elif close_qty_total > 0 and close_fee_total > 0:
-                close_fee_share = close_fee_total * (qty_step / close_qty_total)
+                close_fee_share = close_fee_total * qty_step / close_qty_total
             else:
                 close_fee_share = Decimal(0)
 

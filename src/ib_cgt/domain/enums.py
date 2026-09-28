@@ -15,17 +15,55 @@ from enum import StrEnum
 
 
 class AssetClass(StrEnum):
-    """UK CGT asset classes supported by v1 of the calculator.
+    """UK CGT asset classes the calculator models.
 
     The scope decision in `docs/architecture.md §Scope` fixes this set:
-    stocks, bonds, futures, and FX (the last one treated as a CGT asset
-    class per currency pair vs GBP, not merely a conversion mechanism).
+    stocks, bonds, futures, FX (treated as a CGT asset class per currency
+    vs GBP, not merely a conversion mechanism) and, since 2026-09-28,
+    exchange-traded options (TCGA 1992 s.144 / s.148 — see
+    `docs/options.md`). `OPTION` is declared last so the enum order the
+    reports print in stays stable for the four original classes.
     """
 
     STOCK = "stock"
     BOND = "bond"
     FUTURE = "future"
     FX = "fx"
+    OPTION = "option"
+
+
+class OptionRight(StrEnum):
+    """Whether an option is a call (right to buy) or a put (right to sell).
+
+    Decides which way an exercise or assignment moves the premium into
+    the share trade under TCGA 1992 s.144(2)-(3): a call's premium joins
+    the share *purchase* cost (holder) or the share *sale* proceeds
+    (writer); a put's premium is a cost of the share *sale* (holder) or a
+    deduction from the share *purchase* cost (writer).
+    """
+
+    CALL = "call"
+    PUT = "put"
+
+
+class OptionCloseKind(StrEnum):
+    """How a written option's grant was (partly) closed — one per drain of a grant.
+
+    `PURCHASE`: the writer bought the option back (a closing purchase,
+        TCGA 1992 s.148) — its cost is an incidental cost of the grant.
+    `LAPSE`: the option expired unexercised — no effect on the grantor
+        (HMRC CG55536); recorded so the grant is seen to be closed.
+    `ASSIGNMENT`: the holder exercised and shares changed hands — the
+        grant and the share trade are one transaction (s.144(2)); the
+        assigned contracts' premium leaves the grant for the share trade.
+    `CASH_SETTLEMENT`: the holder exercised a cash-settled option — the
+        cash the writer paid is a cost of the grant (s.144A).
+    """
+
+    PURCHASE = "purchase"
+    LAPSE = "lapse"
+    ASSIGNMENT = "assignment"
+    CASH_SETTLEMENT = "cash_settlement"
 
 
 class MatchRule(StrEnum):
@@ -60,7 +98,7 @@ class MatchRule(StrEnum):
 
 
 class TradeAction(StrEnum):
-    """Superset of trade directions covering all four asset classes.
+    """Superset of trade directions covering every asset class.
 
     Stocks, bonds, and FX use the simple `BUY` / `SELL` pair. Futures need
     more detail: individual-investor CGT treatment is per-contract close-
@@ -68,6 +106,20 @@ class TradeAction(StrEnum):
     *closing* a position, and on which side (long vs short). Keeping the
     action at this granularity avoids re-deriving position state from
     trade history every time a future trade is processed.
+
+    Options use the same four open / close actions when the position is
+    opened or closed *by trade*, plus four qualified closes for the
+    other ways an option can end — each is its own tax event under TCGA
+    1992 s.144, so the action carries the distinction rather than a
+    nullable qualifier column:
+
+    * `LAPSE_LONG` / `LAPSE_SHORT` — the option expired unexercised (IB
+      code `Ep`). A lapsed long is a disposal for nil (s.144(4)); a lapsed
+      short leaves the grant charge untouched.
+    * `EXERCISE_LONG` — the holder exercised (IB code `Ex`): not a
+      disposal (s.144(3)); the option's cost moves into the share trade.
+    * `ASSIGN_SHORT` — the writer was assigned (IB code `A`): the grant
+      and the share trade are one transaction (s.144(2)).
     """
 
     BUY = "buy"
@@ -76,3 +128,7 @@ class TradeAction(StrEnum):
     CLOSE_LONG = "close_long"
     OPEN_SHORT = "open_short"
     CLOSE_SHORT = "close_short"
+    LAPSE_LONG = "lapse_long"
+    EXERCISE_LONG = "exercise_long"
+    LAPSE_SHORT = "lapse_short"
+    ASSIGN_SHORT = "assign_short"

@@ -105,3 +105,14 @@ def test_empty_sections_say_so() -> None:
     paragraphs = [b.text for b in doc.blocks if isinstance(b, Paragraph)]
     assert paragraphs.count("No disposals in this section.") == 4  # summary and computations
     assert "The run recorded no warnings and no errors." in paragraphs
+
+
+def test_disposal_header_spells_out_each_disposal_event() -> None:
+    """The disposal side says what the event was, as the acquisition column always has."""
+    doc = layout(sample_report())
+    headers = [b for b in doc.blocks if isinstance(b, KeyValues) and len(b.items) > 4]
+    aapl = next(h for h in headers if str(h.items[0].value).startswith("AAPL"))
+    keys = [item.key for item in aapl.items]
+    assert keys[3:5] == ["Disposal events", "Disposal detail"]
+    assert aapl.items[3].value == "#5 (U2)"
+    assert aapl.items[4].value == "#5: stock AAPL sell 30 @ 100 USD"

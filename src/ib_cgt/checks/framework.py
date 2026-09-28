@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         EngineOutputs,
         FutureEngineRun,
         FXEngineRun,
+        OptionEngineRun,
         StockEngineRun,
     )
     from ib_cgt.rules.futures import FXConverter
@@ -112,6 +113,7 @@ class Scope(StrEnum):
     STOCKS = "stocks"
     FX = "fx"
     FUTURES = "futures"
+    OPTIONS = "options"
     POOL = "pool"
 
 
@@ -175,6 +177,7 @@ class CheckContext:
     _stock_runs: list[StockEngineRun] | None = field(default=None, repr=False)
     _bond_runs: list[BondEngineRun] | None = field(default=None, repr=False)
     _future_runs: list[FutureEngineRun] | None = field(default=None, repr=False)
+    _option_runs: list[OptionEngineRun] | None = field(default=None, repr=False)
     _fx_runs: list[FXEngineRun] | None = field(default=None, repr=False)
     _position_recs: tuple[PositionReconciliation, ...] | None = field(default=None, repr=False)
 
@@ -189,16 +192,40 @@ class CheckContext:
         return self.symbol is not None or self.since is not None or self.until is not None
 
     def stock_runs(self) -> list[StockEngineRun]:
-        """Return the cached stock-engine runs, building them on first call."""
+        """Return the cached stock-engine runs, building them on first call.
+
+        Exercise transfers are keyed by the share trade, not the
+        series, so a `--symbol` filter must not narrow the option pass
+        that feeds them: when a symbol is set the runner performs its
+        own complete option pass; otherwise the cached runs are shared.
+        """
         if self._stock_runs is None:
             from ib_cgt.calculator.runner import run_stock_engine
 
+            option_runs = None if self.symbol is not None else self.option_runs()
             self._stock_runs = list(
                 run_stock_engine(
-                    self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+                    self.conn,
+                    self.fx,
+                    symbol=self.symbol,
+                    since=self.since,
+                    until=self.until,
+                    option_runs=option_runs,
                 )
             )
         return self._stock_runs
+
+    def option_runs(self) -> list[OptionEngineRun]:
+        """Return the cached option-engine runs, building them on first call."""
+        if self._option_runs is None:
+            from ib_cgt.calculator.runner import run_option_engine
+
+            self._option_runs = list(
+                run_option_engine(
+                    self.conn, self.fx, symbol=self.symbol, since=self.since, until=self.until
+                )
+            )
+        return self._option_runs
 
     def bond_runs(self) -> list[BondEngineRun]:
         """Return the cached bond-engine runs, building them on first call."""
@@ -261,7 +288,7 @@ class CheckContext:
         return self._position_recs
 
     def engine_outputs(self) -> EngineOutputs:
-        """Bundle the four cached runs into the calculator's `EngineOutputs`.
+        """Bundle the five cached runs into the calculator's `EngineOutputs`.
 
         Lets Tier D hand the checks' cached pass to the calculator's
         pure report builder instead of running the engines again.
@@ -273,6 +300,7 @@ class CheckContext:
             bonds=tuple(self.bond_runs()),
             futures=tuple(self.future_runs()),
             fx=tuple(self.fx_runs()),
+            options=tuple(self.option_runs()),
         )
 
 

@@ -27,6 +27,9 @@ non-GBP currency:
 8. **Cash events** — instrument-less movements: broker credit /
    debit interest, external deposits and withdrawals, fee rows.
    Direction is the sign of the amount.
+9. **Option trades** — every premium received or paid, commission,
+   and cash settlement on a non-GBP option series, on the trade
+   date (the shares of a linked exercise are the stock projection's).
 
 Pool model — per currency, not per traded pair
 ----------------------------------------------
@@ -85,6 +88,7 @@ from ib_cgt.rules.fx_cashflow import (
     from_forex_trade,
     from_future_fee,
     from_future_realisation,
+    from_option_trade,
     from_stock_trade,
     make_pool_instrument,
 )
@@ -129,6 +133,7 @@ class FXRuleEngine:
         dividends: Sequence[tuple[int, Dividend]] = (),
         bond_coupons: Sequence[tuple[int, BondCoupon]] = (),
         cash_events: Sequence[tuple[int, CashEvent]] = (),
+        option_trades: Sequence[tuple[int, Trade]] = (),
     ) -> MatchingResult:
         """Match every disposal of `currency` against acquisitions of `currency`.
 
@@ -187,6 +192,10 @@ class FXRuleEngine:
                 range is disjoint from the others (orchestrator
                 allocates from `itertools.count(4 * 10**12)`). Pass
                 an empty sequence to skip cash events.
+            option_trades: `(trade_id, trade)` pairs for non-GBP option
+                trades. Premiums received acquire the series' currency,
+                premiums and commissions paid dispose of it, on the
+                trade date. Pass an empty sequence to skip.
 
         Returns:
             A `MatchingResult` describing the four-rule matching for
@@ -306,6 +315,17 @@ class FXRuleEngine:
                 acquisitions.append(cash_event)
             else:
                 disposals.append(cash_event)
+
+        # Option trades — the net of premium and commission per row,
+        # in the series' currency on the trade date.
+        for trade_id, trade in option_trades:
+            option_event = from_option_trade(trade_id, trade, currency, self._fx, pool_instrument)
+            if option_event is None:
+                continue
+            if isinstance(option_event, Acquisition):
+                acquisitions.append(option_event)
+            else:
+                disposals.append(option_event)
 
         return self._matcher.match(
             pool_instrument,

@@ -36,9 +36,17 @@ from ib_cgt.domain import AssetClass, Trade, TradeAction
 
 # Actions that increase the signed holding; every other action
 # decreases it. Used by `signed_quantity_by_instrument` — the
-# trade-derived side of the open-position reconciliation.
+# trade-derived side of the open-position reconciliation. A short
+# option closing by lapse or assignment brings the holding back up
+# exactly as a closing purchase does.
 _POSITION_INCREASING_ACTIONS: Final[frozenset[TradeAction]] = frozenset(
-    {TradeAction.BUY, TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT}
+    {
+        TradeAction.BUY,
+        TradeAction.OPEN_LONG,
+        TradeAction.CLOSE_SHORT,
+        TradeAction.LAPSE_SHORT,
+        TradeAction.ASSIGN_SHORT,
+    }
 )
 
 
@@ -329,6 +337,26 @@ class TradeRepo:
             instrument_id = int(row["instrument_id"])
             net[instrument_id] = net.get(instrument_id, Decimal(0)) + signed
         return {iid: qty for iid, qty in net.items() if qty != 0}
+
+    def ids_for_rows(self, statement_hash: str, row_indexes: Iterable[int]) -> dict[int, int]:
+        """Map `statement_row_index` → `trade_id` for rows of one statement.
+
+        The ingestor pairs an exercised option with its share trade
+        while both are still positions in the mapped list; once they
+        are inserted, this is how it finds the ids the
+        `option_exercise_links` row needs. Indexes not on file (rows the
+        coverage rule skipped) are simply absent from the result.
+        """
+        indexes = sorted(set(row_indexes))
+        if not indexes:
+            return {}
+        placeholders = ",".join("?" for _ in indexes)
+        rows = self._conn.execute(
+            "SELECT trade_id, statement_row_index FROM trades "
+            f"WHERE source_statement_hash = ? AND statement_row_index IN ({placeholders})",
+            (statement_hash, *indexes),
+        ).fetchall()
+        return {int(r["statement_row_index"]): int(r["trade_id"]) for r in rows}
 
     def count(self) -> int:
         """Return the total row count — test-support helper."""

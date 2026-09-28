@@ -21,9 +21,15 @@ implementation status.
 - [`ingestion.md`](./ingestion.md) — the parser strategy (HTML and PDF adapters,
   one assembler), the coverage rule for overlapping statements, vintage quirks.
 - [`fx.md`](./fx.md) — Frankfurter caching and business-day fallback.
-- [`rules.md`](./rules.md) — UK matching engine + per-asset-class rule engines.
-- [`options.md`](./options.md) — proposal for the CGT treatment of traded
-  options (not implemented): why they are not "like futures".
+- [`rules.md`](./rules.md) — UK matching engine + per-asset-class rule
+  engines (stocks, bonds, futures, options, FX pools), the engine runner
+  and persistence.
+- [`audit.md`](./audit.md) — the `match` dry runs and the `show` drill-downs
+  that take any figure back to the IB statement.
+- [`options.md`](./options.md) — exchange-traded options: the s.144 /
+  s.148 rules the engine applies (grants, closing purchases, exercise and
+  assignment), the decisions taken, how IB prints the rows, and why they
+  are not "like futures".
 - [`reporting.md`](./reporting.md) — the SA108 report: box mapping, the
   disposal-grouping rule, the working-sheet conventions, output formats.
 - [`db/index.md`](./db/index.md) — database reference, one page per table,

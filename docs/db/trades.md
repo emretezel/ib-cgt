@@ -21,6 +21,13 @@ statement_row_index)` still points back to the source HTML for
 audit purposes. Downstream they are indistinguishable from ordinary
 sells.
 
+Option rows (migration `023`) use the futures-style open / close
+actions plus four qualified closes derived from IB's code column:
+`lapse_long` and `lapse_short` (`Ep`, expiry at price 0),
+`exercise_long` (`Ex`) and `assign_short` (`A`). An `exercise_long` or
+`assign_short` row that delivered shares is paired with the stock row
+IB booked at the strike in [`option_exercise_links`](./option_exercise_links.md).
+
 ## Columns
 
 | Column | Type | Nullable | Notes |
@@ -28,7 +35,7 @@ sells.
 | `trade_id` | `INTEGER` | No (PK) | Surrogate id; auto-issued by the SQLite `INTEGER PRIMARY KEY`. |
 | `account_id` | `TEXT` | No (FK) | Owning IB account. |
 | `instrument_id` | `INTEGER` | No (FK) | The instrument traded. |
-| `action` | `TEXT` | No | Trade action; values come from the domain `TradeAction` enum (e.g. `sell`, `open_long`, `close_long`). |
+| `action` | `TEXT` | No | Trade action; values come from the domain `TradeAction` enum: `buy` / `sell` for stocks, bonds and forex; `open_long` / `close_long` / `open_short` / `close_short` for futures and options; `lapse_long` / `exercise_long` / `lapse_short` / `assign_short` for options only. |
 | `trade_datetime` | `TEXT` | No | Execution instant, ISO-8601 UTC with offset: the statement's printed clock read in the zone the statement declares (`statements.time_zone`, Eastern Time for IB). |
 | `trade_date` | `TEXT` | No | `YYYY-MM-DD`, the **Europe/London date** of `trade_datetime` (`Trade.uk_date_of`) — the date the tax-year cut-off, same-day and 30-day rules work with. A fill printed 21:41 Eastern on 5 April is dated 6 April. Stored rather than derived because SQLite cannot convert zones; the domain invariant and check A7 keep it consistent. |
 | `settlement_date` | `TEXT` | No | `YYYY-MM-DD` settlement date as reported by IB. |
@@ -127,10 +134,17 @@ None.
   non-GBP stock and non-GBP futures trade).
 - [`TradeRepo.signed_quantity_by_instrument(account_id, *, up_to)`](../../src/ib_cgt/db/repos/trades.py)
   — the net signed holding per instrument implied by one account's
-  trades up to a date (buys / long opens / short closes add, sells /
-  long closes / short opens subtract; flat instruments omitted; sums
-  in `Decimal`, never in SQL). The trade side of the open-position
-  reconciliation against [`statement_positions`](./statement_positions.md).
+  trades up to a date (buys, long opens and every short close —
+  `close_short`, `lapse_short`, `assign_short` — add; sells, long
+  closes of every kind and short opens subtract; flat instruments
+  omitted; sums in `Decimal`, never in SQL). The trade side of the
+  open-position reconciliation against
+  [`statement_positions`](./statement_positions.md).
+- [`TradeRepo.ids_for_rows(statement_hash, row_indexes)`](../../src/ib_cgt/db/repos/trades.py)
+  — `statement_row_index` → `trade_id` for rows of one statement; the
+  ingestor uses it to turn the exercise linker's row-index pairs into
+  the trade ids [`option_exercise_links`](./option_exercise_links.md)
+  stores.
 - [`TradeRepo.list_filtered(...)`](../../src/ib_cgt/db/repos/trades.py)
   — flexible CLI listing with optional `account_id` / `symbol` /
   `since` / `limit` filters.
@@ -154,18 +168,23 @@ None.
 - `ib-cgt trades [--account | --symbol | --since | --limit]`
   ([`src/ib_cgt/cli/trades.py`](../../src/ib_cgt/cli/trades.py)) — interactive
   read-only listing, served by `TradeRepo.list_filtered`.
+- `ib-cgt show trade <trade_id>` — one row with its statement
+  provenance, FX preview and (for an option row) its series facts and
+  exercise link.
 
 ## Sample (first 5 rows)
 
 Captured via the Python `sqlite3` module in `-line` style after the
-full re-ingest following migration 022 (`SELECT * FROM trades LIMIT 5`,
+full re-ingest following migration 023 (`SELECT * FROM trades LIMIT 5`,
 no ordering). `trade_datetime` is the printed Eastern clock as a UTC
-instant: row 1 was printed `2011-12-21, 05:49:09`.
+instant: row 1 was printed `2011-12-21, 05:49:09`. Row 5 is the first
+option row in the history — the XAUUSD call written on 2012-10-10 for
+a 7.70 premium (× 100 multiplier = 770 USD).
 
 ```
              trade_id = 1
            account_id = U1004320
-        instrument_id = 141
+        instrument_id = 1
                action = sell
        trade_datetime = 2011-12-21T10:49:09+00:00
            trade_date = 2011-12-21
@@ -182,7 +201,7 @@ source_statement_hash = f297080a8153ee02931926eca514cebd63f26aa4c92f21425972c0b9
 
              trade_id = 2
            account_id = U1004320
-        instrument_id = 717
+        instrument_id = 2
                action = buy
        trade_datetime = 2012-12-19T14:41:00+00:00
            trade_date = 2012-12-19
@@ -199,7 +218,7 @@ source_statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5
 
              trade_id = 3
            account_id = U1004320
-        instrument_id = 718
+        instrument_id = 3
                action = buy
        trade_datetime = 2012-12-19T14:37:34+00:00
            trade_date = 2012-12-19
@@ -216,7 +235,7 @@ source_statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5
 
              trade_id = 4
            account_id = U1004320
-        instrument_id = 719
+        instrument_id = 4
                action = buy
        trade_datetime = 2012-12-21T17:22:53+00:00
            trade_date = 2012-12-21
@@ -233,16 +252,16 @@ source_statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5
 
              trade_id = 5
            account_id = U1004320
-        instrument_id = 720
+        instrument_id = 5
                action = open_short
-       trade_datetime = 2012-05-17T09:45:54+00:00
-           trade_date = 2012-05-17
-      settlement_date = 2012-05-17
+       trade_datetime = 2012-10-10T12:26:58+00:00
+           trade_date = 2012-10-10
+      settlement_date = 2012-10-10
              quantity = 1
-         price_amount = 143.3800
-       price_currency = EUR
-          fees_amount = 2.00
-        fees_currency = EUR
+         price_amount = 7.7000
+       price_currency = USD
+          fees_amount = 2.45
+        fees_currency = USD
        accrued_amount = NULL
      accrued_currency = NULL
   statement_row_index = 3

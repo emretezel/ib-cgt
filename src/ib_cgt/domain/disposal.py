@@ -23,6 +23,16 @@ to individual-investor futures (TCGA 1992 s.143(5)-(6), HMRC CG56079): each clos
 standalone disposal, paired one-to-one with the trade that opened the
 contract.
 
+Written options get a third family — `OptionGrant`, `OptionGrantClose`,
+`OpenGrant` — because the grant of an option is itself the disposal
+(TCGA 1992 s.144(1)): the premium is a gain on the grant date, and every
+later event on that grant (a closing purchase under s.148, a lapse, an
+assignment, a cash settlement) modifies *that* disposal rather than
+creating a new one. `OptionExerciseTransfer` carries the s.144(2)/(3)
+amount an exercise or assignment moves into the share trade it produced.
+A holder's bought options, by contrast, are ordinary `MatchedDisposal`
+rows: they are pooled by series and matched like shares (CG55536).
+
 Author: Emre Tezel
 """
 
@@ -33,9 +43,9 @@ from datetime import date
 from decimal import Decimal
 from typing import Literal
 
-from ib_cgt.domain.enums import MatchRule
+from ib_cgt.domain.enums import MatchRule, OptionCloseKind, OptionRight, TradeAction
 from ib_cgt.domain.money import Money
-from ib_cgt.domain.trading import AnyInstrument, FutureInstrument
+from ib_cgt.domain.trading import AnyInstrument, FutureInstrument, OptionInstrument
 
 # ---------------------------------------------------------------------------
 # Acquisition & Disposal — the two sides of a match
@@ -683,3 +693,408 @@ class OpenPosition:
             raise ValueError(
                 f"OpenPosition.fees_remaining must be >= 0, got {self.fees_remaining.amount}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Options — the writer's grant (TCGA 1992 s.144(1), s.148) and its later events
+# ---------------------------------------------------------------------------
+
+
+def _require_native(name: str, value: Money, instrument: OptionInstrument) -> None:
+    """Every native amount on an option shape is in the series' own currency."""
+    if value.currency != instrument.currency:
+        raise ValueError(
+            f"{name} currency ({value.currency}) must match instrument currency "
+            f"({instrument.currency})"
+        )
+
+
+def _require_gbp(name: str, value: Money) -> None:
+    """Every GBP amount on an option shape is sterling."""
+    if not value.is_gbp():
+        raise ValueError(f"{name} must be GBP, got {value.currency}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OptionGrantClose:
+    """One event that (partly) closed a written option's grant.
+
+    A grant is drained FIFO by the writer's later trades on the same
+    series: a closing purchase (`PURCHASE`, s.148), an expiry (`LAPSE`),
+    an assignment with shares delivered (`ASSIGNMENT`, s.144(2)) or a
+    cash settlement on exercise (`CASH_SETTLEMENT`, s.144A). Each drain
+    is one of these records, so a grant's history is auditable trade by
+    trade and a closing purchase that drains two grants appears once
+    under each.
+
+    Attributes:
+        close_trade_id: The `trades.trade_id` of the closing row.
+        kind: Which of the four events this is.
+        close_date: UK-local date of the closing row.
+        quantity: Contracts of the grant this event closed (> 0).
+        premium_native: Gross premium paid on this portion — price x
+            multiplier x quantity — in the series' currency. Zero for a
+            lapse or an assignment (IB prints both at price 0).
+        fee_native: The closing row's commission share, non-negative.
+        fx_rate: The "1 GBP = r native" spot applied on `close_date`.
+        cost_gbp: What this event adds to the grant's incidental costs
+            of disposal, in GBP: premium plus fee at `fx_rate` for a
+            purchase or a cash settlement; the fee alone for a lapse;
+            zero for an assignment, whose premium share and fee travel
+            to the share trade instead (see `OptionExerciseTransfer`).
+    """
+
+    close_trade_id: int
+    kind: OptionCloseKind
+    close_date: date
+    quantity: Decimal
+    premium_native: Money
+    fee_native: Money
+    fx_rate: Decimal
+    cost_gbp: Money
+
+    def __post_init__(self) -> None:
+        """Positivity, sign and kind-specific invariants."""
+        if self.quantity <= 0:
+            raise ValueError(f"OptionGrantClose.quantity must be > 0, got {self.quantity}")
+        if self.premium_native.amount < 0:
+            raise ValueError(
+                f"OptionGrantClose.premium_native must be >= 0, got {self.premium_native.amount}"
+            )
+        if self.fee_native.amount < 0:
+            raise ValueError(
+                f"OptionGrantClose.fee_native must be >= 0, got {self.fee_native.amount}"
+            )
+        if self.fx_rate <= 0:
+            raise ValueError(f"OptionGrantClose.fx_rate must be > 0, got {self.fx_rate}")
+        _require_gbp("OptionGrantClose.cost_gbp", self.cost_gbp)
+        if self.cost_gbp.amount < 0:
+            raise ValueError(f"OptionGrantClose.cost_gbp must be >= 0, got {self.cost_gbp.amount}")
+        if (
+            self.kind in (OptionCloseKind.LAPSE, OptionCloseKind.ASSIGNMENT)
+            and self.premium_native.amount != 0
+        ):
+            raise ValueError(
+                f"OptionGrantClose of kind {self.kind.value!r} carries no premium, "
+                f"got {self.premium_native.amount}"
+            )
+        if self.kind is OptionCloseKind.ASSIGNMENT and self.cost_gbp.amount != 0:
+            raise ValueError(
+                "OptionGrantClose of kind 'assignment' cannot carry a cost — the premium "
+                "and fee move to the share trade"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OptionGrant:
+    """A written option: the disposal constituted by its grant (TCGA 1992 s.144(1)).
+
+    HMRC charges the writer on the grant date: "the full amount of the
+    premium less any incidental cost of disposal are assessable as a
+    gain arising when the option is written" (CG55536). Everything that
+    happens to the grant afterwards adjusts *this* disposal:
+
+    * a closing purchase adds its cost to the grant's incidental costs
+      (s.148(3), CG55545) — the gain on the grant is reduced;
+    * a lapse changes nothing (CG55536);
+    * an assignment makes the grant and the share trade one transaction
+      (s.144(2)): the assigned contracts' premium leaves the grant and
+      joins the share trade, and the charge on them is unwound
+      (CG12317);
+    * a cash settlement on exercise is a cost of the grant (s.144A).
+
+    The record therefore carries the grant's gross figures and every
+    close; the chargeable figures are derived. When a close falls in a
+    later tax year than the grant, the grant year is *restated* — the
+    calculator warns on the later year so the earlier return can be
+    amended.
+
+    Attributes:
+        grant_trade_id: The `OPEN_SHORT` trade that wrote the option.
+        instrument: The option series.
+        grant_date: UK-local date of the grant — the disposal date.
+        quantity: Contracts written (> 0).
+        premium_native: Gross premium received — price x multiplier x
+            quantity — in the series' currency.
+        grant_fee_native: The grant row's commission, non-negative.
+        grant_fx_rate: The "1 GBP = r native" spot on `grant_date`.
+        proceeds_gbp: `premium_native` at `grant_fx_rate` — gross, before
+            the grant fee, so the working sheet's A and B stay separate.
+        grant_fee_gbp: `grant_fee_native` at `grant_fx_rate`.
+        closes: Every later event on the grant, in drain order.
+    """
+
+    grant_trade_id: int
+    instrument: OptionInstrument
+    grant_date: date
+    quantity: Decimal
+    premium_native: Money
+    grant_fee_native: Money
+    grant_fx_rate: Decimal
+    proceeds_gbp: Money
+    grant_fee_gbp: Money
+    closes: tuple[OptionGrantClose, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Instrument class, currencies, signs, and the closes' consistency."""
+        if not isinstance(self.instrument, OptionInstrument):
+            raise ValueError(
+                "OptionGrant.instrument must be OptionInstrument, "
+                f"got {type(self.instrument).__name__}"
+            )
+        if self.quantity <= 0:
+            raise ValueError(f"OptionGrant.quantity must be > 0, got {self.quantity}")
+        _require_native("OptionGrant.premium_native", self.premium_native, self.instrument)
+        _require_native("OptionGrant.grant_fee_native", self.grant_fee_native, self.instrument)
+        if self.premium_native.amount < 0:
+            raise ValueError(
+                f"OptionGrant.premium_native must be >= 0, got {self.premium_native.amount}"
+            )
+        if self.grant_fee_native.amount < 0:
+            raise ValueError(
+                f"OptionGrant.grant_fee_native must be >= 0, got {self.grant_fee_native.amount}"
+            )
+        if self.grant_fx_rate <= 0:
+            raise ValueError(f"OptionGrant.grant_fx_rate must be > 0, got {self.grant_fx_rate}")
+        _require_gbp("OptionGrant.proceeds_gbp", self.proceeds_gbp)
+        _require_gbp("OptionGrant.grant_fee_gbp", self.grant_fee_gbp)
+        closed = Decimal(0)
+        for close in self.closes:
+            _require_native(
+                "OptionGrantClose.premium_native", close.premium_native, self.instrument
+            )
+            _require_native("OptionGrantClose.fee_native", close.fee_native, self.instrument)
+            if close.close_trade_id == self.grant_trade_id:
+                raise ValueError("OptionGrant: a grant cannot be closed by its own trade")
+            if close.close_date < self.grant_date:
+                raise ValueError(
+                    f"OptionGrant: close #{close.close_trade_id} on {close.close_date} predates "
+                    f"the grant on {self.grant_date}"
+                )
+            closed += close.quantity
+        if closed > self.quantity:
+            raise ValueError(
+                f"OptionGrant: closes total {closed} contracts but only {self.quantity} "
+                "were granted"
+            )
+
+    # ------------------------------------------------------------------
+    # Derived quantities
+    # ------------------------------------------------------------------
+
+    @property
+    def closed_quantity(self) -> Decimal:
+        """Contracts every close has taken off the grant."""
+        return sum((c.quantity for c in self.closes), Decimal(0))
+
+    @property
+    def open_quantity(self) -> Decimal:
+        """Contracts still open at the end of the history the grant was computed from."""
+        return self.quantity - self.closed_quantity
+
+    @property
+    def assigned_quantity(self) -> Decimal:
+        """Contracts assigned with shares delivered — their premium left for the share trade."""
+        return sum(
+            (c.quantity for c in self.closes if c.kind is OptionCloseKind.ASSIGNMENT), Decimal(0)
+        )
+
+    @property
+    def chargeable_quantity(self) -> Decimal:
+        """Contracts whose premium is still charged on this grant."""
+        return self.quantity - self.assigned_quantity
+
+    @property
+    def chargeable_fraction(self) -> Decimal:
+        """The share of the grant that is still charged here (1 when nothing was assigned)."""
+        return self.chargeable_quantity / self.quantity
+
+    @property
+    def is_chargeable(self) -> bool:
+        """False once every contract was assigned — the whole premium then sits in share trades."""
+        return self.chargeable_quantity > 0
+
+    # ------------------------------------------------------------------
+    # Derived money — the working-sheet figures of the grant
+    # ------------------------------------------------------------------
+
+    @property
+    def chargeable_proceeds_gbp(self) -> Money:
+        """A — the gross premium still charged on the grant."""
+        return Money.gbp(self.proceeds_gbp.amount * self.chargeable_fraction)
+
+    @property
+    def chargeable_fee_gbp(self) -> Money:
+        """The grant commission's share that stays with the grant."""
+        return Money.gbp(self.grant_fee_gbp.amount * self.chargeable_fraction)
+
+    @property
+    def closing_costs_gbp(self) -> Money:
+        """Σ `cost_gbp` over the closes — the s.148(3) additions to the incidental costs."""
+        total = Money.zero("GBP")
+        for close in self.closes:
+            total = total + close.cost_gbp
+        return total
+
+    @property
+    def incidental_costs_gbp(self) -> Money:
+        """B — grant commission plus every closing cost."""
+        return self.chargeable_fee_gbp + self.closing_costs_gbp
+
+    @property
+    def gain_gbp(self) -> Money:
+        """H — the grant's gain after every close on record (may be a loss)."""
+        return self.chargeable_proceeds_gbp - self.incidental_costs_gbp
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OpenGrant:
+    """A written option still open at the end of input — the writer-side `OpenPosition`.
+
+    Not a tax event in itself: the grant it belongs to has already been
+    charged. It exists so the audit output and the position
+    reconciliation can see which written contracts are still
+    outstanding.
+
+    Attributes:
+        grant_trade_id: The `OPEN_SHORT` trade that wrote the option.
+        instrument: The option series.
+        grant_date: UK-local date of the grant.
+        quantity_remaining: Contracts not yet closed (> 0).
+        premium_price: Per-unit premium received, native currency.
+        fees_remaining: Grant commission not yet attributed to a close,
+            native currency, non-negative.
+    """
+
+    grant_trade_id: int
+    instrument: OptionInstrument
+    grant_date: date
+    quantity_remaining: Decimal
+    premium_price: Money
+    fees_remaining: Money
+
+    def __post_init__(self) -> None:
+        """Instrument class, positivity and native currencies."""
+        if not isinstance(self.instrument, OptionInstrument):
+            raise ValueError(
+                "OpenGrant.instrument must be OptionInstrument, "
+                f"got {type(self.instrument).__name__}"
+            )
+        if self.quantity_remaining <= 0:
+            raise ValueError(
+                f"OpenGrant.quantity_remaining must be > 0, got {self.quantity_remaining}"
+            )
+        _require_native("OpenGrant.premium_price", self.premium_price, self.instrument)
+        _require_native("OpenGrant.fees_remaining", self.fees_remaining, self.instrument)
+        if self.fees_remaining.amount < 0:
+            raise ValueError(
+                f"OpenGrant.fees_remaining must be >= 0, got {self.fees_remaining.amount}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# OptionExerciseTransfer — the s.144(2)/(3) amount an exercise moves into a share trade
+# ---------------------------------------------------------------------------
+
+
+def option_share_action(right: OptionRight, side: Literal["LONG", "SHORT"]) -> TradeAction:
+    """The stock action an exercise (`LONG`) or assignment (`SHORT`) of an option books.
+
+    A call delivers shares to the holder: the holder buys, the writer
+    sells. A put delivers shares to the writer: the holder sells, the
+    writer buys. The ingest linker uses it to find the share trade an
+    option row produced; the stock engine uses it to check the linked
+    share trade has the action the option implies.
+    """
+    if right is OptionRight.CALL:
+        return TradeAction.BUY if side == "LONG" else TradeAction.SELL
+    return TradeAction.SELL if side == "LONG" else TradeAction.BUY
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OptionExerciseTransfer:
+    """What an exercise or assignment carries from the option into the share trade.
+
+    When an option is exercised, the option leg is not a disposal.
+    Instead (TCGA 1992 s.144(2)-(3), CG55536):
+
+    * holder of a call: the option's cost is added to the cost of the
+      shares bought at the strike;
+    * holder of a put: the option's cost is an incidental cost of the
+      share disposal at the strike;
+    * writer of a call: the premium received is added to the proceeds of
+      the shares delivered at the strike;
+    * writer of a put: the premium received is deducted from the cost of
+      the shares bought at the strike.
+
+    The option engine computes the amount — the identified option cost
+    for the holder (`side == "LONG"`), the assigned contracts' share of
+    the grant's gross premium for the writer (`side == "SHORT"`) — and
+    the stock engine applies it to the share trade named here. The
+    option's `right` decides the direction; it is read from
+    `instrument`.
+
+    Attributes:
+        option_trade_id: The `EXERCISE_LONG` / `ASSIGN_SHORT` trade.
+        share_trade_id: The stock trade IB booked at the strike for it.
+        instrument: The option series.
+        side: `LONG` for a holder's exercise, `SHORT` for a writer's
+            assignment.
+        grant_trade_id: For the short side, the grant the assignment
+            drained (one transfer per grant a single assignment drains);
+            `None` on the long side.
+        on: UK-local date of the exercise — the share trade's date.
+        quantity: Contracts exercised or assigned in this transfer.
+        amount_gbp: The principal moving: identified option cost (holder)
+            or gross premium share (writer). Non-negative.
+        fees_gbp: The incidental costs riding with it — the option's own
+            commissions (holder) or the grant fee share plus the
+            assignment row's fee (writer). Non-negative. For the holder
+            the fees are a subset of `amount_gbp`, exactly as
+            `Acquisition.fees_gbp` sits inside `Acquisition.cost_gbp`.
+    """
+
+    option_trade_id: int
+    share_trade_id: int
+    instrument: OptionInstrument
+    side: Literal["LONG", "SHORT"]
+    grant_trade_id: int | None
+    on: date
+    quantity: Decimal
+    amount_gbp: Money
+    fees_gbp: Money
+
+    def __post_init__(self) -> None:
+        """Instrument class, side / grant consistency, positivity and GBP."""
+        if not isinstance(self.instrument, OptionInstrument):
+            raise ValueError(
+                "OptionExerciseTransfer.instrument must be OptionInstrument, "
+                f"got {type(self.instrument).__name__}"
+            )
+        if self.side not in ("LONG", "SHORT"):
+            raise ValueError(
+                f"OptionExerciseTransfer.side must be 'LONG' or 'SHORT', got {self.side!r}"
+            )
+        if (self.grant_trade_id is None) != (self.side == "LONG"):
+            raise ValueError(
+                "OptionExerciseTransfer.grant_trade_id must be set exactly for the SHORT side"
+            )
+        if self.option_trade_id == self.share_trade_id:
+            raise ValueError("OptionExerciseTransfer: option and share trade ids must differ")
+        if self.quantity <= 0:
+            raise ValueError(f"OptionExerciseTransfer.quantity must be > 0, got {self.quantity}")
+        _require_gbp("OptionExerciseTransfer.amount_gbp", self.amount_gbp)
+        _require_gbp("OptionExerciseTransfer.fees_gbp", self.fees_gbp)
+        if self.amount_gbp.amount < 0:
+            raise ValueError(
+                f"OptionExerciseTransfer.amount_gbp must be >= 0, got {self.amount_gbp.amount}"
+            )
+        if self.fees_gbp.amount < 0:
+            raise ValueError(
+                f"OptionExerciseTransfer.fees_gbp must be >= 0, got {self.fees_gbp.amount}"
+            )
+
+    @property
+    def share_action(self) -> TradeAction:
+        """`BUY` or `SELL` — what the linked share trade must be."""
+        return option_share_action(self.instrument.right, self.side)

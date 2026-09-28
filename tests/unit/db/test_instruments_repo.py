@@ -197,6 +197,7 @@ def test_per_child_currency_indexes_exist(db: sqlite3.Connection) -> None:
         "ix_bond_instruments_currency",
         "ix_future_instruments_currency",
         "ix_fx_instruments_currency",
+        "ix_option_instruments_currency",
     }
     assert found == expected
 

@@ -38,6 +38,8 @@ def test_kind_values_match_the_schema_check() -> None:
         "history_incomplete",
         "history_no_lookahead",
         "empty_year",
+        "option_grant_restated",
+        "option_exercise_unlinked",
     }
 
 

@@ -34,9 +34,9 @@ EXPECTED_COMMANDS: tuple[str, ...] = ("ingest", "trades", "compute", "report")
 EXPECTED_GROUPS: dict[str, tuple[str, ...]] = {
     "db": ("init", "reset"),
     "fx": ("sync",),
-    "match": ("futures", "stocks", "fx", "bonds"),
+    "match": ("futures", "stocks", "fx", "bonds", "options"),
     "show": ("trade", "realisation", "match"),
-    "check": ("all", "data", "stocks", "fx", "futures", "pool"),
+    "check": ("all", "data", "stocks", "fx", "futures", "options", "pool"),
     "bonds": ("list",),
 }
 

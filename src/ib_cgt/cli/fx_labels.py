@@ -54,11 +54,11 @@ class FxLabels:
 def build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
     """Build the event-id → source-label map used by the FX renderer.
 
-    Forex / stock / futures-fee events use the real `trades.trade_id`
-    (globally unique). Realisation P&L, dividend and coupon events
-    use the synthetic ids the runner allocated from disjoint high
-    ranges; the label carries enough of the source to be readable
-    without the id.
+    Forex / stock / bond / futures-fee / option events use the real
+    `trades.trade_id` (globally unique). Realisation P&L, dividend and
+    coupon events use the synthetic ids the runner allocated from
+    disjoint high ranges; the label carries enough of the source to be
+    readable without the id.
     """
     out: dict[int, str] = {}
     for tid, trade in inputs.forex_trades:
@@ -69,6 +69,8 @@ def build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
         out[tid] = f"bond {trade.instrument.symbol} {trade.action.value}"
     for tid, trade in inputs.future_trades:
         out[tid] = f"futures fee {trade.instrument.symbol} {trade.action.value}"
+    for tid, trade in inputs.option_trades:
+        out[tid] = f"option {trade.instrument.symbol} {trade.action.value}"
     for synth_id, realisation, _account in inputs.future_realisations:
         side = "P&L"
         out[synth_id] = (
@@ -101,6 +103,8 @@ def build_fx_event_date_map(inputs: FXInputs) -> dict[int, date]:
     for tid, trade in inputs.bond_trades:
         out[tid] = trade.trade_date
     for tid, trade in inputs.future_trades:
+        out[tid] = trade.trade_date
+    for tid, trade in inputs.option_trades:
         out[tid] = trade.trade_date
     for synth_id, realisation, _account in inputs.future_realisations:
         out[synth_id] = realisation.close_date
@@ -141,7 +145,7 @@ def build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
     out: dict[int, str] = {}
     for tid, _trade in (*inputs.forex_trades, *inputs.stock_trades, *inputs.bond_trades):
         out[tid] = f"#{tid}"
-    for tid, _trade in inputs.future_trades:
+    for tid, _trade in (*inputs.future_trades, *inputs.option_trades):
         out[tid] = f"#{tid}"
 
     # Group realisations by close_trade_id so we can emit `[i]`

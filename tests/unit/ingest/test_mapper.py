@@ -629,16 +629,12 @@ def test_unsupported_asset_class_raises() -> None:
         map_rows(_make([row]))
 
 
-def test_equity_options_label_now_raises_mapping_error() -> None:
-    """Defence-in-depth: if the parser filter is ever bypassed and an
-    "Equity and Index Options" row reaches the mapper, it must fail
-    loudly rather than silently classify the option as a stock.
+def test_option_row_without_instrument_info_raises_mapping_error() -> None:
+    """An option with no instrument-information row has no conid and no series facts.
 
-    The parser's `_IGNORED_ASSET_CLASSES` filter is the primary
-    defence (see `tests/unit/ingest/test_parser.py`); this test guards
-    the mapper-level fallback so a future regression cannot
-    re-introduce the silent mis-classification that ingested
-    `TUR 17MAY19 22.0 P` as a stock.
+    The full option mapping is covered in `test_mapper_options.py`; this
+    pins the loud failure so an option can never fall through to the
+    stock pipeline as it did before migration 008.
     """
     row = RawTradeRow(
         asset_class="Equity and Index Options",
@@ -650,5 +646,5 @@ def test_equity_options_label_now_raises_mapping_error() -> None:
         fees_text="-0.51",
         code="O",
     )
-    with pytest.raises(MappingError, match="Unsupported asset class"):
+    with pytest.raises(MappingError, match="no matching entry"):
         map_rows(_make([row]))

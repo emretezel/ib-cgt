@@ -37,10 +37,11 @@ from ib_cgt.cli import match_futures  # noqa: F401  — `match futures`
 from ib_cgt.cli import match_stocks  # noqa: F401  — `match stocks`
 from ib_cgt.cli import match_fx  # noqa: F401  — `match fx`
 from ib_cgt.cli import match_bonds  # noqa: F401  — `match bonds`
+from ib_cgt.cli import match_options  # noqa: F401  — `match options`
 from ib_cgt.cli import show_trade  # noqa: F401  — `show trade`
 from ib_cgt.cli import show_realisation  # noqa: F401  — `show realisation`
 from ib_cgt.cli import show_match  # noqa: F401  — `show match`
-from ib_cgt.cli import check  # noqa: F401  — `check [all|data|stocks|fx|futures|pool]`
+from ib_cgt.cli import check  # noqa: F401  — `check [all|data|stocks|fx|futures|options|pool]`
 from ib_cgt.cli import bonds  # noqa: F401  — `bonds list`
 from ib_cgt.cli import compute  # noqa: F401  — `compute --year`
 from ib_cgt.cli import report  # noqa: F401  — `report --year`

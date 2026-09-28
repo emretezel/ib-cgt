@@ -1,6 +1,6 @@
 # Schema
 
-Effective schema after migrations `001`–`021`
+Effective schema after migrations `001`–`023`
 ([`src/ib_cgt/db/migrations/`](../../src/ib_cgt/db/migrations)). Every table
 is `STRICT`. Columns are `NOT NULL` unless marked `null`. `PK` = primary key.
 `FK → t.c` = foreign key, `RESTRICT` unless marked `cascade` (`ON DELETE
@@ -9,8 +9,11 @@ each table. Purpose, read/write paths and sample rows are on the per-table
 pages linked from [`index.md`](./index.md).
 
 Trade-id columns on run-scoped tables (`matched_disposals`,
-`future_realisations`, `fx_event_sources`) deliberately have no FK to
-`trades`, so audit rows survive a re-ingest.
+`future_realisations`, `option_grants`, `option_grant_closes`,
+`option_exercise_transfers`, `fx_event_sources`) deliberately have no
+FK to `trades`, so audit rows survive a re-ingest. The one table that
+does reference `trades` — `option_exercise_links` — is ingest data and
+cascades with them.
 
 ## Reference
 
@@ -26,11 +29,11 @@ Trade-id columns on run-scoped tables (`matched_disposals`,
 | Column | Type | Constraints |
 |---|---|---|
 | `instrument_id` | INTEGER | PK |
-| `asset_class` | TEXT | CHECK IN (`'stock'`, `'bond'`, `'future'`, `'fx'`) |
+| `asset_class` | TEXT | CHECK IN (`'stock'`, `'bond'`, `'future'`, `'fx'`, `'option'`) |
 
 Identity per class (the natural key `InstrumentRepo.upsert` recognises an
-instrument by): stocks and futures — IB's `conid`; bonds — ISIN; FX pairs —
-the pair columns. `symbol` is display text everywhere; the calculator only
+instrument by): stocks, futures and options — IB's `conid`; bonds — ISIN;
+FX pairs — the pair columns. `symbol` is display text everywhere; the calculator only
 ever compares `instrument_id`.
 
 ### `stock_instruments`
@@ -84,6 +87,23 @@ ever compares `instrument_id`.
 
 - UNIQUE `(symbol, currency, fx_base, fx_quote)`
 - INDEX `ix_fx_instruments_currency` `(currency)`
+
+### `option_instruments`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `instrument_id` | INTEGER | PK, FK → `instruments.instrument_id` cascade |
+| `conid` | INTEGER | UNIQUE, CHECK `> 0` |
+| `symbol` | TEXT | |
+| `currency` | TEXT | |
+| `underlying` | TEXT | CHECK `length > 0` |
+| `contract_multiplier` | TEXT | |
+| `expiry_date` | TEXT | |
+| `strike` | TEXT | |
+| `option_right` | TEXT | CHECK IN (`'call'`, `'put'`) |
+
+- INDEX `ix_option_instruments_symbol_currency` `(symbol, currency)`
+- INDEX `ix_option_instruments_currency` `(currency)`
 
 ## Ingested statement data
 
@@ -142,6 +162,15 @@ ever compares `instrument_id`.
 - INDEX `ix_trades_trade_date` `(trade_date)`
 - INDEX `ix_trades_account_date` `(account_id, trade_date)`
 - INDEX `ix_trades_statement` `(source_statement_hash)`
+
+### `option_exercise_links`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `option_trade_id` | INTEGER | PK, FK → `trades.trade_id` cascade |
+| `share_trade_id` | INTEGER | UNIQUE, FK → `trades.trade_id` cascade |
+
+- CHECK `(option_trade_id <> share_trade_id)`
 
 ### `dividends`
 
@@ -279,6 +308,65 @@ ever compares `instrument_id`.
 - CHECK `(open_date <= close_date)`
 - INDEX `ix_future_realisations_run` `(run_id, close_date)`
 
+### `option_grants`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `run_id` | INTEGER | FK → `tax_runs.run_id` cascade |
+| `grant_trade_id` | INTEGER | |
+| `instrument_id` | INTEGER | FK → `instruments.instrument_id` |
+| `grant_date` | TEXT | |
+| `quantity` | TEXT | |
+| `premium_native` | TEXT | |
+| `grant_fee_native` | TEXT | |
+| `grant_fx_rate` | TEXT | |
+| `proceeds_gbp` | TEXT | |
+| `grant_fee_gbp` | TEXT | |
+
+- PK `(run_id, grant_trade_id)`
+- INDEX `ix_option_grants_run` `(run_id, grant_date)`
+
+### `option_grant_closes`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `run_id` | INTEGER | |
+| `grant_trade_id` | INTEGER | |
+| `close_trade_id` | INTEGER | |
+| `kind` | TEXT | CHECK IN (`'purchase'`, `'lapse'`, `'assignment'`, `'cash_settlement'`) |
+| `close_date` | TEXT | |
+| `quantity` | TEXT | |
+| `premium_native` | TEXT | |
+| `fee_native` | TEXT | |
+| `fx_rate` | TEXT | |
+| `cost_gbp` | TEXT | |
+| `seq` | INTEGER | CHECK `>= 0` |
+
+- PK `(run_id, grant_trade_id, close_trade_id)`
+- FK `(run_id, grant_trade_id)` → `option_grants.(run_id, grant_trade_id)` cascade
+- CHECK `(grant_trade_id <> close_trade_id)`
+
+### `option_exercise_transfers`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `run_id` | INTEGER | FK → `tax_runs.run_id` cascade |
+| `option_trade_id` | INTEGER | |
+| `share_trade_id` | INTEGER | |
+| `instrument_id` | INTEGER | FK → `instruments.instrument_id` |
+| `side` | TEXT | CHECK IN (`'LONG'`, `'SHORT'`) |
+| `grant_trade_id` | INTEGER | null |
+| `on_date` | TEXT | |
+| `quantity` | TEXT | |
+| `amount_gbp` | TEXT | |
+| `fees_gbp` | TEXT | |
+| `seq` | INTEGER | CHECK `>= 0` |
+
+- PK `(run_id, option_trade_id, seq)`
+- CHECK `(option_trade_id <> share_trade_id)`
+- CHECK `(grant_trade_id IS NULL) = (side = 'LONG')`
+- INDEX `ix_option_exercise_transfers_run` `(run_id, on_date)`
+
 ### `fx_event_sources`
 
 | Column | Type | Constraints |
@@ -308,7 +396,7 @@ ever compares `instrument_id`.
 |---|---|---|
 | `run_id` | INTEGER | FK → `tax_runs.run_id` cascade |
 | `seq` | INTEGER | CHECK `>= 0` |
-| `kind` | TEXT | CHECK IN (`'position_mismatch'`, `'rate_not_found'`, `'inconsistent_trades'`, `'engine_failure'`, `'open_short_position'`, `'fx_residual'`, `'history_incomplete'`, `'history_no_lookahead'`, `'empty_year'`) |
+| `kind` | TEXT | CHECK IN (`'position_mismatch'`, `'rate_not_found'`, `'inconsistent_trades'`, `'engine_failure'`, `'open_short_position'`, `'fx_residual'`, `'history_incomplete'`, `'history_no_lookahead'`, `'empty_year'`, `'option_grant_restated'`, `'option_exercise_unlinked'`) |
 | `instrument_id` | INTEGER | null, FK → `instruments.instrument_id` |
 | `message` | TEXT | |
 
@@ -326,8 +414,10 @@ ever compares `instrument_id`.
 
 ## Views
 
-- `v_instruments` — `UNION ALL` of the four `*_instruments` children joined
+- `v_instruments` — `UNION ALL` of the five `*_instruments` children joined
   to `instruments`; columns `instrument_id`, `asset_class`, `isin` (bonds
-  only), `conid` (stocks and futures only), `symbol`, `currency`,
-  `is_cgt_exempt`, `contract_multiplier`, `expiry_date`, `fx_base`,
-  `fx_quote` (class-specific columns are NULL for the other classes).
+  only), `conid` (stocks, futures and options), `symbol`, `currency`,
+  `is_cgt_exempt`, `contract_multiplier` and `expiry_date` (futures and
+  options), `fx_base`, `fx_quote`, and the option-only `underlying`,
+  `strike`, `option_right` (class-specific columns are NULL for the other
+  classes).

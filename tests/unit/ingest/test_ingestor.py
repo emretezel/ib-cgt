@@ -419,15 +419,17 @@ def test_ingest_records_statement_time_zone(db: sqlite3.Connection) -> None:
 def test_ingest_persists_open_positions_and_cash_events(db: sqlite3.Connection) -> None:
     """Positions and cash events land in their tables; the unresolved row is reported.
 
-    The fixture lists six positions, one of which (`CBK6`) has no
+    The fixture lists seven positions, one of which (`CBK6`) has no
     instrument-information row and no prior contract in the DB, so it
-    is reported rather than stored. The eight non-coupon, non-internal
-    cash rows become cash events; the coupon goes to `bond_coupons`.
+    is reported rather than stored; the held option series resolves
+    through the options-shaped instrument table. The eight non-coupon,
+    non-internal cash rows become cash events; the coupon goes to
+    `bond_coupons`.
     """
     result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
 
-    assert result.position_count == 5
-    assert result.positions_inserted == 5
+    assert result.position_count == 6
+    assert result.positions_inserted == 6
     assert result.unresolved_position_symbols == ("CBK6",)
     assert result.cash_event_count == 8
     assert result.cash_events_inserted == 8
@@ -439,6 +441,7 @@ def test_ingest_persists_open_positions_and_cash_events(db: sqlite3.Connection) 
         ("IEAA", "3652"),
         ("IEMI", "100"),
         ("TSLA", "-40"),
+        ("TUR 17MAY26 22.0 P", "5"),
         ("UKT 0 3/8 10/22/26", "310000"),
         ("6LK6", "6"),
     ]
@@ -472,7 +475,7 @@ def test_leftover_future_position_resolves_against_known_contract(
 
     result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
 
-    assert result.position_count == 6
+    assert result.position_count == 7
     assert result.unresolved_position_symbols == ()
     positions = StatementPositionRepo(db).for_statement(result.statement_hash)
     cbk6_rows = [p for _iid, p in positions if p.instrument.symbol == "CBK6"]
@@ -495,7 +498,7 @@ def test_ambiguous_leftover_future_position_stays_unresolved(db: sqlite3.Connect
             )
         )
     result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
-    assert result.position_count == 5
+    assert result.position_count == 6
     assert result.unresolved_position_symbols == ("CBK6",)
 
 

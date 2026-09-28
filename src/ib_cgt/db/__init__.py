@@ -10,8 +10,8 @@ This package is step 3 of the twelve-step implementation order in
 * `codecs` — small, explicit helpers for Decimal / date / datetime / Money
   round-trips so repo code never reaches for sqlite3's adapter magic.
 * `repos/` — one repository class per aggregate (accounts, instruments,
-  trades, fx_rates, statements, tax_runs). Each takes a connection and
-  exposes intention-revealing methods; no ORM.
+  trades, fx_rates, statements, tax_runs, option grants and exercises).
+  Each takes a connection and exposes intention-revealing methods; no ORM.
 
 Downstream components (ingest, fx, rules, calculator, report) should
 import repositories from here rather than issuing SQL directly.
@@ -31,6 +31,8 @@ from ib_cgt.db.repos.future_realisations import FutureRealisationRepo
 from ib_cgt.db.repos.fx_event_sources import FXEventSourceRepo
 from ib_cgt.db.repos.fx_rates import FXRate, FXRateRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
+from ib_cgt.db.repos.option_exercises import OptionExerciseLinkRepo, OptionExerciseTransferRepo
+from ib_cgt.db.repos.option_grants import OptionGrantRepo
 from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo, StatementRow
 from ib_cgt.db.repos.tax_run_issues import TaxRunIssueRepo
@@ -48,6 +50,9 @@ __all__ = [
     "FutureRealisationRepo",
     "InstrumentRepo",
     "MatchedDisposalRepo",
+    "OptionExerciseLinkRepo",
+    "OptionExerciseTransferRepo",
+    "OptionGrantRepo",
     "StatementPositionRepo",
     "StatementRepo",
     "StatementRow",

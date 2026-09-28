@@ -8,12 +8,12 @@ settling in the contract's native currency, stock proceeds settling
 in the listing currency).
 
 This module is the projector layer: pure, stateless functions that
-turn each non-Forex source — non-GBP stock and bond trades, non-GBP
-futures trade fees, futures realised P&L, dividends, bond coupons,
-and instrument-less cash events — into the same `Acquisition` /
-`Disposal` shapes the FX engine already feeds into the shared
-`MatchingEngine`. The forex-trade projector also lives here so every
-projection rule sits in one file.
+turn each non-Forex source — non-GBP stock, bond and option trades,
+non-GBP futures trade fees, futures realised P&L, dividends, bond
+coupons, and instrument-less cash events — into the same
+`Acquisition` / `Disposal` shapes the FX engine already feeds into the
+shared `MatchingEngine`. The forex-trade projector also lives here so
+every projection rule sits in one file.
 
 Each helper:
 
@@ -65,6 +65,7 @@ from ib_cgt.domain import (
     FutureRealisation,
     FXInstrument,
     Money,
+    OptionInstrument,
     StockInstrument,
     Trade,
     TradeAction,
@@ -705,3 +706,89 @@ def _money_to_gbp(amount: Money, fx: FXConverter, on_date: date) -> Money:
         return amount
     gbp, _rate = fx.convert_with_rate(amount, target="GBP", on=on_date)
     return gbp
+
+
+# ---------------------------------------------------------------------------
+# Option trades — premiums, commissions and settlements in the series' currency
+# ---------------------------------------------------------------------------
+
+# The option actions whose premium is cash *received*: selling to close
+# a bought option, a lapse or exercise of one (nothing or the cash
+# settlement comes in), and writing an option. Every other option action
+# pays the premium out. Commissions are always paid.
+_OPTION_INFLOW_ACTIONS: Final[frozenset[TradeAction]] = frozenset(
+    {
+        TradeAction.CLOSE_LONG,
+        TradeAction.LAPSE_LONG,
+        TradeAction.EXERCISE_LONG,
+        TradeAction.OPEN_SHORT,
+    }
+)
+
+
+def from_option_trade(
+    trade_id: int,
+    trade: Trade,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | Disposal | None:
+    """Project a non-GBP option trade's cash leg into an FX-pool event.
+
+    The cash an option row moves is `price x multiplier x quantity`,
+    received on a sale to close, a grant or a cash settlement, paid on a
+    purchase to open or a closing purchase, plus the commission, which
+    is always paid. The net is posted to the cent, as IB's ledger does:
+    a positive net brings currency into the pool (an **acquisition**),
+    a negative one takes it out (a **disposal**), and a lapse with no
+    fee moves nothing. A linked exercise prints at price 0, so only its
+    fee moves here — the shares' cash is the stock projection's.
+
+    `fees_gbp` on the projected event is zero, as for stock trades: the
+    commission belongs to the option engine's audit, not the pool's.
+    Returns `None` for GBP-denominated series, series in another
+    currency, or a row that moves no cash.
+    """
+    if not isinstance(trade.instrument, OptionInstrument):
+        raise WrongAssetClassError(
+            engine_name="FXRuleEngine",
+            instrument_class=type(trade.instrument).__name__,
+        )
+    if trade.action in (TradeAction.BUY, TradeAction.SELL):
+        raise InconsistentTradeError(
+            instrument_symbol=trade.instrument.symbol,
+            trade_id=trade_id,
+            detail=f"action {trade.action.value!r} is not valid for an option trade",
+        )
+
+    native_ccy = trade.instrument.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    premium = trade.price.amount * trade.instrument.contract_multiplier * trade.quantity
+    signed_premium = premium if trade.action in _OPTION_INFLOW_ACTIONS else -premium
+    net = _cash(signed_premium - trade.fees.amount)
+    if net == 0:
+        return None
+
+    magnitude = abs(net)
+    gbp_value = _to_gbp(magnitude, native_ccy, fx, trade.trade_date)
+    if net > 0:
+        return Acquisition(
+            trade_id=trade_id,
+            account_id=trade.account_id,
+            instrument=pool_instrument,
+            acquisition_date=trade.trade_date,
+            quantity=magnitude,
+            cost_gbp=gbp_value,
+            fees_gbp=Money.gbp(Decimal(0)),
+        )
+    return Disposal(
+        trade_id=trade_id,
+        account_id=trade.account_id,
+        instrument=pool_instrument,
+        disposal_date=trade.trade_date,
+        quantity=magnitude,
+        proceeds_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )

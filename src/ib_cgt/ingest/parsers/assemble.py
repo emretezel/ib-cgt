@@ -10,7 +10,6 @@ every file format:
   and `Comm in GBP` are both the fee column);
 * the asset-class / currency sub-header state machine, and the
   legacy custodian suffix stripped from asset labels;
-* the asset classes dropped at parse time (stock options);
 * which rows are aggregates (a blank date cell) and which rows are
   malformed enough to fail loudly (a data row before any header);
 * the fixed emit order per section family, which fixes the
@@ -108,6 +107,13 @@ _INSTRUMENT_SPEC: Final = _SectionSpec(
         "Security ID": "security_id",
         "Maturity": "maturity",
         "Issuer": "issuer",
+        # Options-shaped table: the series' underlying, its right
+        # (`Type` is `C` / `P` there; the stocks table prints `ETF` /
+        # `COMMON` in the same column) and its strike. Futures tables
+        # print `Underlying` too; `Strike` is options-only.
+        "Underlying": "underlying",
+        "Type": "type",
+        "Strike": "strike",
     },
     required=frozenset({"symbol", "description"}),
     needs_asset_class=True,
@@ -166,15 +172,6 @@ _SPECS: Final[Mapping[SectionKind, _SectionSpec]] = {
     SectionKind.FEES: _DATED_SPEC,
     SectionKind.OPEN_POSITIONS: _POSITION_SPEC,
 }
-
-# Asset-class section labels dropped at parse time. Stock options
-# arrive under "Equity and Index Options" — this project does not
-# handle them, and accepting the rows would let OCC-formatted option
-# symbols (`TUR 17MAY19 22.0 P`) flow into the stocks pipeline. The
-# filter applies to every section that carries an asset header, so
-# neither the trades nor the instrument-information leg of an options
-# block can leak through.
-_IGNORED_ASSET_CLASSES: Final[frozenset[str]] = frozenset({"Equity and Index Options"})
 
 # The dividend-shaped and cash-shaped sections, in the order their rows
 # are emitted. Emit order fixes the per-statement row index the
@@ -321,11 +318,11 @@ def _classify_data_row(
 
     Skipped: spacer rows (fewer than two non-blank cells), rows too
     short to carry every required column (aggregate rows printed with
-    fewer cells and no total class), rows whose marker cell is blank
-    (aggregates IB prints as ordinary rows), and rows of an ignored
-    asset class. Raised: a real row — marker populated — that arrived
-    before any resolvable header or outside the sub-header block the
-    section needs, which is an adapter fault rather than a quirk.
+    fewer cells and no total class), and rows whose marker cell is
+    blank (aggregates IB prints as ordinary rows). Raised: a real row —
+    marker populated — that arrived before any resolvable header or
+    outside the sub-header block the section needs, which is an adapter
+    fault rather than a quirk.
     """
     if sum(1 for cell in row.cells if cell.strip()) < 2:
         return None
@@ -348,8 +345,6 @@ def _classify_data_row(
         raise StatementParseError(
             f"{section.value}: data row outside any asset-class / currency block: {row.cells[:3]}"
         )
-    if spec.needs_asset_class and asset_class in _IGNORED_ASSET_CLASSES:
-        return None
     return data
 
 
@@ -420,6 +415,9 @@ def _instrument_row(row: _DataRow) -> RawInstrumentInfo:
         maturity_text=row.optional("maturity"),
         issuer_text=row.optional("issuer"),
         conid_text=row.optional("conid"),
+        underlying=row.optional("underlying"),
+        type_text=row.optional("type"),
+        strike_text=row.optional("strike"),
     )
 
 

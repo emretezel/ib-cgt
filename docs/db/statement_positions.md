@@ -14,11 +14,12 @@ bought before the earliest statement, a missing statement in
 between). See `docs/rules.md` §Open positions and residuals for how
 the reconciliation is used and why it is done per taxpayer.
 
-Only stocks, bonds and futures are stored. IB reports currency
-balances in a separate section and the FX pools are deliberately
-never reconciled (the earliest statement is the origin of every
-pool). Equity-option positions are dropped at parse time like their
-trades.
+Stocks, bonds, futures and — since migration `023` — option series
+are stored. IB reports currency balances in a separate section and
+the FX pools are deliberately never reconciled (the earliest statement
+is the origin of every pool). The live history holds two option
+positions: the XSP put open at the end of 2013 and the fifteen TUR
+puts open on the 2019 statement that exercised them.
 
 The `account_id` is **not** a column: it is the statement's account,
 reachable through `statements.account_id`, and repeating it here would
@@ -31,7 +32,7 @@ duplicate that fact (AGENTS.md §3, single source of truth).
 |---|---|---|---|
 | `statement_hash` | `TEXT` | No (PK, FK) | The statement whose Open Positions section the row came from. |
 | `statement_row_index` | `INTEGER` | No (PK) | Zero-based offset within the statement's position stream (parser emit order across the section's sub-tables). Independent of every other table's row-index space. |
-| `instrument_id` | `INTEGER` | No (FK) | The held instrument, resolved to the same `instruments` row the trades use — a stock or a futures contract by its IB `conid`, a bond by ISIN (all through the statement's Financial Instrument Information section; a held-over row with no such section falls back to a `(symbol, currency)` lookup against the instruments already stored). |
+| `instrument_id` | `INTEGER` | No (FK) | The held instrument, resolved to the same `instruments` row the trades use — a stock, a futures contract or an option series by its IB `conid`, a bond by ISIN (all through the statement's Financial Instrument Information section; a held-over row with no such section falls back to a `(symbol, currency)` lookup against the instruments already stored). |
 | `quantity` | `TEXT` | No | Signed Decimal string in the trades' unit (shares, contracts, bond face units). Negative = short. Never zero: a flat instrument has no row, and the mapper skips the zero lines IB prints for a contract closed on the period's last day. |
 
 See [`index.md`](./index.md#encoding-conventions) for decimal
@@ -100,40 +101,42 @@ None.
 
 - `ib-cgt ingest PATH` — the only producer. The summary line prints
   `N open positions`; a yellow note lists any skipped symbols.
-- `ib-cgt check all` / `check stocks` / `check futures` — check **C7**
-  reconciles every stock, bond and futures position against these
-  rows (ERROR severity).
+- `ib-cgt check all` / `check stocks` / `check futures` /
+  `check options` — check **C7** reconciles every stock, bond, futures
+  and option position against these rows (ERROR severity).
 - `ib-cgt db reset` — clears the table (statement cascade).
 
 ## Sample (first 5 rows)
 
 Captured via the Python `sqlite3` module in `-line` style after the
-first full re-ingest following migration 016 (the system `sqlite3`
-binary predates STRICT tables).
+full re-ingest following migration 023 (`SELECT * FROM
+statement_positions LIMIT 5`, no ordering; the system `sqlite3` binary
+predates STRICT tables). The first three rows are the 2012 statement's
+year-end holdings, the next two the 2013 statement's.
 
 ```
-     statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
+     statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5a3f4b32a
 statement_row_index = 0
-      instrument_id = 42
-           quantity = 200
-
-     statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-statement_row_index = 1
-      instrument_id = 80
-           quantity = 150
-
-     statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-statement_row_index = 2
-      instrument_id = 32
-           quantity = 400
-
-     statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-statement_row_index = 3
-      instrument_id = 33
+      instrument_id = 2
            quantity = 100
 
-     statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-statement_row_index = 4
-      instrument_id = 18
+     statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5a3f4b32a
+statement_row_index = 1
+      instrument_id = 3
+           quantity = 100
+
+     statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5a3f4b32a
+statement_row_index = 2
+      instrument_id = 4
            quantity = 300
+
+     statement_hash = de13d221ab88ed18d4a0389fc7d2db6d18eb65f506f20164a70e9a462821b23b
+statement_row_index = 0
+      instrument_id = 26
+           quantity = 65
+
+     statement_hash = de13d221ab88ed18d4a0389fc7d2db6d18eb65f506f20164a70e9a462821b23b
+statement_row_index = 1
+      instrument_id = 28
+           quantity = 620
 ```

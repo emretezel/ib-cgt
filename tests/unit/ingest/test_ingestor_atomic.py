@@ -100,4 +100,4 @@ def test_failure_in_the_last_step_rolls_back_cash_events_and_positions(
     monkeypatch.undo()
     result = ingest_statement(fixture, db)
     assert result.cash_events_inserted == 8
-    assert result.positions_inserted == 5
+    assert result.positions_inserted == 6

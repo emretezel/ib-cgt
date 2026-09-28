@@ -23,6 +23,7 @@ from ib_cgt.domain import (
     FutureInstrument,
     FXInstrument,
     Money,
+    OptionInstrument,
     RunIssue,
     StockInstrument,
 )
@@ -33,6 +34,7 @@ from ib_cgt.report.model import (
     DirectBasis,
     DisposalComputation,
     EventRef,
+    GrantBasis,
     LineBasis,
     Sa108Figures,
     Sa108Report,
@@ -173,6 +175,27 @@ def _basis(basis: LineBasis) -> dict[str, JsonValue]:
             "open_fx_rate": _decimal(basis.open_fx_rate),
             "close_fx_rate": _decimal(basis.close_fx_rate),
         }
+    if isinstance(basis, GrantBasis):
+        return {
+            "kind": "grant",
+            "premium_native": _native(basis.premium_native),
+            "grant_fee_native": _native(basis.grant_fee_native),
+            "grant_fx_rate": _decimal(basis.grant_fx_rate),
+            "granted_quantity": _decimal(basis.granted_quantity),
+            "chargeable_quantity": _decimal(basis.chargeable_quantity),
+            "closes": [
+                {
+                    "close": _event(close.close),
+                    "kind": close.kind.value,
+                    "quantity": _decimal(close.quantity),
+                    "premium_native": _native(close.premium_native),
+                    "fee_native": _native(close.fee_native),
+                    "fx_rate": _decimal(close.fx_rate),
+                    "cost_gbp": _money(close.cost_gbp),
+                }
+                for close in basis.closes
+            ],
+        }
     return {
         "kind": "pool",
         "match_rule": basis.rule.value,
@@ -216,6 +239,13 @@ def _instrument(instrument: AnyInstrument) -> dict[str, JsonValue]:
             "base": instrument.currency_pair.base,
             "quote": instrument.currency_pair.quote,
         }
+    elif isinstance(instrument, OptionInstrument):
+        payload["conid"] = instrument.conid
+        payload["underlying"] = instrument.underlying
+        payload["contract_multiplier"] = _decimal(instrument.contract_multiplier)
+        payload["expiry_date"] = _date(instrument.expiry_date)
+        payload["strike"] = _decimal(instrument.strike)
+        payload["right"] = instrument.right.value
     return payload
 
 

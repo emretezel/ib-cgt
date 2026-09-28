@@ -36,7 +36,7 @@ def test_ingest_reports_positions_cash_events_and_unresolved_symbols(
     assert result.exit_code == 0, result.stdout
     assert "Imported" in result.stdout
     assert "8 new / 8 cash events" in result.stdout
-    assert "5 open positions" in result.stdout
+    assert "6 open positions" in result.stdout
     assert "1 new / 1 bond coupon" in result.stdout
     assert "Skipped 1 open position(s) with no resolvable instrument: CBK6" in result.stdout
 

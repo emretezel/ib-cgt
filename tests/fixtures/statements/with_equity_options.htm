@@ -11,9 +11,11 @@
 </div>
 
 <!-- Trades section: includes a Stocks block, an "Equity and Index
-     Options" block, and a Forex block. The options rows must be
-     dropped by `_IGNORED_ASSET_CLASSES`; the surrounding stock and
-     forex rows must survive intact. -->
+     Options" block, and a Forex block. The option row is the exercise
+     of 15 TUR puts (`C;Ex`, price 0) and the stock row is the share
+     sale IB booked for it at the strike (`Ex;O`, 1,500 at 22) — the
+     shape of the real 2019 statement, so the mapper and the exercise
+     linker can be tested on it. -->
 <div id="tblTransactions_U9999997Body">
 <table id="summaryDetailTable">
 <thead>
@@ -53,7 +55,7 @@
 </tr>
 </tbody>
 
-<!-- EQUITY AND INDEX OPTIONS — must be dropped -->
+<!-- EQUITY AND INDEX OPTIONS — the exercised put -->
 <tbody><tr><td class="header-asset" colspan="12">Equity and Index Options</td></tr></tbody>
 <tbody><tr><td class="header-currency" colspan="12">USD</td></tr></tbody>
 <tbody>
@@ -95,9 +97,9 @@
 </table>
 </div>
 
-<!-- Financial Instrument Information — should contain only stock/future
-     metadata after the parser filter; the Equity and Index Options
-     block in this section must also be dropped. -->
+<!-- Financial Instrument Information — an older vintage without the
+     `Type` / `Strike` columns: the option mapper falls back to the
+     series key parsed from the symbol / description. -->
 <div id="tblContractInfoU9999997Body">
 <table>
 <thead>

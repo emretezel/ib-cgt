@@ -42,6 +42,7 @@ from ib_cgt.db.repos.bond_coupons import BondCouponRepo
 from ib_cgt.db.repos.cash_events import CashEventRepo
 from ib_cgt.db.repos.dividends import DividendRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
+from ib_cgt.db.repos.option_exercises import OptionExerciseLinkRepo
 from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
@@ -56,7 +57,8 @@ from ib_cgt.ingest.corporate_actions import (
 from ib_cgt.ingest.coverage import Coverage
 from ib_cgt.ingest.dividends import map_dividends
 from ib_cgt.ingest.hashing import compute_statement_hash
-from ib_cgt.ingest.mapper import map_rows
+from ib_cgt.ingest.mapper import OPTION_LABELS, map_rows
+from ib_cgt.ingest.option_exercises import ExerciseLink, map_option_exercise_links
 from ib_cgt.ingest.parsers import StatementFormat, parser_for
 from ib_cgt.ingest.positions import map_open_positions
 from ib_cgt.ingest.raw import ParsedStatement, RawOpenPositionRow
@@ -109,6 +111,11 @@ class IngestResult:
             to no instrument — reported, never stored.
         cash_event_count: Instrument-less cash rows the mapper kept.
         cash_events_inserted: How many of those were new rows.
+        option_link_count: Exercised / assigned option rows paired with
+            the share trade IB booked for them (`option_exercise_links`).
+        unlinked_exercise_count: Exercised / assigned option rows with
+            no share trade at the strike beside them. The calculator
+            treats them as cash-settled (TCGA 1992 s.144A) and warns.
         covered_trade_count: Parsed trades skipped because an earlier
             statement of the account already owns their date.
         covered_dividend_count: Dividend rows skipped for the same reason.
@@ -150,6 +157,8 @@ class IngestResult:
     unresolved_position_symbols: tuple[str, ...] = ()
     cash_event_count: int = 0
     cash_events_inserted: int = 0
+    option_link_count: int = 0
+    unlinked_exercise_count: int = 0
     covered_trade_count: int = 0
     covered_dividend_count: int = 0
     covered_bond_coupon_count: int = 0
@@ -353,6 +362,12 @@ def ingest_parsed(
     )
     trades = regular_trades + merger_trades + maturity_trades
 
+    # Exercised / assigned options and the share trade IB booked for
+    # each (TCGA 1992 s.144(2)-(3) treats the two as one transaction).
+    # Found on the mapped trades, as positions in `trades`; the ids
+    # they become are only known after the insert below.
+    exercise_links, unlinked_exercises = map_option_exercise_links(trades)
+
     # Dividends / WHT / payment-in-lieu — independent event stream from
     # trades. They feed the FX rule engine via the per-currency S.104
     # pool (HMRC CG78315) but are not themselves CGT events and so live
@@ -442,6 +457,12 @@ def ingest_parsed(
             time_zone=parsed.time_zone,
         )
         inserted = trade_repo.insert_indexed(kept_trades, source_statement_hash=statement_hash)
+        # The exercise links, now that the trades have ids. Both rows of
+        # a link share an instant, so the coverage rule keeps or skips
+        # them together; a link with either row skipped is dropped.
+        links_inserted = OptionExerciseLinkRepo(conn).insert_many(
+            _resolve_exercise_links(exercise_links, kept_trades, trade_repo, statement_hash)
+        )
         dividends_inserted = dividend_repo.insert_indexed(
             kept_dividends, source_statement_hash=statement_hash
         )
@@ -481,6 +502,8 @@ def ingest_parsed(
         unresolved_position_symbols=tuple(row.symbol for row in unresolved),
         cash_event_count=len(cash_events),
         cash_events_inserted=cash_events_inserted,
+        option_link_count=links_inserted,
+        unlinked_exercise_count=len(unlinked_exercises),
         covered_trade_count=len(trades) - len(kept_trades),
         covered_dividend_count=len(dividends) - len(kept_dividends),
         covered_bond_coupon_count=len(bond_coupons) - len(kept_coupons),
@@ -524,6 +547,32 @@ def _not_owned_elsewhere[T](
         (index, fact)
         for index, fact in enumerate(facts)
         if not coverage.owned_elsewhere(dated_by(fact))
+    ]
+
+
+def _resolve_exercise_links(
+    links: Sequence[ExerciseLink],
+    kept_trades: Sequence[tuple[int, Trade]],
+    trade_repo: TradeRepo,
+    statement_hash: str,
+) -> list[tuple[int, int]]:
+    """Turn position-based exercise links into `(option_trade_id, share_trade_id)` pairs.
+
+    The positions are the `statement_row_index` values the trades were
+    just inserted under, so the ids come straight back from the
+    `(statement, row index)` identity. A link whose option or share row
+    the coverage rule skipped is dropped — the two share a date, so in
+    practice both survive or neither does.
+    """
+    kept = {index for index, _trade in kept_trades}
+    wanted = {
+        index for link in links for index in (link.option_index, link.share_index) if index in kept
+    }
+    ids = trade_repo.ids_for_rows(statement_hash, wanted)
+    return [
+        (ids[link.option_index], ids[link.share_index])
+        for link in links
+        if link.option_index in ids and link.share_index in ids
     ]
 
 
@@ -591,13 +640,13 @@ def _resolve_leftover_positions(
 
 
 # Open Positions section labels → the asset class whose child table a
-# leftover row is resolved against. Options never reach here (the
-# parser drops them) and FX has no positions section.
+# leftover row is resolved against. FX has no positions section.
 _POSITION_ASSET_CLASSES: Final[dict[str, AssetClass]] = {
     "Stocks": AssetClass.STOCK,
     "Bonds": AssetClass.BOND,
     "Corporate and Municipal Bonds": AssetClass.BOND,
     "Futures": AssetClass.FUTURE,
+    **dict.fromkeys(OPTION_LABELS, AssetClass.OPTION),
 }
 
 

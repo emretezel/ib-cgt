@@ -29,12 +29,18 @@ outputs.
 | Stocks, ETFs | Listed shares and securities | 23 / 24 / 25 / 26 / 27 |
 | Bonds that are not CGT-exempt | Listed shares and securities | 23 / 24 / 25 / 26 / 27 |
 | Futures close-outs (TCGA 1992 s.143) | Other property, assets and gains | 14 / 15 / 16 / 17 / 19 |
+| Options (TCGA 1992 s.144 / s.148): grants of written options, disposals of bought options | Other property, assets and gains | 14 / 15 / 16 / 17 / 19 |
 | Foreign-currency pools (CG78315) | Other property, assets and gains | 14 / 15 / 16 / 17 / 19 |
 
 Exempt gilts and qualifying corporate bonds are never persisted by
 `compute` and never appear. IB's bonds are exchange-listed, which is
 why non-exempt bonds sit with listed shares; an unlisted bond would
-belong in "Other property" and would need its own classification.
+belong in "Other property" and would need its own classification. An
+option over listed shares is not itself a listed share, so options sit
+in "Other property" too; the share trade an exercised or assigned
+option produced is an ordinary stock disposal or acquisition in the
+listed-shares section, carrying the option's amount
+([`options.md`](./options.md)).
 
 Both sections always print, with zeros when empty, so every box the
 form has can be copied. The report also prints the year totals across
@@ -64,15 +70,15 @@ summary table prints.
 Every line carries the letters of the working sheet on page CGN 15 of
 the SA108 notes:
 
-| Letter | Meaning | Share-matched line (stock, bond, currency) | Futures close-out |
-|---|---|---|---|
-| A | Disposal proceeds, gross | `matched_proceeds_gbp + matched_disposal_fees_gbp` | `max(proceeds_gbp, 0)` |
-| B | Incidental costs of disposal | `matched_disposal_fees_gbp` | 0 |
-| C | Net proceeds | A − B (= the engine's net proceeds) | A |
-| D | Cost | `matched_cost_gbp − matched_acquisition_fees_gbp` | `max(−proceeds_gbp, 0)` — the payment on a losing close-out |
-| E | Incidental costs of acquisition | `matched_acquisition_fees_gbp` | `cost_gbp` — both commissions |
-| G | Allowable costs | D + E (= the engine's cost) | D + E |
-| H | Gain or loss | C − G | C − G |
+| Letter | Meaning | Share-matched line (stock, bond, bought option, currency) | Futures close-out | Grant of a written option |
+|---|---|---|---|---|
+| A | Disposal proceeds, gross | `matched_proceeds_gbp + matched_disposal_fees_gbp` | `max(proceeds_gbp, 0)` | the gross premium at the grant-date spot, for the contracts still charged on the grant (`chargeable_proceeds_gbp`) |
+| B | Incidental costs of disposal | `matched_disposal_fees_gbp` | 0 | the grant commission's share plus every closing purchase and cash settlement (`incidental_costs_gbp`, s.148(3) / s.144A) |
+| C | Net proceeds | A − B (= the engine's net proceeds) | A | A − B |
+| D | Cost | `matched_cost_gbp − matched_acquisition_fees_gbp` | `max(−proceeds_gbp, 0)` — the payment on a losing close-out | 0 — the writer never acquired the option |
+| E | Incidental costs of acquisition | `matched_acquisition_fees_gbp` | `cost_gbp` — both commissions | 0 |
+| G | Allowable costs | D + E (= the engine's cost) | D + E | 0 |
+| H | Gain or loss | C − G | C − G | C (= `OptionGrant.gain_gbp`) |
 
 The engines carry proceeds *net* of the sale fee and cost *inclusive*
 of the purchase fee, with each fee stored as its own fact
@@ -98,6 +104,22 @@ Three consequences worth knowing:
   The persisted `proceeds_gbp` is the signed net cashflow of the
   close-out (s.143(5)); the form's boxes are non-negative, so a loss
   is reported as D with A = 0. H is unchanged either way.
+- **A written option's grant is a disposal with no acquisition.** The
+  line's disposal event is the grant trade itself, dated on the grant
+  date; a closing purchase in a later year appears in B of *this*
+  year's line (the grant is restated, not the later year), which is
+  why the grant line spells out every later event. Contracts later
+  assigned have left the grant for the share trade and are not in A;
+  a grant fully assigned is not a disposal of the year at all.
+- **A share trade an option produced explains itself.** The
+  `OptionExerciseTransfer` folded into it shows as a note on the
+  trade's description — `s.144: option #313 exercised, 2,208.92 GBP
+  cost of disposal` (or `added to cost`, `added to proceeds`,
+  `deducted from cost`) — so the stock line's B or D is seen to
+  differ from price × quantity for a reason. The description is
+  printed in the disposal header's **Disposal detail** row (one
+  `label: description` per disposal event) and in the acquisition
+  column when the share trade is the acquisition side.
 
 Money is carried unrounded through the model; the console and
 Markdown renderers show pennies, JSON and CSV carry full precision. A
@@ -126,17 +148,28 @@ it — so the report never does.
 
 One block per disposal, numbered through the report, ordered section
 → asset class → date → symbol. The header is the working sheet's
-"description of asset" plus the disposal's A, B, C, G and H; the
-lines beneath show, per identification:
+"description of asset", the disposal events (label and account) and
+their descriptions (the **Disposal detail** row), plus the disposal's
+A, B, C, G and H; the lines beneath show, per identification:
 
 - the disposal event and the rule (`same-day (s.105(1)(b))`, `30-day
   (s.106A)`, `S.104 holding`, `later acquisition (s.105(2))`,
-  `close-out (s.143)`);
+  `close-out (s.143)`, `grant of option (s.144(1))`);
 - the acquisition — trade label, date and description for a direct
   match; the holding's units, cost and average cost for a pool draw;
   the open trade, side, gross P&L, commissions and both FX rates for
   a close-out;
 - D, E, G, A, B, C and H.
+
+A written option's disposal gets its own table instead of the share
+columns: `# | Grant | Written | Charged here | Premium | Grant fee |
+FX grant | Later events | A Proceeds | B Incidental costs | C Net
+proceeds | H Gain/(loss)`, where *Later events* lists every close on
+the grant with its kind and statutory hook (`closing purchase (s.148)
+#6 on 2012-11-01: 1.00 for 142.45 USD`, `lapsed`, `assigned
+(s.144(2))`, `cash-settled (s.144A)`) or `none — still open`. A day
+with both bought-option disposals and a grant of the same series
+prints both tables.
 
 Every event is cited in the notation of [`audit.md`](./audit.md) —
 `#N` for a trade, `Div #N` / `WHT #N` / `Cpn #N` / `Cash #N` for the
@@ -153,8 +186,8 @@ refresh the run.
 |---|---|---|---|
 | `console` (default) | the terminal | summary + computations (rich tables) | looking up box values |
 | `markdown` | stdout or `--out` | the same page as Markdown | the document to keep and to print to PDF as the "computations" attached to the return |
-| `json` | stdout or `--out` | the full model: sections, boxes, totals, issues, every line and basis | scripts, golden tests, a future form-filler |
-| `csv` | stdout or `--out` | one row per computation line with the disposal's identity repeated | spreadsheet reconciliation |
+| `json` | stdout or `--out` | the full model: sections, boxes, totals, issues, every line and basis (`kind`: `direct`, `pool`, `close_out` or `grant` — the grant basis carries `premium_native`, `grant_fee_native`, `grant_fx_rate`, `granted_quantity`, `chargeable_quantity` and `closes[]`; an option instrument carries `underlying`, `strike`, `right`, `expiry_date`, `contract_multiplier`) | scripts, golden tests, a future form-filler |
+| `csv` | stdout or `--out` | one row per computation line with the disposal's identity repeated (a grant line has `acquisition_ref` = `grant` and the grant's terms and later events in `acquisition_description`) | spreadsheet reconciliation |
 
 `--out` alone picks the format from the suffix (`.md`, `.json`,
 `.csv`); `--summary-only` drops the computations (not available for

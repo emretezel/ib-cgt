@@ -31,6 +31,7 @@ from ib_cgt.report.document import (
 )
 from ib_cgt.report.labels import (
     asset_class_label,
+    close_kind_label,
     instrument_identifier,
     instrument_title,
     rule_label,
@@ -40,6 +41,7 @@ from ib_cgt.report.model import (
     ComputationLine,
     DirectBasis,
     DisposalComputation,
+    GrantBasis,
     PoolBasis,
     Sa108Figures,
     Sa108Report,
@@ -292,6 +294,11 @@ def _disposal_blocks(number: int, disposal: DisposalComputation) -> list[Block]:
         f"{ref.label}" + (f" ({ref.account_id})" if ref.account_id else "")
         for ref in disposal.disposal_refs
     )
+    # What each disposal event was, in the resolver's words. The
+    # acquisition column always says this for the other side; here it
+    # is where a share trade explains a cost or proceeds figure that is
+    # not price times quantity — the s.144 note of an option exercise.
+    detail = "; ".join(f"{ref.label}: {ref.description}" for ref in disposal.disposal_refs)
     header = KeyValues(
         items=(
             KeyValue(
@@ -305,6 +312,7 @@ def _disposal_blocks(number: int, disposal: DisposalComputation) -> list[Block]:
                 kind=ColumnKind.QUANTITY,
             ),
             KeyValue(key="Disposal events", value=events),
+            KeyValue(key="Disposal detail", value=detail),
             KeyValue(
                 key="A Disposal proceeds",
                 value=disposal.gross_proceeds_gbp,
@@ -326,21 +334,38 @@ def _disposal_blocks(number: int, disposal: DisposalComputation) -> list[Block]:
             KeyValue(key="H Gain or (loss)", value=disposal.gain_gbp, kind=ColumnKind.MONEY),
         )
     )
-    table = (
-        _futures_table(disposal.lines)
-        if disposal.asset_class is AssetClass.FUTURE
-        else _share_table(disposal.lines)
-    )
-    return [heading, header, table]
+    return [heading, header, *_line_tables(disposal)]
+
+
+def _line_tables(disposal: DisposalComputation) -> list[Table]:
+    """The table(s) a disposal's lines are laid out in.
+
+    Futures get the close-out columns; share-matched classes the
+    working-sheet columns. An option series can carry both a bought
+    option's share-matched lines and a written option's grant line on
+    one day, so options get one table per kind present.
+    """
+    if disposal.asset_class is AssetClass.FUTURE:
+        return [_futures_table(disposal.lines)]
+    if disposal.asset_class is AssetClass.OPTION:
+        share_lines = [line for line in disposal.lines if not isinstance(line.basis, GrantBasis)]
+        grant_lines = [line for line in disposal.lines if isinstance(line.basis, GrantBasis)]
+        tables: list[Table] = []
+        if share_lines:
+            tables.append(_share_table(share_lines))
+        if grant_lines:
+            tables.append(_grants_table(grant_lines))
+        return tables
+    return [_share_table(disposal.lines)]
 
 
 def _share_table(lines: Iterable[ComputationLine]) -> Table:
-    """The working-sheet columns for share-matched lines (stocks, bonds, currency)."""
+    """The working-sheet columns for share-matched lines (stocks, bonds, options, currency)."""
     rows: list[tuple[Cell, ...]] = []
     for index, line in enumerate(lines, start=1):
         basis = line.basis
-        if isinstance(basis, CloseOutBasis):
-            raise ValueError("a futures close-out cannot appear in a share-matched disposal")
+        if isinstance(basis, CloseOutBasis | GrantBasis):
+            raise ValueError("only share-matched lines belong in a share-matched table")
         rows.append(
             (
                 index,
@@ -392,6 +417,69 @@ def _acquisition_text(basis: DirectBasis | PoolBasis) -> str:
         f"{basis.total_cost_gbp_before.amount:,.2f} GBP, average "
         f"{basis.average_cost_gbp.amount:,.4f} GBP"
     )
+
+
+def _grants_table(lines: Iterable[ComputationLine]) -> Table:
+    """The columns for written options: the grant, its closes, then A/B/C/H.
+
+    No D or E — the writer never acquired the option. The closes
+    column spells out every later event on the grant with its kind
+    and statutory hook, so a closing purchase in a later year is seen
+    to reduce this year's grant.
+    """
+    rows: list[tuple[Cell, ...]] = []
+    for index, line in enumerate(lines, start=1):
+        basis = line.basis
+        if not isinstance(basis, GrantBasis):
+            raise ValueError("only grant lines belong in a grants table")
+        rows.append(
+            (
+                index,
+                line.disposal.label,
+                basis.granted_quantity,
+                line.matched_quantity,
+                basis.premium_native,
+                basis.grant_fee_native,
+                basis.grant_fx_rate,
+                _closes_text(basis),
+                line.gross_proceeds_gbp,
+                line.disposal_costs_gbp,
+                line.net_proceeds_gbp,
+                line.gain_gbp,
+            )
+        )
+    return Table(
+        columns=(
+            Column(header="#", kind=ColumnKind.INTEGER),
+            Column(header="Grant"),
+            Column(header="Written", kind=ColumnKind.QUANTITY),
+            Column(header="Charged here", kind=ColumnKind.QUANTITY),
+            Column(header="Premium", kind=ColumnKind.NATIVE),
+            Column(header="Grant fee", kind=ColumnKind.NATIVE),
+            Column(header="FX grant", kind=ColumnKind.RATE),
+            Column(header="Later events"),
+            Column(header="A Proceeds", kind=ColumnKind.MONEY),
+            Column(header="B Incidental costs", kind=ColumnKind.MONEY),
+            Column(header="C Net proceeds", kind=ColumnKind.MONEY),
+            Column(header="H Gain/(loss)", kind=ColumnKind.MONEY),
+        ),
+        rows=tuple(rows),
+    )
+
+
+def _closes_text(basis: GrantBasis) -> str:
+    """`closing purchase (s.148) #7 on 2012-11-01: 1 for 142.45 USD` per close, or `none`."""
+    if not basis.closes:
+        return "none — still open"
+    parts: list[str] = []
+    for close in basis.closes:
+        on = close.close.on.isoformat() if close.close.on is not None else "unknown date"
+        paid = close.premium_native + close.fee_native
+        parts.append(
+            f"{close_kind_label(close.kind)} {close.close.label} on {on}: "
+            f"{close.quantity:,.2f} for {paid.amount:,.2f} {paid.currency}"
+        )
+    return "; ".join(parts)
 
 
 def _futures_table(lines: Iterable[ComputationLine]) -> Table:

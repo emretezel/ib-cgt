@@ -25,6 +25,12 @@ The package contains:
   per TCGA 1992 s.143(5)-(6) (HMRC CG56079). Does *not* use `MatchingEngine`; futures emit a
   separate `FutureRealisation` shape because UK share-matching rules
   do not apply to them.
+* `OptionRuleEngine` — exchange-traded options per TCGA 1992 s.144 /
+  s.144A / s.148: bought options are pooled by series through
+  `MatchingEngine`; written options are a FIFO ledger of grants, each
+  a disposal on its grant date with every later close attached; an
+  exercise or assignment hands the stock engine an
+  `OptionExerciseTransfer` for the share trade it produced.
 
 Importers should pull names from this top-level surface rather than
 from the submodules directly, so the internal layout can evolve.
@@ -44,6 +50,7 @@ from ib_cgt.rules.errors import (
 from ib_cgt.rules.futures import FutureResult, FutureRuleEngine, FXConverter
 from ib_cgt.rules.fx import FXRuleEngine
 from ib_cgt.rules.matching import MatchingEngine, MatchingResult
+from ib_cgt.rules.options import OptionResult, OptionRuleEngine
 from ib_cgt.rules.stocks import StockRuleEngine
 
 __all__ = [
@@ -57,6 +64,8 @@ __all__ = [
     "InconsistentTradeError",
     "MatchingEngine",
     "MatchingResult",
+    "OptionResult",
+    "OptionRuleEngine",
     "RuleEngineError",
     "StockRuleEngine",
     "UnmatchedDisposalError",

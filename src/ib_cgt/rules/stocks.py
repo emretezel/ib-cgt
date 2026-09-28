@@ -32,6 +32,25 @@ to feed in trades for the instrument across **all** accounts. The
 engine does not filter or partition by `account_id` — it trusts
 the caller to assemble the cross-account history.
 
+Options exercised into shares (TCGA 1992 s.144(2)-(3))
+------------------------------------------------------
+
+A share trade IB booked at an option's strike is one transaction with
+the option. The option engine works out what the option contributes —
+an `OptionExerciseTransfer` per exercised or assigned option row —
+and this engine folds it into the share trade's projection:
+
+| option        | share trade | effect                                              |
+|---------------|-------------|-----------------------------------------------------|
+| holder, call  | BUY         | option cost added to the share cost                 |
+| holder, put   | SELL        | option cost is an incidental cost of the disposal   |
+| writer, call  | SELL        | premium added to the share proceeds                 |
+| writer, put   | BUY         | premium deducted from the share cost                |
+
+The grant fee (writer) and the option's commissions (holder) ride
+along as incidental costs, so the fee fields keep their subset
+semantics and the report's working sheet can show them under B / E.
+
 Author: Emre Tezel
 """
 
@@ -45,6 +64,7 @@ from ib_cgt.domain import (
     AssetClass,
     Disposal,
     Money,
+    OptionExerciseTransfer,
     StockInstrument,
     Trade,
     TradeAction,
@@ -88,6 +108,7 @@ class StockRuleEngine:
         trades: Sequence[tuple[int, Trade]],
         *,
         soft_residuals: bool = False,
+        transfers: Sequence[OptionExerciseTransfer] = (),
     ) -> MatchingResult:
         """Project trades into GBP and run the four-rule matcher.
 
@@ -110,6 +131,11 @@ class StockRuleEngine:
                 calculator's runner uses this so a still-open short
                 (confirmed against the statement's open positions)
                 is reported rather than treated as a failure.
+            transfers: What exercised or assigned options contribute to
+                share trades of this stock (TCGA 1992 s.144(2)-(3)),
+                from the option engine. Every transfer must name a
+                trade in `trades` with the action its option implies;
+                the runner passes the transfers for this stock only.
 
         Returns:
             `MatchingResult` with matched chunks (in (chronological,
@@ -122,7 +148,9 @@ class StockRuleEngine:
                 than `BUY` / `SELL` (`Trade.__post_init__` already
                 rejects `OPEN_*`/`CLOSE_*` for non-future
                 instruments, but the engine guards against in-memory
-                malformed `Trade` objects too).
+                malformed `Trade` objects too); or a transfer names a
+                trade that is not in the input or has the wrong
+                action for the option that produced it.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
                 (strict mode only) when a disposal still carries
                 residual quantity after every rule has had its turn (typically a
@@ -135,6 +163,8 @@ class StockRuleEngine:
                 instrument_class=type(instrument).__name__,
             )
 
+        by_share_trade = _transfers_by_share_trade(transfers)
+
         # Per-instrument engine: `trades` is the history of exactly one
         # `instruments.instrument_id`, loaded as such by the caller. The
         # engine does not re-check that against the trades' instrument
@@ -143,10 +173,14 @@ class StockRuleEngine:
         acquisitions: list[Acquisition] = []
         disposals: list[Disposal] = []
         for trade_id, trade in trades:
+            trade_transfers = by_share_trade.pop(trade_id, ())
+            _check_transfer_directions(trade_id, trade, trade_transfers, instrument)
             if trade.action is TradeAction.BUY:
-                acquisitions.append(self._build_acquisition(trade_id, trade, instrument))
+                acquisitions.append(
+                    self._build_acquisition(trade_id, trade, instrument, trade_transfers)
+                )
             elif trade.action is TradeAction.SELL:
-                disposals.append(self._build_disposal(trade_id, trade, instrument))
+                disposals.append(self._build_disposal(trade_id, trade, instrument, trade_transfers))
             else:
                 # `Trade.__post_init__` rejects non-BUY/SELL actions
                 # on non-future instruments, so a stock trade with an
@@ -157,6 +191,19 @@ class StockRuleEngine:
                     trade_id=trade_id,
                     detail=f"action {trade.action.value!r} is not valid for a stock trade",
                 )
+        if by_share_trade:
+            # A transfer for a share trade this stock's history does not
+            # hold: the link points at the wrong instrument or a trade
+            # the loader did not deliver.
+            missing = sorted(by_share_trade)
+            raise InconsistentTradeError(
+                instrument_symbol=instrument.symbol,
+                trade_id=missing[0],
+                detail=(
+                    f"option exercise transfer(s) name share trade(s) {missing} that are not "
+                    "among this stock's trades"
+                ),
+            )
 
         return self._matcher.match(
             instrument, acquisitions, disposals, soft_residuals=soft_residuals
@@ -167,7 +214,11 @@ class StockRuleEngine:
     # ------------------------------------------------------------------
 
     def _build_acquisition(
-        self, trade_id: int, trade: Trade, instrument: StockInstrument
+        self,
+        trade_id: int,
+        trade: Trade,
+        instrument: StockInstrument,
+        transfers: Sequence[OptionExerciseTransfer],
     ) -> Acquisition:
         """Project a `BUY` trade into a GBP `Acquisition` record.
 
@@ -178,6 +229,12 @@ class StockRuleEngine:
         we re-use it for the standalone fees conversion so that
         ``acquisition.cost_gbp == principal_gbp + fees_gbp`` holds
         exactly (subset semantics on `Acquisition.fees_gbp`).
+
+        A share purchase under an option (s.144(2)-(3)) then takes the
+        option's contribution: a holder's call adds the option's cost
+        (its commissions are incidental costs of acquisition); a
+        writer's put deducts the premium received and adds the grant
+        fee as an incidental cost.
         """
         cost_native = Money(
             trade.price.amount * trade.quantity + trade.fees.amount,
@@ -189,6 +246,15 @@ class StockRuleEngine:
         # reported native commission. The cache makes the second call
         # free (same date, same currency pair).
         fees_gbp, _ = self._fx.convert_with_rate(trade.fees, target="GBP", on=trade.trade_date)
+        for transfer in transfers:
+            if transfer.side == "LONG":
+                # Holder's call: the option cost (fees inside) joins the cost.
+                cost_gbp = cost_gbp + transfer.amount_gbp
+            else:
+                # Writer's put: the premium comes off the cost; the grant
+                # fee and assignment fee are incidental costs of acquisition.
+                cost_gbp = cost_gbp - transfer.amount_gbp + transfer.fees_gbp
+            fees_gbp = fees_gbp + transfer.fees_gbp
         return Acquisition(
             trade_id=trade_id,
             account_id=trade.account_id,
@@ -199,7 +265,13 @@ class StockRuleEngine:
             fees_gbp=fees_gbp,
         )
 
-    def _build_disposal(self, trade_id: int, trade: Trade, instrument: StockInstrument) -> Disposal:
+    def _build_disposal(
+        self,
+        trade_id: int,
+        trade: Trade,
+        instrument: StockInstrument,
+        transfers: Sequence[OptionExerciseTransfer],
+    ) -> Disposal:
         """Project a `SELL` trade into a GBP `Disposal` record.
 
         Proceeds: ``price * qty - fees`` in the instrument's native
@@ -208,6 +280,12 @@ class StockRuleEngine:
         incidental costs" treatment per HMRC CG14241), and the
         deducted fee amount is also surfaced separately on the
         `Disposal` for audit.
+
+        A share sale under an option (s.144(2)-(3)) then takes the
+        option's contribution: a holder's put makes the option's cost
+        an incidental cost of the disposal; a writer's call adds the
+        premium received to the proceeds with the grant fee and
+        assignment fee as incidental costs.
         """
         proceeds_native = Money(
             trade.price.amount * trade.quantity - trade.fees.amount,
@@ -219,6 +297,16 @@ class StockRuleEngine:
         # Same trade-date rate as the proceeds — keeps the relation
         # `proceeds_gbp == gross_principal_gbp - fees_gbp` exact.
         fees_gbp, _ = self._fx.convert_with_rate(trade.fees, target="GBP", on=trade.trade_date)
+        for transfer in transfers:
+            if transfer.side == "LONG":
+                # Holder's put: the whole option cost is an incidental
+                # cost of the disposal, so it is deducted and shown as a fee.
+                proceeds_gbp = proceeds_gbp - transfer.amount_gbp
+                fees_gbp = fees_gbp + transfer.amount_gbp
+            else:
+                # Writer's call: premium in, its fees deducted and shown.
+                proceeds_gbp = proceeds_gbp + transfer.amount_gbp - transfer.fees_gbp
+                fees_gbp = fees_gbp + transfer.fees_gbp
         return Disposal(
             trade_id=trade_id,
             account_id=trade.account_id,
@@ -228,3 +316,38 @@ class StockRuleEngine:
             proceeds_gbp=proceeds_gbp,
             fees_gbp=fees_gbp,
         )
+
+
+# ---------------------------------------------------------------------------
+# Transfer plumbing
+# ---------------------------------------------------------------------------
+
+
+def _transfers_by_share_trade(
+    transfers: Sequence[OptionExerciseTransfer],
+) -> dict[int, list[OptionExerciseTransfer]]:
+    """Group the transfers by the share trade they modify, in the given order."""
+    grouped: dict[int, list[OptionExerciseTransfer]] = {}
+    for transfer in transfers:
+        grouped.setdefault(transfer.share_trade_id, []).append(transfer)
+    return grouped
+
+
+def _check_transfer_directions(
+    trade_id: int,
+    trade: Trade,
+    transfers: Sequence[OptionExerciseTransfer],
+    instrument: StockInstrument,
+) -> None:
+    """Every transfer's option must imply the share trade's actual action."""
+    for transfer in transfers:
+        if transfer.share_action is not trade.action:
+            raise InconsistentTradeError(
+                instrument_symbol=instrument.symbol,
+                trade_id=trade_id,
+                detail=(
+                    f"option #{transfer.option_trade_id} ({transfer.side.lower()} "
+                    f"{transfer.instrument.right.value}) implies a {transfer.share_action.value} "
+                    f"of the shares but the linked trade is a {trade.action.value}"
+                ),
+            )

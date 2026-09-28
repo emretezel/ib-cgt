@@ -349,6 +349,27 @@ date (the date the borrowed shares are disposed of); the basis
 is rendered separately in the audit output (it is implicit in the
 basis trade id at the domain level).
 
+### Exercise transfers (s.144)
+
+`compute(instrument, trades, transfers=...)` also takes the
+`OptionExerciseTransfer` records the option engine produced for this
+stock's trades (the runner distributes them by `share_trade_id`). Each
+one modifies the projection of the share trade IB booked at the
+strike, in the direction TCGA 1992 s.144(2)–(3) prescribes
+([`options.md`](./options.md#the-four-s144-directions-in-stockruleengine)):
+
+| Transfer | Right | Share trade | Projection change |
+|---|---|---|---|
+| `LONG` (holder exercised) | call | `BUY`  | `cost_gbp += amount`, `fees_gbp += fees` |
+| `LONG` (holder exercised) | put  | `SELL` | `proceeds_gbp -= amount`, `fees_gbp += amount` |
+| `SHORT` (writer assigned) | call | `SELL` | `proceeds_gbp += amount − fees`, `fees_gbp += fees` |
+| `SHORT` (writer assigned) | put  | `BUY`  | `cost_gbp -= amount − fees`, `fees_gbp += fees` |
+
+Two things are refused with `InconsistentTradeError`: a transfer whose
+`share_trade_id` is not among this stock's trades, and a transfer whose
+option implies the other direction (a holder's call pointing at a
+sale) — either means the exercise link is wrong.
+
 ### Errors
 
 | Exception                | When                                                                                              |
@@ -454,18 +475,125 @@ exceeding available open quantity, or a `BUY`/`SELL` action on a
 future (the domain layer should reject the latter at construction
 time, but the engine guards against malformed in-memory inputs too).
 
+## `OptionRuleEngine`
+
+```python
+from ib_cgt.fx import FXService
+from ib_cgt.rules import OptionRuleEngine
+
+engine = OptionRuleEngine(fx)  # fx implements FXConverter Protocol
+result = engine.compute(
+    instrument,
+    trades,
+    exercise_links={exercise_trade_id: share_trade_id},  # from option_exercise_links
+    soft_residuals=True,
+)
+```
+
+One call per option series (one underlying, expiry, strike and right —
+one IB conid), cross-account like stocks. The series' trade history has
+two sides that UK CGT taxes in two different ways
+([`options.md`](./options.md) has the rules and the HMRC citations);
+the engine keeps them strictly apart — a bought put and a written put
+on the same series never net.
+
+### The holder's side — a pooled asset
+
+A bought option is an asset pooled by series (CG55536), so the long
+side is projected into `Acquisition` / `Disposal` records and handed
+to the shared `MatchingEngine` exactly as `StockRuleEngine` does, with
+`price × contract_multiplier × quantity` as the cash and the fee a
+separate fact:
+
+| Action | Projection |
+|---|---|
+| `OPEN_LONG` | acquisition: premium paid + commission |
+| `CLOSE_LONG` | disposal: premium received − commission |
+| `LAPSE_LONG` | disposal for **nil** on the lapse date (s.144(4), CG55415) — the identified cost is the loss |
+| `EXERCISE_LONG`, linked | **not a disposal** (s.144(3)): put through the matcher as a zero-proceeds disposal so the cost is identified by the same rules, then its chunks are lifted out of `matched_disposals` into one `OptionExerciseTransfer(side="LONG")` — `amount_gbp` = identified cost + the exercise row's fee, `fees_gbp` = identified acquisition fees + that fee |
+| `EXERCISE_LONG`, not linked | cash-settled (s.144A): an ordinary disposal at the row's price; the trade id goes into `cash_settled_trade_ids` |
+
+Same-day pairing, the 30-day rule, the S.104 pool and later
+acquisitions therefore all apply to a series; residuals behave as for
+stocks (`soft_residuals=True` in the runner).
+
+### The writer's side — a FIFO ledger of grants
+
+The grant is the disposal (s.144(1)): "the full amount of the premium
+less any incidental cost of disposal are assessable as a gain arising
+when the option is written" (CG55536). Every later event adjusts *that*
+disposal, so the short side is a deque of `_GrantSlice` records per
+series, drained first-in, first-out — the same identification the
+futures engine uses, **decided for options on 2026-09-28** (s.148 gives
+no rule; FIFO keeps each close traceable to one grant and only moves
+gain between grants). Each `OPEN_SHORT` becomes one `OptionGrant`
+carrying its closes:
+
+| Action | `OptionGrantClose.kind` | Effect on the grant |
+|---|---|---|
+| `OPEN_SHORT` | — | a grant: gross premium at the grant-date spot as `proceeds_gbp`, the commission as `grant_fee_gbp` |
+| `CLOSE_SHORT` | `PURCHASE` | s.148(3): premium + commission at the close-date spot is `cost_gbp`, added to the grant's incidental costs |
+| `LAPSE_SHORT` | `LAPSE` | nothing (CG55536); recorded with zero cost so the grant is seen to be closed |
+| `ASSIGN_SHORT`, linked | `ASSIGNMENT` | zero cost on the grant; the assigned contracts' share of the gross premium and grant fee (plus the assignment row's fee) leaves as an `OptionExerciseTransfer(side="SHORT", grant_trade_id=…)`, and `chargeable_quantity` drops by the assigned contracts (s.144(2), CG12317) |
+| `ASSIGN_SHORT`, not linked | `CASH_SETTLEMENT` | s.144A: the cash paid is a cost of the grant, like a closing purchase; the trade id goes into `cash_settled_trade_ids` |
+
+`OptionGrant.gain_gbp` is `chargeable_proceeds − chargeable_fee −
+closing_costs`, where the chargeable amounts are the grant's proceeds
+and fee scaled to the contracts still charged on it. A grant fully
+assigned has `is_chargeable == False` and is not a disposal of the
+year. Slices still open at the end of input come back as `OpenGrant`
+records (native premium price and fee remaining) — not tax events.
+
+Fees are allocated pro-rata by quantity with the last drain on a slice
+(or on a closing trade) taking the exact residual, as in
+`FutureRuleEngine`; both engines multiply before dividing
+(`fee × qty_step / total`), so a third of a 3.00 fee is exactly 1.00.
+FX follows CG78310: every cashflow at the spot on its own date — the
+grant at the grant date, each close at its own.
+
+### Restatement
+
+The engine does not know about tax years. A close dated in a later
+year than its grant simply sits on the grant; the calculator, filtering
+grants by `grant_date` and seeing a close dated in the year being
+computed on a grant of an earlier year, records an
+`option_grant_restated` warning naming the grant and its year, so the
+earlier year is recomputed (its stored run is stale — check D1 says so).
+A zero-cost lapse restates nothing and is not reported.
+
+### Output: `OptionResult`
+
+| Field | Type | Description |
+|---|---|---|
+| `matched` | `MatchingResult` | The holder's side, exercise chunks already lifted out; `unmatched_disposals` carries soft residuals. |
+| `grants` | `tuple[OptionGrant, ...]` | One per `OPEN_SHORT`, in trade order, each with every close on record. |
+| `open_grants` | `tuple[OpenGrant, ...]` | Written contracts still open at end of input — not tax events. |
+| `transfers` | `tuple[OptionExerciseTransfer, ...]` | Every amount an exercise or assignment moved into a share trade, for `StockRuleEngine`. |
+| `cash_settled_trade_ids` | `tuple[int, ...]` | Exercise / assignment rows with no linked share trade, treated under s.144A. |
+
+### Errors
+
+| Exception | When |
+|---|---|
+| `WrongAssetClassError` | The engine was handed a non-`OptionInstrument`. |
+| `InconsistentTradeError` | A `CLOSE_SHORT` / `LAPSE_SHORT` / `ASSIGN_SHORT` with **no open grant** (or more contracts than the open grants hold); a `BUY` / `SELL` action on an option (the domain rejects it first). |
+| `UnmatchedDisposalError` | Propagated from `MatchingEngine` on the holder's side in strict mode; the runner uses soft residuals. |
+
 ## Persistence
 
 `ib-cgt compute --year` (`ib_cgt.calculator.Calculator`) runs every
 engine over the **whole** history, keeps the chunks and futures
-realisations dated inside the year, and writes one run in a single
-transaction, replacing any earlier run for the same year:
+realisations, option grants and exercise transfers dated inside the
+year, and writes one run in a single transaction, replacing any
+earlier run for the same year:
 
 | Table | Rows |
 |---|---|
-| [`tax_runs`](./db/tax_runs.md) | The header: year, timestamp, net gain over both row tables. |
-| [`matched_disposals`](./db/matched_disposals.md) | One row per chunk (stocks, non-exempt bonds, FX pools), DIRECT vs POOL basis. |
+| [`tax_runs`](./db/tax_runs.md) | The header: year, timestamp, net gain over the chunk, realisation and grant rows. |
+| [`matched_disposals`](./db/matched_disposals.md) | One row per chunk (stocks, non-exempt bonds, bought options, FX pools), DIRECT vs POOL basis. |
 | [`future_realisations`](./db/future_realisations.md) | One row per closed-out futures slice. |
+| [`option_grants`](./db/option_grants.md) / [`option_grant_closes`](./db/option_grant_closes.md) | One row per written option's grant dated in the year, with every later close on record (whatever its year). |
+| [`option_exercise_transfers`](./db/option_exercise_transfers.md) | One row per amount an exercise or assignment dated in the year moved into a share trade. |
 | [`fx_event_sources`](./db/fx_event_sources.md) | The synthetic FX event ids the chunks cite, resolved to their dividend / coupon / cash event / realisation. |
 | [`tax_run_issues`](./db/tax_run_issues.md) | What the run could not do (errors) and what it wants noticed (warnings). |
 
@@ -474,7 +602,8 @@ average cost on a 2025 disposal depends on every acquisition since the
 first statement, and the 30-day rule reaches past the year end), so
 the engines are never fed a single year's trades. The rows go into
 the report in a canonical order — chunks by disposal id, realisations
-by close date then close trade — which is also the order the repos
+by close date then close trade, grants by grant date then grant trade,
+transfers by exercise date then option trade — which is also the order the repos
 read them back in, so `Calculator.load(year)` reproduces
 `compute(year)` exactly and check D1 can compare the two.
 
@@ -487,9 +616,9 @@ pool residual, a history that stops before the year end or inside the
 30-day look-ahead, an empty year — never fail a run. There is no
 `--strict`.
 
-`UnmatchedAcquisition` and `OpenPosition` are not persisted — they
-are computed fresh on every engine call and the `match` commands
-render them from the live pass.
+`UnmatchedAcquisition`, `OpenPosition` and `OpenGrant` are not
+persisted — they are computed fresh on every engine call and the
+`match` commands render them from the live pass.
 
 ## Error model
 
@@ -519,18 +648,19 @@ result = engine.compute(
     bond_coupons=non_gbp_bond_coupons,  # from BondCouponRepo.for_currency
     bond_trades=non_gbp_bond_trades,  # real trade ids, like stocks
     cash_events=non_gbp_cash_events,  # from CashEventRepo.for_currency
+    option_trades=non_gbp_option_trades,  # real trade ids, like stocks
 )
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects events from **eight sources** into GBP-denominated
+projects events from **nine sources** into GBP-denominated
 `Acquisition` and `Disposal` records via the FX service, then
 delegates the match. Unlike the stock engine its API is
 **per-currency** rather than per-instrument, because UK CGT pools FX
 per single non-GBP currency vs GBP — and a single `EUR.USD` trade
 therefore touches *two* pools (one EUR, one USD).
 
-The eight cashflow sources implement HMRC CG78315 — "foreign currency
+The nine cashflow sources implement HMRC CG78315 — "foreign currency
 arising from any source" — so the per-currency pool reflects every
 foreign-cash movement IB reports:
 
@@ -579,8 +709,22 @@ foreign-cash movement IB reports:
    amount. IB's descriptions are never consulted for direction — it
    printed negative `JPY Credit Interest` throughout the negative-
    rate years, and a fee can be refunded.
+9. **Non-GBP option trades** — every premium, commission and
+   settlement amount of an option series priced in a foreign
+   currency, on the trade date (`fx_cashflow.from_option_trade`).
+   The net cash is `±premium − fee` with premium =
+   `price × multiplier × quantity`: buying an option (`OPEN_LONG`)
+   or closing a written one (`CLOSE_SHORT`, `LAPSE_SHORT`,
+   `ASSIGN_SHORT`) spends the currency, writing one (`OPEN_SHORT`)
+   or selling a bought one (`CLOSE_LONG`, `LAPSE_LONG`,
+   `EXERCISE_LONG`) brings it in. A positive net is an acquisition,
+   a negative net a disposal, zero no event — so a lapse or a linked
+   exercise, which IB prints at price 0, moves only its fee, and a
+   cash-settled exercise moves the settlement. The share leg of an
+   exercise is an ordinary stock trade (source 2). See
+   [`options.md`](./options.md).
 
-Three conventions behind the last source are user decisions rather
+Three conventions behind the cash-event source are user decisions rather
 than HMRC guidance, and are recorded here as such:
 
 - **External deposits are booked at spot** on the day they arrive.
@@ -606,16 +750,15 @@ Each is a pure function returning `Acquisition | Disposal | None`.
 ### Sources the pools do not see yet
 
 Every description IB has printed in this taxpayer's 2011–2026 history
-falls into one of the eight sources above (checked after the full
+falls into one of the nine sources above (checked after the full
 ingest: broker and margin interest, stock-lending income, accrued
 interest on gilt trades, external deposits and withdrawals, wire and
 market-data fees and their refunds, dividends, payments in lieu and
-their withholding). What the model does **not** carry, because nothing
-ingests it, is:
+their withholding, option premiums and settlements). What the model
+does **not** carry, because nothing ingests it, is:
 
 | Missing source | Why it matters | Status |
 |---|---|---|
-| Option premiums, close-out payments, exercise / assignment cash | Every one is foreign currency arising on the trade date (CG78315) | Options are dropped at parse time; [`options.md`](./options.md) proposes the rules |
 | Corporate-action cash other than cash mergers and bond maturities (cash in lieu of fractional shares, return of capital, special cash distributions) | Cash arriving in the pool with no trade behind it | None in the history so far; the corporate-actions mapper ignores unknown shapes silently |
 | Position transfers in or out of IB with a cash component (ACATS, FOP) | Cash moving without a trade | None in the history (the 2022 move between the taxpayer's own accounts was positions only) |
 | IB's `Forex Balances` section (end-of-period cash per currency with IB's own GBP cost basis) | Not a cashflow, but the one independent figure the pool balances could be reconciled against | Not read; a natural next check |
@@ -845,18 +988,19 @@ compatible with a future ingestion change.
 ## The engine runner
 
 `ib_cgt.calculator.runner` is the one place that loads the persisted
-history and drives the four engines. The `match` commands, the
+history and drives the five engines. The `match` commands, the
 `check` tiers, and the tax-year calculator all consume it, so every
 command sees the same inputs and the same engine behaviour.
 
 | Entry point                                                | What it does                                                                                   |
 |------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| `run_stock_engine(conn, fx, *, symbol, since, until)`      | One `StockEngineRun` per stock, cross-account, soft-residual mode.                              |
+| `run_option_engine(conn, fx, *, symbol, since, until)`     | One `OptionEngineRun` per option series, cross-account, soft-residual mode; loads the series' exercise links from `option_exercise_links`. |
+| `run_stock_engine(conn, fx, *, symbol, since, until, option_runs)` | One `StockEngineRun` per stock, cross-account, soft-residual mode. Hands each stock the exercise transfers whose share trade it owns; runs its own option pass when `option_runs` is `None`. |
 | `run_bond_engine(conn, fx, *, symbol, since, until)`       | One `BondEngineRun` per bond (sealed `BondResult` union), soft-residual mode.                   |
 | `run_future_engine(conn, fx, *, symbol, account_id, …)`    | One `FutureEngineRun` per contract, GBP contracts included.                                     |
-| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP bond / non-GBP futures trades, futures realisations, dividends, coupons, cash events, provenance map, pool list. |
+| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP bond / non-GBP futures / non-GBP option trades, futures realisations, dividends, coupons, cash events, provenance map, pool list. |
 | `run_fx_engine(conn, fx, *, future_runs, currency, …)`     | One `FXEngineRun` per non-GBP pool; runs its own futures pass when none is supplied.            |
-| `run_engines(conn, fx)`                                    | The whole-history pass: futures → stocks → bonds → FX.                                          |
+| `run_engines(conn, fx)`                                    | The whole-history pass: futures → options → stocks (with the transfers) → bonds → FX.           |
 
 Each run record carries the instrument (or currency), the trades
 that fed the engine, and *either* the result *or* the captured
@@ -867,7 +1011,10 @@ exception — a single bad instrument never blanks the pass.
 acquisition or disposal of that currency on the close date), and
 only the futures engine produces them. `load_fx_inputs` therefore
 takes the futures runs as a required argument and `run_engines`
-fixes the order outright. Stock and bond cash legs come from the
+fixes the order outright. The stock engine consumes the option
+engine's `OptionExerciseTransfer` records (an exercised or assigned
+option modifies the share trade it produced, s.144(2)–(3)), so options
+run before stocks. Stock, bond and option cash legs come from the
 trades themselves, not from those engines' results, so their order
 relative to FX is immaterial; FX is a pure sink.
 
@@ -881,15 +1028,16 @@ dividends, coupons and cash events by currency and date).
 `FutureRealisationRef` / `DividendRef` / `BondCouponRef` /
 `CashEventRef` (`ib_cgt.domain.fx_events`), which is how the audit
 output prints `P&L #A→#B`, `Div #N`, `WHT #N`, `Cpn #N` and
-`Cash #N` instead of the ids. Bond trades, like stock trades, carry
-their real `trades` ids and need no provenance entry.
+`Cash #N` instead of the ids. Bond and option trades, like stock
+trades, carry their real `trades` ids and need no provenance entry.
 
 ## Open positions and residuals
 
 Since the matching engines run in soft-residual mode, a disposal
 with nothing to match against — a sale of shares bought before the
 earliest statement, a short still open, a futures contract opened
-but never closed — no longer stops a run. What decides whether such
+but never closed, a written option whose grant precedes the history
+— no longer stops a run. What decides whether such
 a residual is *fine* or a *data gap* is the broker's own view of the
 book: the Open Positions section of each account's latest statement
 ([`docs/db/statement_positions.md`](db/statement_positions.md)).
@@ -921,9 +1069,10 @@ only ever a warning.
 
 ## What's not implemented yet
 
-A strategy-pattern abstract base class for the four engines is
-deliberately deferred — the per-engine APIs are not yet identical
-(FX is per-currency, Stock / Bond / Future are per-instrument; Bond
-returns a sealed union, Future returns its own shape). With four
-real implementations now in place, the right abstraction is easier
-to see; we'll revisit when the tax-year calculator lands.
+A strategy-pattern abstract base class for the five engines is
+deliberately deferred — the per-engine APIs are not identical (FX is
+per-currency, Stock / Bond / Future / Option are per-instrument; Bond
+returns a sealed union, Future and Option return their own shapes,
+Option also takes the exercise links). With five real implementations
+in place, the right abstraction is easier to see; revisit if a sixth
+class arrives.

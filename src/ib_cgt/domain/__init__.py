@@ -24,14 +24,19 @@ from ib_cgt.domain.disposal import (
     FutureRealisation,
     MatchBasis,
     MatchedDisposal,
+    OpenGrant,
     OpenPosition,
+    OptionExerciseTransfer,
+    OptionGrant,
+    OptionGrantClose,
     TaxLot,
     TaxLotSnapshot,
     UnmatchedAcquisition,
     UnmatchedDisposalChunk,
+    option_share_action,
 )
 from ib_cgt.domain.dividends import Dividend, DividendKind, InvalidDividendError
-from ib_cgt.domain.enums import AssetClass, MatchRule, TradeAction
+from ib_cgt.domain.enums import AssetClass, MatchRule, OptionCloseKind, OptionRight, TradeAction
 from ib_cgt.domain.fx_events import (
     BondCouponRef,
     CashEventRef,
@@ -63,6 +68,7 @@ from ib_cgt.domain.trading import (
     Instrument,
     InvalidInstrumentError,
     InvalidTradeError,
+    OptionInstrument,
     StockInstrument,
     Trade,
 )
@@ -105,7 +111,14 @@ __all__ = [
     "MatchRule",
     "MatchedDisposal",
     "Money",
+    "OpenGrant",
     "OpenPosition",
+    "OptionCloseKind",
+    "OptionExerciseTransfer",
+    "OptionGrant",
+    "OptionGrantClose",
+    "OptionInstrument",
+    "OptionRight",
     "RunIssue",
     "RunIssueKind",
     "StatementPosition",
@@ -118,5 +131,6 @@ __all__ = [
     "TradeAction",
     "UnmatchedAcquisition",
     "UnmatchedDisposalChunk",
+    "option_share_action",
     "validate_currency_code",
 ]

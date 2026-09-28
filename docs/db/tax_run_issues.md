@@ -18,7 +18,7 @@ mirrors it:
 
 | Kind | Severity | Meaning |
 |---|---|---|
-| `position_mismatch` | error | A stock / bond / futures position implied by the trades disagrees with the latest statements' open positions (`docs/rules.md` §Open positions and residuals). |
+| `position_mismatch` | error | A stock / bond / futures / option position implied by the trades disagrees with the latest statements' open positions (`docs/rules.md` §Open positions and residuals). |
 | `rate_not_found` | error | An FX rate the engines needed is not cached (`ib-cgt fx sync`). |
 | `inconsistent_trades` | error | One instrument's history is self-contradictory (a futures CLOSE with no OPEN). |
 | `engine_failure` | error | An engine raised anything else. |
@@ -26,7 +26,9 @@ mirrors it:
 | `fx_residual` | warning | An FX pool disposal with no cover; never an error (the earliest statement is the pool's origin). |
 | `history_incomplete` | warning | An account's latest statement ends before the tax year does. |
 | `history_no_lookahead` | warning | The history covers the year but not the 30-day window after it. |
-| `empty_year` | warning | No disposals and no realisations in the year. |
+| `empty_year` | warning | No disposals, realisations or option grants in the year. |
+| `option_grant_restated` | warning | A closing purchase, assignment or cash settlement dated in this year modifies a written option's grant that was charged in an **earlier** year (TCGA 1992 s.148(3), s.144(2); HMRC CG12317). The grant's row in that earlier run already carries the close — the message names the grant, its date and the year to recompute and amend. A zero-cost lapse changes nothing for the grantor and is not reported. |
+| `option_exercise_unlinked` | warning | An `exercise_long` / `assign_short` row in this year had no share trade at the strike beside it in the statement (no [`option_exercise_links`](./option_exercise_links.md) row), so the engine treated it as cash-settled under s.144A; verify against the statement. |
 
 ## Columns
 
@@ -34,7 +36,7 @@ mirrors it:
 |---|---|---|---|
 | `run_id` | `INTEGER` | No (PK, FK) | Parent run. |
 | `seq` | `INTEGER` | No (PK) | Position in the calculator's issue list (errors first, instruments in run order). |
-| `kind` | `TEXT` | No | One of the nine kinds above (CHECK-constrained). |
+| `kind` | `TEXT` | No | One of the eleven kinds above (CHECK-constrained; the two option kinds were added by migration `023`, which recreated the table). |
 | `instrument_id` | `INTEGER` | Yes (FK) | The instrument the issue is about — the failing contract, the over-sold stock, the synthetic FX pool instrument for a residual. `NULL` exactly for the three run-level kinds (`history_incomplete`, `history_no_lookahead`, `empty_year`); the CHECK ties NULL-ness to the kind. |
 | `message` | `TEXT` | No | Human-readable detail: quantities, dates, the exception text. |
 
@@ -54,7 +56,7 @@ None beyond the primary key.
 ## CHECK constraints
 
 - `seq >= 0`.
-- `kind IN (…the nine kinds…)`.
+- `kind IN (…the eleven kinds…)`.
 - `(instrument_id IS NULL) = (kind IN ('history_incomplete', 'history_no_lookahead', 'empty_year'))`.
 
 ## Indexes
@@ -90,7 +92,10 @@ None.
 
 Captured via the Python `sqlite3` module in `-line` style after the
 first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
-system `sqlite3` binary predates STRICT tables).
+system `sqlite3` binary predates STRICT tables). After the migration
+`023` re-ingest and the recompute of every year 2011/12–2025/26 on
+2026-09-28 the table is **empty** — no run recorded an issue — so the
+rows below are kept as the shape reference.
 
 ```
        run_id = 1

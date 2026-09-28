@@ -1,7 +1,8 @@
 # Auditing matched output
 
-The `ib-cgt match fx` (and `match stocks` / `match futures`) tables
-print one row per matched chunk. Each row carries the trade ids
+The `ib-cgt match fx` (and `match stocks` / `match bonds` /
+`match futures` / `match options`) tables print one row per matched
+chunk, realisation or grant. Each row carries the trade ids
 that drove it; the `show` subcommands let you drill from any of
 those ids back to the original IB statement, the native amounts,
 the FX rate the engine applied, and any other chunks that
@@ -55,7 +56,13 @@ Single-trade audit dossier. Resolves the trade through
   GBP arithmetic.
 - Asset-class-specific rows: stock cost / proceeds in native +
   GBP; FX trade per-leg breakdown; futures contract metadata
-  + a pointer to `show realisation`.
+  + a pointer to `show realisation`; for an option row the series
+  facts (`conid`, right, underlying, strike, expiry, multiplier), the
+  premium the row moves (`price × multiplier × quantity`, with fees
+  and its GBP equivalent) and, on an exercise or assignment, the
+  **Exercise linkage** — `share trade #N (one transaction, TCGA 1992
+  s.144)` or `no share trade linked — treated as cash-settled
+  (s.144A)`.
 
 ## `ib-cgt show realisation --close <close_trade_id>`
 
@@ -67,6 +74,39 @@ its `[i]` index matching the `match fx` notation.
 
 Optional `--open <open_trade_id>` to narrow to a single
 (open, close) pair when a close drained several opens.
+
+## `ib-cgt match options [--symbol SERIES] [--since] [--until]`
+
+Dry-runs `OptionRuleEngine` over every option series (or the one
+`--symbol` names, in IB's display form, e.g. `XSPAM 20DEC14 140.0 P`)
+and prints, without writing anything:
+
+- **Option matched disposals** — per series, the holder's side in the
+  `match stocks` columns (disposal id and date, rule, quantity,
+  basis, proceeds, fees, cost, gain), then any unmatched residual;
+- **Written options — the grant is the disposal (s.144(1))** — one
+  row per grant across all series: grant id and date, contracts
+  written and still charged, premium, fee, grant-date FX, *Later
+  events* (`purchase #6 2012-11-01 1.00 for 142.45 USD`, `lapse #8
+  …`, `assignment …`, `cash_settlement …` or `open`), proceeds,
+  costs and gain in GBP;
+- **Written options still open** — grants not yet closed;
+- **Exercises and assignments — carried into the share trade
+  (s.144(2)-(3))** — option id, share id, side, right, date,
+  contracts, the GBP amount and fees moved, and the effect
+  (`added to share cost`, `cost of the share disposal`, `added to
+  share proceeds`, `deducted from share cost`);
+- a **Summary** (series, errors, chunks, grants, total realised gain)
+  and any per-series errors.
+
+Every id is a `trades.trade_id`, so `show trade N` reaches the
+statement row from any cell. `ib-cgt check options` runs the option
+checks alone: C8 (every series computes), C9 (grant closure — written
+= closed + still open, no close drains more than its own quantity),
+C10 (every `option_exercise_links` row pairs an exercise / assignment
+with a stock trade of the underlying at the strike for contracts ×
+multiplier at the same instant, in the right direction) and D7 (the
+persisted option run tables' trade ids resolve).
 
 ## `ib-cgt show match --disposal <disposal_trade_id>`
 
@@ -111,9 +151,10 @@ mode) appears in a yellow `UNMATCHED` row at the bottom.
 
 The persisted counterpart of the `match` dry runs. It computes the
 year from the same engine pass the `match` commands render, so every
-chunk in `matched_disposals` and every row in `future_realisations`
-can be found in `match stocks` / `match bonds` / `match fx` /
-`match futures` output with the same ids and the same labels — the
+chunk in `matched_disposals`, every row in `future_realisations` and
+every grant in `option_grants` can be found in `match stocks` /
+`match bonds` / `match fx` / `match futures` / `match options` output
+with the same ids and the same labels — the
 `Cpn #N` / `Cash #N` / `P&L #A→#B` notation is resolved for a
 persisted run through `fx_event_sources`. The command prints the
 per-class summary, the warnings and (in red) the errors, then either
@@ -122,10 +163,13 @@ iff an error-severity issue exists. The issues themselves are in
 `tax_run_issues` and come back with `Calculator.load`.
 
 `ib-cgt check all` then runs Tier D: D1 recomputes every persisted
-year from a fresh engine pass and compares chunks, realisations, the
-net gain and the recorded engine failures; D2 re-adds the header from
-its rows; D4 / D6 confirm every trade id (or synthetic id) still
-resolves. A `FAIL` there means the database changed under a run —
+year from a fresh engine pass and compares chunks, realisations,
+option grants, exercise transfers, the net gain and the recorded
+engine failures; D2 re-adds the header from its rows (chargeable
+grants included); D4 / D6 / D7 confirm every trade id (or synthetic
+id) still resolves. An `option_grant_restated` warning on a later
+year means an earlier year's stored run is stale — D1 says which, and
+recomputing that year clears it. A `FAIL` there means the database changed under a run —
 re-run `compute` for the year.
 
 ## `ib-cgt report --year 2025/26 [--format console|markdown|json|csv] [--out FILE] [--summary-only]`
@@ -136,7 +180,10 @@ every computation cites its events in the notation above, resolved
 from the run's `fx_event_sources` rows rather than a live engine pass:
 `#N` for a trade (`show trade N`), `Div #N` / `WHT #N` / `Cpn #N` /
 `Cash #N` for the non-trade cashflows, and `P&L #A→#B` for a futures
-close-out (`show realisation --close B`). The one difference from
-`match fx` is that the `[i]` slice suffix is not printed — a persisted
-run cannot tell how many slices a close drained in *other* years, and
-`(open, close)` is unique within a run anyway.
+close-out (`show realisation --close B`). A written option's line
+cites its grant trade (`#5`) and each later event (`closing purchase
+(s.148) #6 on 2012-11-01: …`); a share trade an option produced
+carries the `s.144: option #N …` note in its description. The one
+difference from `match fx` is that the `[i]` slice suffix is not
+printed — a persisted run cannot tell how many slices a close drained
+in *other* years, and `(open, close)` is unique within a run anyway.

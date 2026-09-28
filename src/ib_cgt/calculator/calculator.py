@@ -38,11 +38,13 @@ from ib_cgt.calculator.positions import (
     reconcile_positions,
 )
 from ib_cgt.calculator.runner import run_engines
-from ib_cgt.calculator.runs import EngineFailure, EngineOutputs, FXEngineRun
+from ib_cgt.calculator.runs import EngineFailure, EngineOutputs, FXEngineRun, OptionEngineRun
 from ib_cgt.db import (
     FutureRealisationRepo,
     FXEventSourceRepo,
     MatchedDisposalRepo,
+    OptionExerciseTransferRepo,
+    OptionGrantRepo,
     StatementRepo,
     TaxRun,
     TaxRunIssueRepo,
@@ -55,6 +57,9 @@ from ib_cgt.domain import (
     FXEventSource,
     IssueSeverity,
     MatchedDisposal,
+    OptionCloseKind,
+    OptionExerciseTransfer,
+    OptionGrant,
     RunIssue,
     RunIssueKind,
     TaxYear,
@@ -134,6 +139,8 @@ def load_persisted_run(conn: sqlite3.Connection, tax_year: TaxYear) -> Persisted
         tax_year,
         MatchedDisposalRepo(conn).for_run(run.run_id),
         FutureRealisationRepo(conn).for_run(run.run_id),
+        OptionGrantRepo(conn).for_run(run.run_id),
+        OptionExerciseTransferRepo(conn).for_run(run.run_id),
     )
     computation = TaxYearComputation(
         report=report,
@@ -151,17 +158,20 @@ def load_persisted_run(conn: sqlite3.Connection, tax_year: TaxYear) -> Persisted
 def build_report(outputs: EngineOutputs, tax_year: TaxYear) -> TaxYearReport:
     """Filter one whole-history pass down to the year and roll it up.
 
-    Chunks come from the stock, non-exempt bond and FX runs;
-    realisations from the futures runs. Only rows dated inside
+    Chunks come from the stock, non-exempt bond, option (holder side)
+    and FX runs; realisations from the futures runs; grants and
+    exercise transfers from the option runs. Only rows dated inside
     `tax_year` survive — a chunk by `disposal_date`, a realisation by
-    `close_date`. Failed runs contribute nothing; their absence is
-    what the issues record.
+    `close_date`, a grant by `grant_date` (with every close on record,
+    whatever its year), a transfer by its exercise date. Failed runs
+    contribute nothing; their absence is what the issues record.
 
     Rows are put in the report in the same canonical order the repos
     read them back in — chunks by disposal id (emit order within a
-    disposal preserved), realisations by close date then close trade
-    — so `load(year)` reproduces `compute(year)` exactly and the
-    order no longer depends on which engine ran first.
+    disposal preserved), realisations by close date then close trade,
+    grants by grant date then grant trade, transfers by date then
+    option trade — so `load(year)` reproduces `compute(year)` exactly
+    and the order no longer depends on which engine ran first.
     """
     chunks: list[MatchedDisposal] = []
     for matching in _matching_results(outputs):
@@ -175,7 +185,16 @@ def build_report(outputs: EngineOutputs, tax_year: TaxYear) -> TaxYearReport:
             r for r in future_run.result.realisations if tax_year.contains(r.close_date)
         )
     realisations.sort(key=lambda r: (r.close_date, r.close_trade_id))  # stable: FIFO seq kept
-    return TaxYearReport.build(tax_year, chunks, realisations)
+    grants: list[OptionGrant] = []
+    transfers: list[OptionExerciseTransfer] = []
+    for option_run in outputs.options:
+        if option_run.result is None:
+            continue
+        grants.extend(g for g in option_run.result.grants if tax_year.contains(g.grant_date))
+        transfers.extend(t for t in option_run.result.transfers if tax_year.contains(t.on))
+    grants.sort(key=lambda g: (g.grant_date, g.grant_trade_id))
+    transfers.sort(key=lambda t: (t.on, t.option_trade_id))  # stable: per-option seq kept
+    return TaxYearReport.build(tax_year, chunks, realisations, grants, transfers)
 
 
 def referenced_fx_sources(
@@ -202,13 +221,16 @@ def referenced_fx_sources(
 
 
 def _matching_results(outputs: EngineOutputs) -> Iterable[MatchingResult]:
-    """Every successful four-rule result: stocks, then non-exempt bonds, then FX pools."""
+    """Every successful four-rule result: stocks, non-exempt bonds, bought options, FX pools."""
     for stock_run in outputs.stocks:
         if stock_run.result is not None:
             yield stock_run.result
     for bond_run in outputs.bonds:
         if bond_run.result is not None and not isinstance(bond_run.result, ExemptBondResult):
             yield bond_run.result
+    for option_run in outputs.options:
+        if option_run.result is not None:
+            yield option_run.result.matched
     for fx_run in outputs.fx:
         if fx_run.result is not None:
             yield fx_run.result
@@ -269,12 +291,16 @@ class Calculator:
         1. one issue per captured engine failure;
         2. one `position_mismatch` per instrument whose trades and
            latest statements disagree;
-        3. one `open_short_position` per residual stock / bond chunk
-           whose instrument *does* reconcile (the statement confirms
-           the short) — dated inside the year;
+        3. one `open_short_position` per residual stock / bond / option
+           chunk whose instrument *does* reconcile (the statement
+           confirms the short) — dated inside the year;
         4. one `fx_residual` per FX pool with in-year residual chunks;
-        5. per account with a statement, the history-coverage warning;
-        6. `empty_year` when the year has no rows at all.
+        5. one `option_grant_restated` per in-year close of a grant
+           charged in an earlier year, and one
+           `option_exercise_unlinked` per in-year exercise treated as
+           cash-settled;
+        6. per account with a statement, the history-coverage warning;
+        7. `empty_year` when the year has no rows at all.
         """
         errors: list[RunIssue] = []
         warnings: list[RunIssue] = []
@@ -318,6 +344,9 @@ class Calculator:
             if residual is not None:
                 warnings.append(residual)
 
+        for option_run in outputs.options:
+            warnings.extend(_option_issues(option_run, tax_year))
+
         warnings.extend(_coverage_issues(self._conn, tax_year))
 
         if report.is_empty:
@@ -347,6 +376,10 @@ class Calculator:
             run_id = TaxRunRepo(self._conn).replace_for(report.tax_year, report.net_gbp)
             MatchedDisposalRepo(self._conn).insert_many(run_id, report.matched_disposals)
             FutureRealisationRepo(self._conn).insert_many(run_id, report.future_realisations)
+            OptionGrantRepo(self._conn).insert_many(run_id, report.option_grants)
+            OptionExerciseTransferRepo(self._conn).insert_many(
+                run_id, report.option_exercise_transfers
+            )
             FXEventSourceRepo(self._conn).insert_many(run_id, computation.fx_event_sources)
             TaxRunIssueRepo(self._conn).insert_many(run_id, computation.issues)
         return run_id
@@ -384,7 +417,7 @@ def _failure_issue(failure: EngineFailure) -> RunIssue:
 def _in_year_residuals(
     outputs: EngineOutputs, tax_year: TaxYear
 ) -> Iterable[tuple[int, AnyInstrument, UnmatchedDisposalChunk]]:
-    """Every in-year uncovered stock / bond chunk with its instrument id."""
+    """Every in-year uncovered stock / bond / bought-option chunk with its instrument id."""
     for stock_run in outputs.stocks:
         if stock_run.result is None:
             continue
@@ -397,6 +430,66 @@ def _in_year_residuals(
         for chunk in bond_run.result.unmatched_disposals:
             if tax_year.contains(chunk.disposal_date):
                 yield bond_run.instrument_id, bond_run.instrument, chunk
+    for option_run in outputs.options:
+        if option_run.result is None:
+            continue
+        for chunk in option_run.result.matched.unmatched_disposals:
+            if tax_year.contains(chunk.disposal_date):
+                yield option_run.instrument_id, option_run.instrument, chunk
+
+
+def _option_issues(option_run: OptionEngineRun, tax_year: TaxYear) -> list[RunIssue]:
+    """The option warnings of one series for `tax_year`.
+
+    A closing purchase, assignment or cash settlement dated in the year
+    on a grant charged in an earlier year restates that year (TCGA 1992
+    s.148(3), s.144(2); CG12317) — the user must recompute and amend
+    it. A lapse changes nothing for the grantor and is not reported
+    unless it carried a fee. An exercise or assignment with no linked
+    share trade was treated as cash-settled (s.144A) and is flagged so
+    the statement can be checked.
+    """
+    if option_run.result is None:
+        return []
+    instrument = option_run.instrument
+    issues: list[RunIssue] = []
+    for grant in option_run.result.grants:
+        if tax_year.contains(grant.grant_date):
+            continue
+        for close in grant.closes:
+            if not tax_year.contains(close.close_date):
+                continue
+            if close.kind is OptionCloseKind.LAPSE and close.cost_gbp.amount == 0:
+                continue
+            grant_year = TaxYear.containing(grant.grant_date)
+            issues.append(
+                RunIssue(
+                    kind=RunIssueKind.OPTION_GRANT_RESTATED,
+                    instrument=instrument,
+                    message=(
+                        f"{close.kind.value} #{close.close_trade_id} on {close.close_date} "
+                        f"modifies the grant #{grant.grant_trade_id} of {grant.grant_date} "
+                        f"({grant_year.label}); recompute {grant_year.label} and amend its return"
+                    ),
+                )
+            )
+    trade_dates = {trade_id: trade.trade_date for trade_id, trade in option_run.trades}
+    for trade_id in option_run.result.cash_settled_trade_ids:
+        on = trade_dates.get(trade_id)
+        if on is None or not tax_year.contains(on):
+            continue
+        issues.append(
+            RunIssue(
+                kind=RunIssueKind.OPTION_EXERCISE_UNLINKED,
+                instrument=instrument,
+                message=(
+                    f"trade #{trade_id} on {on}: no share trade at the strike was booked with "
+                    "this exercise, so it was treated as cash-settled (TCGA 1992 s.144A); "
+                    "verify against the statement"
+                ),
+            )
+        )
+    return issues
 
 
 def _fx_residual_issue(fx_run: FXEngineRun, tax_year: TaxYear) -> RunIssue | None:

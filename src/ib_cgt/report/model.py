@@ -36,6 +36,7 @@ from ib_cgt.domain import (
     IssueSeverity,
     MatchRule,
     Money,
+    OptionCloseKind,
     RunIssue,
     TaxYear,
 )
@@ -69,10 +70,10 @@ class Sa108SectionKind(StrEnum):
 
     Listed shares and securities take the share-matched classes (stocks
     and non-exempt bonds — IB's bonds are exchange-listed). Futures
-    close-outs (TCGA 1992 s.143) and foreign-currency pools are neither
-    shares nor securities, so they fall under "Other property, assets
-    and gains", the section the notes reserve for "assets not covered
-    elsewhere".
+    close-outs (TCGA 1992 s.143), options (s.144: an option is an asset
+    in its own right, not a share or security) and foreign-currency
+    pools fall under "Other property, assets and gains", the section
+    the notes reserve for "assets not covered elsewhere".
     """
 
     LISTED_SHARES = "listed_shares"
@@ -113,6 +114,7 @@ _SECTION_OF: Final[dict[AssetClass, Sa108SectionKind]] = {
     AssetClass.BOND: Sa108SectionKind.LISTED_SHARES,
     AssetClass.FUTURE: Sa108SectionKind.OTHER_ASSETS,
     AssetClass.FX: Sa108SectionKind.OTHER_ASSETS,
+    AssetClass.OPTION: Sa108SectionKind.OTHER_ASSETS,
 }
 
 
@@ -363,7 +365,59 @@ class CloseOutBasis:
     close_fx_rate: Decimal
 
 
-LineBasis = DirectBasis | PoolBasis | CloseOutBasis
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GrantCloseRef:
+    """One later event on a written option's grant, as the report cites it.
+
+    Attributes:
+        close: The closing trade — a purchase, a lapse, an assignment
+            or a cash settlement.
+        kind: Which of those it was.
+        quantity: Contracts of the grant it closed.
+        premium_native: Premium paid on that portion (zero for a lapse
+            or an assignment), series currency.
+        fee_native: The closing row's commission share.
+        fx_rate: Spot applied on the close date.
+        cost_gbp: What it added to the grant's incidental costs.
+    """
+
+    close: EventRef
+    kind: OptionCloseKind
+    quantity: Decimal
+    premium_native: Money
+    fee_native: Money
+    fx_rate: Decimal
+    cost_gbp: Money
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GrantBasis:
+    """A written option: the grant is the disposal (TCGA 1992 s.144(1)).
+
+    There is no acquisition — the writer never owned the option — so
+    the line has no D or E. A is the premium still charged on the
+    grant, B the grant commission plus every closing purchase or cash
+    settlement (s.148(3), s.144A). Contracts later assigned have left
+    the grant for the share trade and are not in A.
+
+    Attributes:
+        premium_native: The whole grant's gross premium, series currency.
+        grant_fee_native: The grant row's commission.
+        grant_fx_rate: Spot applied on the grant date.
+        granted_quantity: Contracts written.
+        chargeable_quantity: Contracts still charged on this grant.
+        closes: Every later event on the grant, in drain order.
+    """
+
+    premium_native: Money
+    grant_fee_native: Money
+    grant_fx_rate: Decimal
+    granted_quantity: Decimal
+    chargeable_quantity: Decimal
+    closes: tuple[GrantCloseRef, ...]
+
+
+LineBasis = DirectBasis | PoolBasis | CloseOutBasis | GrantBasis
 """How one computation line's allowable cost was identified."""
 
 
@@ -605,6 +659,8 @@ __all__ = [
     "DirectBasis",
     "DisposalComputation",
     "EventRef",
+    "GrantBasis",
+    "GrantCloseRef",
     "LineBasis",
     "PoolBasis",
     "RunHeader",

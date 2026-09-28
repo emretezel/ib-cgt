@@ -220,8 +220,12 @@ def test_real_row_outside_any_currency_block_fails_loudly() -> None:
         assemble(_document(table))
 
 
-def test_ignored_asset_class_is_dropped_in_every_section_that_has_one() -> None:
-    """Stock options vanish from Trades, Open Positions and Financial Instrument Information."""
+def test_option_rows_are_read_in_every_section_that_has_an_asset_header() -> None:
+    """Options flow through Trades, Open Positions and Financial Instrument Information.
+
+    The options-shaped instrument table adds `Type` and `Strike`; both
+    land on the raw row for the mapper.
+    """
     trades = _trades_table(
         _header(*_TRADE_HEADER),
         _asset("Stocks"),
@@ -240,8 +244,33 @@ def test_ignored_asset_class_is_dropped_in_every_section_that_has_one() -> None:
             _header("Symbol", "Description", "Conid"),
             _asset("Stocks"),
             _data("TUR", "ISHARES MSCI TURKEY ETF", "123456"),
+            _header(
+                "Symbol",
+                "Description",
+                "Conid",
+                "Underlying",
+                "Listing Exch",
+                "Multiplier",
+                "Expiry",
+                "Delivery Month",
+                "Type",
+                "Strike",
+                "Code",
+            ),
             _asset("Equity and Index Options"),
-            _data("TUR 17MAY19 22.0 P", "TUR 17MAY19 PUT 22.0", "654321"),
+            _data(
+                "TUR   190517P00022000",
+                "TUR 17MAY19 22.0 P",
+                "334765297",
+                "TUR",
+                "",
+                "100",
+                "2019-05-17",
+                "2019-05",
+                "P",
+                "22",
+                "",
+            ),
         ),
     )
     positions = RawTable(
@@ -254,9 +283,19 @@ def test_ignored_asset_class_is_dropped_in_every_section_that_has_one() -> None:
         ),
     )
     parsed = assemble(_document(trades, instruments, positions))
-    assert [row.symbol for row in parsed.trades] == ["TUR", "EUR.GBP"]
-    assert [info.symbol for info in parsed.instruments] == ["TUR"]
-    assert parsed.open_positions == ()
+    assert [row.symbol for row in parsed.trades] == ["TUR", "TUR 17MAY19 22.0 P", "EUR.GBP"]
+    assert parsed.trades[1].asset_class == "Equity and Index Options"
+    assert [info.symbol for info in parsed.instruments] == ["TUR", "TUR   190517P00022000"]
+    option = parsed.instruments[1]
+    assert option.asset_class == "Equity and Index Options"
+    assert option.underlying == "TUR"
+    assert option.type_text == "P"
+    assert option.strike_text == "22"
+    assert option.expiry_text == "2019-05-17"
+    (position,) = parsed.open_positions
+    assert position.asset_class == "Equity and Index Options"
+    assert position.symbol == "TUR 17MAY19 22.0 P"
+    assert position.multiplier_text == "100"
 
 
 def test_asset_headers_in_cash_sections_are_grouping_labels() -> None:

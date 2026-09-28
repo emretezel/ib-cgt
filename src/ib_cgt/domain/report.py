@@ -18,7 +18,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from ib_cgt.domain.disposal import FutureRealisation, MatchedDisposal
+from ib_cgt.domain.disposal import (
+    FutureRealisation,
+    MatchedDisposal,
+    OptionExerciseTransfer,
+    OptionGrant,
+)
 from ib_cgt.domain.enums import AssetClass
 from ib_cgt.domain.money import Money
 from ib_cgt.domain.tax_year import TaxYear
@@ -97,12 +102,20 @@ class TaxYearReport:
             `close_date` fell into this tax year. Futures do not fit
             `MatchedDisposal` (see `FutureRealisation`), so they sit
             beside the chunks rather than among them.
+        option_grants: Every written option whose `grant_date` fell into
+            this tax year, with every later close on record (a close in
+            a later year restates this year — see `OptionGrant`).
+        option_exercise_transfers: Every exercise / assignment dated in
+            this year, for the audit trail of the share trades it
+            adjusted. Not tax events themselves.
     """
 
     tax_year: TaxYear
     matched_disposals: tuple[MatchedDisposal, ...]
     summaries: tuple[AssetClassSummary, ...]
     future_realisations: tuple[FutureRealisation, ...] = ()
+    option_grants: tuple[OptionGrant, ...] = ()
+    option_exercise_transfers: tuple[OptionExerciseTransfer, ...] = ()
 
     def __post_init__(self) -> None:
         """Summaries must not double-up; every row must fall inside the year."""
@@ -129,6 +142,18 @@ class TaxYearReport:
                     f"#{realisation.close_trade_id} closed {realisation.close_date} is "
                     f"outside {self.tax_year.label}"
                 )
+        for grant in self.option_grants:
+            if not self.tax_year.contains(grant.grant_date):
+                raise ValueError(
+                    f"TaxYearReport: option grant #{grant.grant_trade_id} dated "
+                    f"{grant.grant_date} is outside {self.tax_year.label}"
+                )
+        for transfer in self.option_exercise_transfers:
+            if not self.tax_year.contains(transfer.on):
+                raise ValueError(
+                    f"TaxYearReport: option exercise #{transfer.option_trade_id} dated "
+                    f"{transfer.on} is outside {self.tax_year.label}"
+                )
 
     @classmethod
     def build(
@@ -136,19 +161,27 @@ class TaxYearReport:
         tax_year: TaxYear,
         matched_disposals: Iterable[MatchedDisposal],
         future_realisations: Iterable[FutureRealisation] = (),
+        option_grants: Iterable[OptionGrant] = (),
+        option_exercise_transfers: Iterable[OptionExerciseTransfer] = (),
     ) -> TaxYearReport:
         """Assemble a report, deriving one summary per asset class with rows.
 
-        Chunks roll up by their instrument's asset class; futures
-        realisations roll up under `AssetClass.FUTURE`, counting one
-        realisation per row, with `proceeds_gbp` (signed) and
+        Chunks roll up by their instrument's asset class (a holder's
+        option disposals therefore land under `AssetClass.OPTION`);
+        futures realisations roll up under `AssetClass.FUTURE`, counting
+        one realisation per row, with `proceeds_gbp` (signed) and
         `cost_gbp` summed and the gain split into its positive and
-        negative parts exactly as chunks are. Classes with no rows get
-        no summary. Summaries come out in `AssetClass` declaration
-        order so renderers print a stable table.
+        negative parts exactly as chunks are; option grants roll up under
+        `AssetClass.OPTION` with the chargeable premium as proceeds and
+        the incidental costs (grant fee plus closing costs) as cost.
+        Exercise transfers are not tax events and contribute nothing.
+        Classes with no rows get no summary. Summaries come out in
+        `AssetClass` declaration order so renderers print a stable table.
         """
         chunks = tuple(matched_disposals)
         realisations = tuple(future_realisations)
+        grants = tuple(option_grants)
+        transfers = tuple(option_exercise_transfers)
         totals: dict[AssetClass, _Totals] = {}
         for chunk in chunks:
             totals.setdefault(chunk.instrument.asset_class, _Totals()).add(
@@ -158,6 +191,14 @@ class TaxYearReport:
             totals.setdefault(AssetClass.FUTURE, _Totals()).add(
                 realisation.proceeds_gbp, realisation.cost_gbp
             )
+        for grant in grants:
+            # A grant assigned in full has moved its whole premium into
+            # share trades; it is carried for the audit trail but is no
+            # longer a disposal of this year.
+            if grant.is_chargeable:
+                totals.setdefault(AssetClass.OPTION, _Totals()).add(
+                    grant.chargeable_proceeds_gbp, grant.incidental_costs_gbp
+                )
         summaries = tuple(
             totals[asset_class].summary(asset_class)
             for asset_class in AssetClass
@@ -168,6 +209,8 @@ class TaxYearReport:
             matched_disposals=chunks,
             summaries=summaries,
             future_realisations=realisations,
+            option_grants=grants,
+            option_exercise_transfers=transfers,
         )
 
     @property
@@ -182,8 +225,10 @@ class TaxYearReport:
 
     @property
     def is_empty(self) -> bool:
-        """True when the year has neither disposal chunks nor futures realisations."""
-        return not self.matched_disposals and not self.future_realisations
+        """True when the year has no chunks, no futures realisations and no option grants."""
+        return (
+            not self.matched_disposals and not self.future_realisations and not self.option_grants
+        )
 
     def summary_for(self, asset_class: AssetClass) -> AssetClassSummary | None:
         """Return the summary for `asset_class`, or `None` if absent.

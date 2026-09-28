@@ -18,7 +18,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Protocol
 
 from ib_cgt.db import BondCouponRepo, CashEventRepo, DividendRepo, TradeRepo
@@ -29,6 +29,7 @@ from ib_cgt.domain import (
     FutureInstrument,
     FutureRealisationRef,
     FXEventSource,
+    OptionExerciseTransfer,
 )
 from ib_cgt.report.labels import (
     cash_description,
@@ -41,6 +42,7 @@ from ib_cgt.report.labels import (
     realisation_label,
     trade_description,
     trade_label,
+    transfer_note,
 )
 from ib_cgt.report.model import EventRef
 
@@ -87,14 +89,25 @@ class DbEventResolver:
     """Resolve ids through the repositories, guided by the run's provenance map."""
 
     def __init__(
-        self, conn: sqlite3.Connection, fx_event_sources: Mapping[int, FXEventSource]
+        self,
+        conn: sqlite3.Connection,
+        fx_event_sources: Mapping[int, FXEventSource],
+        exercise_transfers: Iterable[OptionExerciseTransfer] = (),
     ) -> None:
-        """Bind to an open connection and the run's synthetic-id map."""
+        """Bind to an open connection, the run's synthetic-id map and its exercise transfers.
+
+        `exercise_transfers` are the run's `option_exercise_transfers`;
+        a share trade one of them modified gets the s.144 note appended
+        to its description so the stock line explains its cost.
+        """
         self._trades = TradeRepo(conn)
         self._dividends = DividendRepo(conn)
         self._coupons = BondCouponRepo(conn)
         self._cash_events = CashEventRepo(conn)
         self._sources = fx_event_sources
+        self._transfers: dict[int, list[OptionExerciseTransfer]] = {}
+        for transfer in exercise_transfers:
+            self._transfers.setdefault(transfer.share_trade_id, []).append(transfer)
         # A disposal cited by several lines, or an acquisition matched
         # by several disposals, is looked up once.
         self._cache: dict[int, EventRef] = {}
@@ -121,17 +134,25 @@ class DbEventResolver:
         return self._realisation(event_id, source)
 
     def _trade(self, event_id: int) -> EventRef:
-        """A real trade: label `#N`, dated and described from the row."""
+        """A real trade: label `#N`, dated and described from the row.
+
+        A share trade an option exercise modified carries the s.144
+        note for each transfer, so the reader sees why its cost or
+        proceeds differ from price times quantity.
+        """
         stored = self._trades.get(event_id)
         if stored is None:
             return unresolved(event_id)
         trade = stored.trade
+        description = trade_description(trade)
+        for transfer in self._transfers.get(event_id, ()):
+            description = f"{description}; {transfer_note(transfer)}"
         return EventRef(
             event_id=event_id,
             label=trade_label(event_id),
             on=trade.trade_date,
             account_id=trade.account_id,
-            description=trade_description(trade),
+            description=description,
         )
 
     def _dividend(self, event_id: int, source: DividendRef) -> EventRef:

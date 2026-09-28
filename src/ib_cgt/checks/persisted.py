@@ -1,13 +1,15 @@
 """Tier D — invariants over persisted tax runs.
 
 `ib-cgt compute --year` writes a run to `tax_runs`, `matched_disposals`,
-`future_realisations`, `fx_event_sources` and `tax_run_issues`. These
-checks confirm that what was written is still true: a fresh engine
-pass reproduces the persisted rows (D1), the header's net gain equals
-the rows (D2), one run per year (D3), every trade-id reference still
-resolves — through `trades` or the run's synthetic-id map (D4), the
-basis columns agree with their discriminator (D5), and the futures
-rows' trade ids resolve (D6).
+`future_realisations`, `option_grants` (with `option_grant_closes`),
+`option_exercise_transfers`, `fx_event_sources` and `tax_run_issues`.
+These checks confirm that what was written is still true: a fresh
+engine pass reproduces the persisted rows (D1), the header's net gain
+equals the rows (D2), one run per year (D3), every trade-id reference
+still resolves — through `trades` or the run's synthetic-id map (D4),
+the basis columns agree with their discriminator (D5), the futures
+rows' trade ids resolve (D6), and the option rows' trade ids resolve
+(D7).
 
 The tier wakes up as soon as a `tax_runs` row exists; before the
 first `compute` every check reports SKIP rather than asserting
@@ -32,7 +34,14 @@ from ib_cgt.checks.framework import (
     Tier,
     register_check,
 )
-from ib_cgt.db import FutureRealisationRepo, MatchedDisposalRepo, TaxRunIssueRepo, TaxRunRepo
+from ib_cgt.db import (
+    FutureRealisationRepo,
+    MatchedDisposalRepo,
+    OptionExerciseTransferRepo,
+    OptionGrantRepo,
+    TaxRunIssueRepo,
+    TaxRunRepo,
+)
 from ib_cgt.domain import IssueSeverity, TaxYear
 
 _EVIDENCE_LIMIT: Final = 20
@@ -78,11 +87,12 @@ def _rows_to_evidence(
 def _check_recompute_equality(ctx: CheckContext) -> Finding:
     """Recompute every persisted year from the checks' cached engine pass.
 
-    Four comparisons per run: the multiset of matched chunks, the
-    multiset of futures realisations, the header's net gain, and the
-    set of instruments carrying an error-kind issue (versus the fresh
-    pass's captured failures). A narrowed context (symbol or date
-    filter) cannot rebuild the pools and skips itself.
+    Six comparisons per run: the multisets of matched chunks, futures
+    realisations, option grants (closes included) and exercise
+    transfers, the header's net gain, and the set of instruments
+    carrying an error-kind issue (versus the fresh pass's captured
+    failures). A narrowed context (symbol or date filter) cannot
+    rebuild the pools and skips itself.
     """
     if not _has_persisted_rows(ctx):
         return Finding(triggered=False, skipped=True, detail="no persisted tax runs yet")
@@ -105,6 +115,8 @@ def _check_recompute_equality(ctx: CheckContext) -> Finding:
         fresh = build_report(outputs, tax_year)
         stored_chunks = Counter(MatchedDisposalRepo(ctx.conn).for_run(run.run_id))
         stored_realisations = Counter(FutureRealisationRepo(ctx.conn).for_run(run.run_id))
+        stored_grants = Counter(OptionGrantRepo(ctx.conn).for_run(run.run_id))
+        stored_transfers = Counter(OptionExerciseTransferRepo(ctx.conn).for_run(run.run_id))
         stored_failures = {
             (i.instrument.symbol, i.instrument.currency)
             for i in TaxRunIssueRepo(ctx.conn).for_run(run.run_id)
@@ -115,6 +127,10 @@ def _check_recompute_equality(ctx: CheckContext) -> Finding:
             differences.append("matched_disposals")
         if stored_realisations != Counter(fresh.future_realisations):
             differences.append("future_realisations")
+        if stored_grants != Counter(fresh.option_grants):
+            differences.append("option_grants")
+        if stored_transfers != Counter(fresh.option_exercise_transfers):
+            differences.append("option_exercise_transfers")
         if run.net_gbp != fresh.net_gbp:
             differences.append("net_gbp")
         # Position mismatches are derived from the statements, not the
@@ -147,21 +163,25 @@ def _check_recompute_equality(ctx: CheckContext) -> Finding:
 
 @register_check(
     name="D2",
-    description="tax_runs.net_gbp == sum(matched_proceeds_gbp - matched_cost_gbp) per run",
+    description="tax_runs.net_gbp == sum of gains over chunks, realisations and option grants",
     tier=Tier.D,
     scopes={Scope.ALL},
     severity=Severity.ERROR,
 )
 def _check_tax_run_net_reconciliation(ctx: CheckContext) -> Finding:
-    """The header's net gain equals proceeds minus cost over both row tables.
+    """The header's net gain equals the gains summed over the three row tables.
 
-    Sums are done in Python `Decimal` — the columns are Decimal text
-    and a SQL SUM would go through floating point — and compared
+    Chunks and realisations are `proceeds - cost` per row; a written
+    option's gain needs its closes (the chargeable premium less the
+    grant fee and every closing cost), so the grants go through the
+    repo. Sums are done in Python `Decimal` — the columns are Decimal
+    text and a SQL SUM would go through floating point — and compared
     within `_NET_TOLERANCE` (see the note on the constant).
     """
     if not _has_persisted_rows(ctx):
         return Finding(triggered=False, skipped=True, detail="no persisted rows yet")
     bad: list[Mapping[str, object]] = []
+    grants = OptionGrantRepo(ctx.conn)
     for run in ctx.conn.execute("SELECT run_id, net_gbp FROM tax_runs ORDER BY run_id"):
         run_id = int(run["run_id"])
         derived = Decimal(0)
@@ -176,6 +196,9 @@ def _check_tax_run_net_reconciliation(ctx: CheckContext) -> Finding:
             (run_id,),
         ):
             derived += Decimal(str(r["p"])) - Decimal(str(r["c"]))
+        for grant in grants.for_run(run_id):
+            if grant.is_chargeable:
+                derived += grant.gain_gbp.amount
         stored = Decimal(str(run["net_gbp"]))
         if abs(stored - derived) > _NET_TOLERANCE:
             bad.append(
@@ -362,5 +385,51 @@ def _check_persisted_realisation_trade_ids(ctx: CheckContext) -> Finding:
     return Finding(
         triggered=True,
         detail=f"{len(bad)} future_realisations row(s) reference missing trade_id(s)",
+        evidence=_rows_to_evidence(bad),
+    )
+
+
+# ---------------------------------------------------------------------------
+# D7 — option run tables' trade ids still resolve in trades
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="D7",
+    description="option_grants / option_grant_closes / option_exercise_transfers trade ids resolve",
+    tier=Tier.D,
+    scopes={Scope.ALL, Scope.OPTIONS},
+    severity=Severity.ERROR,
+)
+def _check_persisted_option_trade_ids(ctx: CheckContext) -> Finding:
+    """The option twin of D6: every trade id on the three option run tables is live."""
+    if not _has_persisted_rows(ctx):
+        return Finding(triggered=False, skipped=True, detail="no persisted rows yet")
+    rows = ctx.conn.execute(
+        "SELECT 'option_grants' AS source, g.run_id, g.grant_trade_id AS trade_id "
+        "FROM option_grants g LEFT JOIN trades t ON t.trade_id = g.grant_trade_id "
+        "WHERE t.trade_id IS NULL "
+        "UNION ALL "
+        "SELECT 'option_grant_closes', c.run_id, c.close_trade_id "
+        "FROM option_grant_closes c LEFT JOIN trades t ON t.trade_id = c.close_trade_id "
+        "WHERE t.trade_id IS NULL "
+        "UNION ALL "
+        "SELECT 'option_exercise_transfers', x.run_id, x.option_trade_id "
+        "FROM option_exercise_transfers x LEFT JOIN trades t ON t.trade_id = x.option_trade_id "
+        "WHERE t.trade_id IS NULL "
+        "UNION ALL "
+        "SELECT 'option_exercise_transfers', x.run_id, x.share_trade_id "
+        "FROM option_exercise_transfers x LEFT JOIN trades t ON t.trade_id = x.share_trade_id "
+        "WHERE t.trade_id IS NULL"
+    ).fetchall()
+    if not rows:
+        return Finding(triggered=False)
+    bad = [
+        {"source": str(r["source"]), "run_id": int(r["run_id"]), "trade_id": int(r["trade_id"])}
+        for r in rows
+    ]
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} option run row(s) reference missing trade_id(s)",
         evidence=_rows_to_evidence(bad),
     )

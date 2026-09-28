@@ -18,12 +18,21 @@ Each Tier C invariant is anchored to one rule engine:
   usually an ingestion gap).
 * **C6** — every bond instrument runs cleanly under
   `BondRuleEngine.compute` (the bond twin of C1).
-* **C7** — every stock / bond / future position the trades imply
-  matches the account's latest statement, and every statement
+* **C7** — every stock / bond / future / option position the trades
+  imply matches the account's latest statement, and every statement
   position is backed by trades (the calculator's reconciliation,
   run standalone).
+* **C8** — every option series runs cleanly under
+  `OptionRuleEngine.compute` (the option twin of C1).
+* **C9** — grant closure: per series, contracts written equal the
+  contracts every close took plus the contracts still open, and no
+  closing trade drains more than its own quantity (the option twin
+  of C4).
+* **C10** — every exercise link pairs an option row with a stock
+  trade of the underlying at the strike for `contracts x multiplier`
+  at the same instant, in the direction the right implies.
 
-C1 and C6 catch engine-time exceptions; the others are pure
+C1, C6 and C8 catch engine-time exceptions; the others are pure
 post-conditions the engines should already enforce. Tier C is
 where you find out that an engine bug exists for the *whole*
 instrument, not just a single chunk.
@@ -36,10 +45,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import date as date_cls
 from decimal import Decimal
-from typing import Final
+from typing import Final, Literal
 
 from ib_cgt.calculator.positions import PositionStatus
-from ib_cgt.calculator.runs import BondEngineRun, StockEngineRun
+from ib_cgt.calculator.runs import BondEngineRun, OptionEngineRun, StockEngineRun
 from ib_cgt.checks.framework import (
     CheckContext,
     Finding,
@@ -48,11 +57,15 @@ from ib_cgt.checks.framework import (
     Tier,
     register_check,
 )
+from ib_cgt.db import OptionExerciseLinkRepo, TradeRepo
 from ib_cgt.domain import (
     Acquisition,
     Disposal,
     FXInstrument,
+    OptionInstrument,
+    StockInstrument,
     TradeAction,
+    option_share_action,
 )
 from ib_cgt.rules.fx_cashflow import from_forex_trade, make_pool_instrument
 
@@ -91,8 +104,10 @@ def _check_stocks_run_clean(ctx: CheckContext) -> Finding:
     return _runs_clean_finding(ctx.stock_runs(), noun="stock")
 
 
-def _runs_clean_finding(runs: Iterable[StockEngineRun | BondEngineRun], *, noun: str) -> Finding:
-    """Shared body of C1 / C6: one evidence row per run that captured an error."""
+def _runs_clean_finding(
+    runs: Iterable[StockEngineRun | BondEngineRun | OptionEngineRun], *, noun: str
+) -> Finding:
+    """Shared body of C1 / C6 / C8: one evidence row per run that captured an error."""
     bad: list[Mapping[str, object]] = []
     for run in runs:
         if run.error is None:
@@ -129,6 +144,161 @@ def _runs_clean_finding(runs: Iterable[StockEngineRun | BondEngineRun], *, noun:
 def _check_bonds_run_clean(ctx: CheckContext) -> Finding:
     """Mirror of C1 for the bond engine (exempt and non-exempt alike)."""
     return _runs_clean_finding(ctx.bond_runs(), noun="bond")
+
+
+# ---------------------------------------------------------------------------
+# C8 — every option series runs cleanly
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C8",
+    description="every option series runs cleanly under OptionRuleEngine.compute",
+    tier=Tier.C,
+    scopes={Scope.ALL, Scope.OPTIONS},
+    severity=Severity.ERROR,
+)
+def _check_options_run_clean(ctx: CheckContext) -> Finding:
+    """Mirror of C1 for the option engine (both the pooled and the grant side)."""
+    return _runs_clean_finding(ctx.option_runs(), noun="option")
+
+
+# ---------------------------------------------------------------------------
+# C9 — grant closure
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C9",
+    description="option grant closure: written == closed + still open, no close over-drains",
+    tier=Tier.C,
+    scopes={Scope.ALL, Scope.OPTIONS},
+    severity=Severity.ERROR,
+)
+def _check_option_grant_closure(ctx: CheckContext) -> Finding:
+    """Verify the writer-side ledger of every series adds up.
+
+    Per series: Σ contracts written (`OPEN_SHORT`) equals Σ contracts
+    every close took off a grant plus Σ contracts still open; and per
+    closing trade, the contracts it drained across grants never exceed
+    its own quantity.
+    """
+    bad: list[Mapping[str, object]] = []
+    for run in ctx.option_runs():
+        if run.result is None:
+            continue
+        written = sum(
+            (t.quantity for _tid, t in run.trades if t.action is TradeAction.OPEN_SHORT),
+            start=Decimal(0),
+        )
+        closed = sum((c.quantity for g in run.result.grants for c in g.closes), start=Decimal(0))
+        still_open = sum((g.quantity_remaining for g in run.result.open_grants), start=Decimal(0))
+        if written != closed + still_open:
+            bad.append(
+                {
+                    "instrument": run.instrument.symbol,
+                    "sum_written": str(written),
+                    "sum_closed": str(closed),
+                    "sum_open_grants": str(still_open),
+                }
+            )
+        drained_by_close: dict[int, Decimal] = {}
+        for grant in run.result.grants:
+            for close in grant.closes:
+                drained_by_close[close.close_trade_id] = (
+                    drained_by_close.get(close.close_trade_id, Decimal(0)) + close.quantity
+                )
+        close_qty = {tid: t.quantity for tid, t in run.trades}
+        for close_tid, drained in drained_by_close.items():
+            if drained > close_qty.get(close_tid, Decimal(0)):
+                bad.append(
+                    {
+                        "instrument": run.instrument.symbol,
+                        "close_trade_id": close_tid,
+                        "close_qty": str(close_qty.get(close_tid)),
+                        "sum_drained": str(drained),
+                        "issue": "closes exceed the closing trade's quantity",
+                    }
+                )
+    if not bad:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} option grant closure mismatch(es)",
+        evidence=_truncate(bad),
+    )
+
+
+# ---------------------------------------------------------------------------
+# C10 — exercise links pair the right rows
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C10",
+    description=(
+        "every option exercise link names a stock trade of the underlying at the strike "
+        "for contracts x multiplier at the same instant, in the right direction"
+    ),
+    tier=Tier.C,
+    scopes={Scope.ALL, Scope.OPTIONS},
+    severity=Severity.ERROR,
+)
+def _check_option_exercise_links(ctx: CheckContext) -> Finding:
+    """Re-verify the ingest-time pairing against the two trades' stored facts.
+
+    The linker matched the rows inside one statement; this check
+    confirms the pairing still holds on the stored rows (an
+    `ingest --replace` of one statement but not the other would leave
+    a dangling or mismatched link).
+    """
+    trades = TradeRepo(ctx.conn)
+    bad: list[Mapping[str, object]] = []
+    for option_id, share_id in OptionExerciseLinkRepo(ctx.conn).all_links().items():
+        option = trades.get(option_id)
+        share = trades.get(share_id)
+        problem = _link_problem(option, share)
+        if problem is not None:
+            bad.append({"option_trade_id": option_id, "share_trade_id": share_id, "issue": problem})
+    if not bad:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} option exercise link(s) do not pair matching trades",
+        evidence=_truncate(bad),
+    )
+
+
+def _link_problem(option: object, share: object) -> str | None:
+    """The first way a link's two stored trades fail to be one transaction, or `None`."""
+    from ib_cgt.db import StoredTrade  # local: the check module stays import-cheap
+
+    if not isinstance(option, StoredTrade) or not isinstance(share, StoredTrade):
+        return "trade row missing"
+    series = option.trade.instrument
+    stock = share.trade.instrument
+    if not isinstance(series, OptionInstrument):
+        return "option_trade_id is not an option trade"
+    if not isinstance(stock, StockInstrument):
+        return "share_trade_id is not a stock trade"
+    side: Literal["LONG", "SHORT"]
+    if option.trade.action is TradeAction.EXERCISE_LONG:
+        side = "LONG"
+    elif option.trade.action is TradeAction.ASSIGN_SHORT:
+        side = "SHORT"
+    else:
+        return f"option trade is a {option.trade.action.value}, not an exercise or assignment"
+    if stock.symbol != series.underlying:
+        return f"share symbol {stock.symbol} is not the underlying {series.underlying}"
+    if share.trade.trade_datetime != option.trade.trade_datetime:
+        return "share trade is not at the same instant"
+    if share.trade.action is not option_share_action(series.right, side):
+        return f"share trade is a {share.trade.action.value}; the option implies the opposite"
+    if share.trade.quantity != option.trade.quantity * series.contract_multiplier:
+        return "share quantity is not contracts x multiplier"
+    if share.trade.price.amount != series.strike:
+        return f"share price {share.trade.price.amount} is not the strike {series.strike}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -391,11 +561,11 @@ def _check_futures_open_past_expiry(ctx: CheckContext) -> Finding:
 @register_check(
     name="C7",
     description=(
-        "every stock/bond/future position implied by the trades matches the latest "
+        "every stock/bond/future/option position implied by the trades matches the latest "
         "statement's open positions, and every statement position is backed by trades"
     ),
     tier=Tier.C,
-    scopes={Scope.ALL, Scope.STOCKS, Scope.FUTURES},
+    scopes={Scope.ALL, Scope.STOCKS, Scope.FUTURES, Scope.OPTIONS},
     severity=Severity.ERROR,
 )
 def _check_positions_reconcile(ctx: CheckContext) -> Finding:

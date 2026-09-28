@@ -17,7 +17,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ib_cgt.domain import BondInstrument, FutureInstrument, StockInstrument
+from ib_cgt.domain import (
+    BondInstrument,
+    FutureInstrument,
+    OptionInstrument,
+    OptionRight,
+    StockInstrument,
+)
 from ib_cgt.ingest.mapper import MappingError
 from ib_cgt.ingest.parsers import parse_statement
 from ib_cgt.ingest.positions import map_open_positions
@@ -235,9 +241,44 @@ def test_bond_without_security_id_is_returned_as_leftover() -> None:
 
 
 def test_unknown_asset_class_raises_mapping_error() -> None:
-    """The parser already drops options; anything else unknown is loud."""
+    """An asset class no mapper models is loud."""
     with pytest.raises(MappingError, match="Unsupported asset class"):
         map_open_positions(_parsed(_row(asset_class="Warrants", symbol="W")))
+
+
+def test_option_position_resolves_through_the_options_instrument_table() -> None:
+    """An option series held over resolves by its series key to the conid-keyed instrument."""
+    info = RawInstrumentInfo(
+        asset_class="Equity and Index Options",
+        symbol="TUR   260515P00022000",
+        description="TUR 17MAY26 22.0 P",
+        multiplier_text="100",
+        expiry_text="2026-05-15",
+        listing_exch=None,
+        conid_text="700000001",
+        underlying="TUR",
+        type_text="P",
+        strike_text="22",
+    )
+    positions, leftovers = map_open_positions(
+        _parsed(
+            _row(asset_class="Equity and Index Options", symbol="TUR 17MAY26 22.0 P"),
+            instruments=(info,),
+        )
+    )
+    assert leftovers == []
+    (position,) = positions
+    assert position.instrument == OptionInstrument(
+        conid=700000001,
+        symbol="TUR 17MAY26 22.0 P",
+        currency="USD",
+        underlying="TUR",
+        contract_multiplier=Decimal("100"),
+        expiry_date=date(2026, 5, 15),
+        strike=Decimal("22"),
+        right=OptionRight.PUT,
+    )
+    assert position.quantity == Decimal("10")
 
 
 def test_mixed_statement_keeps_resolved_and_leftover_rows_in_order() -> None:
@@ -247,6 +288,7 @@ def test_mixed_statement_keeps_resolved_and_leftover_rows_in_order() -> None:
         "IEAA",
         "IEMI",
         "TSLA",
+        "TUR 17MAY26 22.0 P",
         "UKT 0 3/8 10/22/26",
         "6LK6",
     ]

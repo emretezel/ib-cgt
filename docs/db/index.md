@@ -26,9 +26,8 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`22`** (`001_initial.sql` through `022_statement_time_zone.sql`
-all applied — see [`schema_migrations.md`](./schema_migrations.md) for
-the full list). Whenever a new migration lands in the repository, run
+`23`** (`001_initial.sql` through `023_options.sql` all applied — see
+[`schema_migrations.md`](./schema_migrations.md) for the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
 documentation so the per-table pages reflect what is actually
 deployed.
@@ -44,9 +43,11 @@ deployed.
 | `bond_instruments` | Asset-class child of `instruments` for bonds (ISIN-keyed, with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
 | `future_instruments` | Asset-class child of `instruments` for futures (keyed by IB `conid`; multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
+| `option_instruments` | Asset-class child of `instruments` for exchange-traded option series (keyed by IB `conid`; underlying, multiplier, expiry, strike, right) | [`option_instruments.md`](./option_instruments.md) |
 | `statements` | One row per imported IB statement, HTML or PDF (idempotency, covered period) | [`statements.md`](./statements.md) |
 | `statement_positions` | One row per instrument open on a statement's last day (the Open Positions section) | [`statement_positions.md`](./statement_positions.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
+| `option_exercise_links` | One row per exercised / assigned option row paired with the share trade IB booked for it (one transaction under TCGA 1992 s.144(2)–(3)) | [`option_exercise_links.md`](./option_exercise_links.md) |
 | `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax); instrument-less, the IB security tag is kept as text | [`dividends.md`](./dividends.md) |
 | `bond_coupons` | One row per bond coupon payment from IB's Interest section | [`bond_coupons.md`](./bond_coupons.md) |
 | `cash_events` | One row per instrument-less cash movement (broker interest, external transfers, fees, interest withholding) | [`cash_events.md`](./cash_events.md) |
@@ -54,6 +55,9 @@ deployed.
 | `tax_runs` | One row per `compute --year` invocation | [`tax_runs.md`](./tax_runs.md) |
 | `matched_disposals` | Per-chunk audit trail produced by the calculator | [`matched_disposals.md`](./matched_disposals.md) |
 | `future_realisations` | Per-run closed-out futures contracts (the s.143(5) side of a run) | [`future_realisations.md`](./future_realisations.md) |
+| `option_grants` | Per-run written options — the disposal constituted by each grant (s.144(1)) | [`option_grants.md`](./option_grants.md) |
+| `option_grant_closes` | Per-run later events on a grant: closing purchase, lapse, assignment, cash settlement | [`option_grant_closes.md`](./option_grant_closes.md) |
+| `option_exercise_transfers` | Per-run amounts an exercise or assignment moved into a share trade (s.144(2)–(3)) | [`option_exercise_transfers.md`](./option_exercise_transfers.md) |
 | `fx_event_sources` | Per-run map from synthetic FX event ids to the dividend / coupon / cash-event / realisation they stood for | [`fx_event_sources.md`](./fx_event_sources.md) |
 | `tax_run_issues` | Per-run errors and warnings recorded by `compute` ("save what worked") | [`tax_run_issues.md`](./tax_run_issues.md) |
 
@@ -61,14 +65,18 @@ deployed.
 
 ```
 accounts (account_id) ──┐
-                        ├── statements ── trades ──────────── instruments ── {stock,bond,future,fx}_instruments
-                        │             ├─ bond_coupons ───────┘  ▲
-                        │             ├─ statement_positions ─┘  │
-                        │             ├─ dividends                │
-                        │             └─ cash_events              │
-tax_runs ──┬─ matched_disposals ────────────────────────────────┤
-           ├─ future_realisations ──────────────────────────────┤
-           ├─ tax_run_issues ───────────────────────────────────┘
+                        ├── statements ── trades ──────────── instruments ── {stock,bond,future,fx,option}_instruments
+                        │             │     └─ option_exercise_links ┘  ▲
+                        │             ├─ bond_coupons ────────────────┘  │
+                        │             ├─ statement_positions ──────────┘  │
+                        │             ├─ dividends                         │
+                        │             └─ cash_events                       │
+tax_runs ──┬─ matched_disposals ─────────────────────────────────────────┤
+           ├─ future_realisations ───────────────────────────────────────┤
+           ├─ option_grants ── option_grant_closes                        │
+           │        └────────────────────────────────────────────────────┤
+           ├─ option_exercise_transfers ─────────────────────────────────┤
+           ├─ tax_run_issues ────────────────────────────────────────────┘
            └─ fx_event_sources
 
 fx_rates (standalone cache; no FK in or out)
@@ -76,16 +84,25 @@ fx_rates (standalone cache; no FK in or out)
 
 `instruments` is a thin parent (id + discriminator); each row has
 exactly one matching child row in one of `stock_instruments`,
-`bond_instruments`, `future_instruments`, or `fx_instruments`,
-selected by `instruments.asset_class`. Each child owns its class's
-natural key — IB's `conid` for stocks and futures, the ISIN for bonds,
-the pair for FX — which is how ingestion recognises the same
-instrument across statements (IB renames symbols; it never changes a
-conid). Trade and disposal references target the parent so callers
-don't need to know the discriminator when joining, and the surrogate
-`instrument_id` is the only identity the calculator compares.
-`dividends` and `cash_events` are deliberately instrument-less: only
-their cash leg feeds the FX pools.
+`bond_instruments`, `future_instruments`, `fx_instruments` or
+`option_instruments`, selected by `instruments.asset_class`. Each
+child owns its class's natural key — IB's `conid` for stocks, futures
+and options, the ISIN for bonds, the pair for FX — which is how
+ingestion recognises the same instrument across statements (IB renames
+symbols; it never changes a conid). Trade and disposal references
+target the parent so callers don't need to know the discriminator
+when joining, and the surrogate `instrument_id` is the only identity
+the calculator compares. `dividends` and `cash_events` are
+deliberately instrument-less: only their cash leg feeds the FX pools.
+
+`option_exercise_links` is the one table that references `trades`
+with real foreign keys: it is a fact of the statement (two rows IB
+printed at the same instant form one s.144 transaction) and dies with
+the statement's trades. The run-scoped tables — `matched_disposals`,
+`future_realisations`, `option_grants`, `option_grant_closes`,
+`option_exercise_transfers`, `fx_event_sources` — deliberately carry
+trade ids **without** a FK, so an audit row survives a re-ingest and
+the Tier D checks (D4, D6, D7) can report a dangling id.
 
 Foreign-key chain in detail:
 
@@ -106,10 +123,18 @@ Foreign-key chain in detail:
 - `bond_instruments.instrument_id`     → `instruments.instrument_id` `ON DELETE CASCADE`
 - `future_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`
 - `fx_instruments.instrument_id`       → `instruments.instrument_id` `ON DELETE CASCADE`
+- `option_instruments.instrument_id`   → `instruments.instrument_id` `ON DELETE CASCADE`
+- `option_exercise_links.option_trade_id` → `trades.trade_id` `ON DELETE CASCADE`
+- `option_exercise_links.share_trade_id`  → `trades.trade_id` `ON DELETE CASCADE`
 - `matched_disposals.run_id`           → `tax_runs.run_id` `ON DELETE CASCADE`
 - `matched_disposals.instrument_id`    → `instruments.instrument_id`
 - `future_realisations.run_id`         → `tax_runs.run_id` `ON DELETE CASCADE`
 - `future_realisations.instrument_id`  → `instruments.instrument_id`
+- `option_grants.run_id`               → `tax_runs.run_id` `ON DELETE CASCADE`
+- `option_grants.instrument_id`        → `instruments.instrument_id`
+- `option_grant_closes.(run_id, grant_trade_id)` → `option_grants.(run_id, grant_trade_id)` `ON DELETE CASCADE`
+- `option_exercise_transfers.run_id`   → `tax_runs.run_id` `ON DELETE CASCADE`
+- `option_exercise_transfers.instrument_id` → `instruments.instrument_id`
 - `fx_event_sources.run_id`            → `tax_runs.run_id` `ON DELETE CASCADE`
 - `tax_run_issues.run_id`              → `tax_runs.run_id` `ON DELETE CASCADE`
 - `tax_run_issues.instrument_id`       → `instruments.instrument_id`
@@ -118,7 +143,7 @@ Foreign-key chain in detail:
 
 | View | Purpose |
 |---|---|
-| `v_instruments` | UNION-ALL of the four asset-class children with the parent, projecting one flat column shape (`isin` from bonds only, `conid` from stocks and futures only) so external readers do not need to know about the per-class split. Callers that filter by `symbol` or `currency` (CLI's FX-sync `DISTINCT currency`, `TradeRepo.list_filtered`'s symbol join) target this view. |
+| `v_instruments` | UNION-ALL of the five asset-class children with the parent, projecting one flat column shape (`isin` from bonds only, `conid` from stocks, futures and options, `contract_multiplier` / `expiry_date` from futures and options, `underlying` / `strike` / `option_right` from options only) so external readers do not need to know about the per-class split. Callers that filter by `symbol` or `currency` (CLI's FX-sync `DISTINCT currency`, `TradeRepo.list_filtered`'s symbol join) target this view. |
 
 The view does not duplicate truth — it is a read-time projection only,
 which is the use CLAUDE.md §3 explicitly allows.
@@ -151,6 +176,14 @@ the same kind of movement (a fee, broker interest) goes either way
 and the sign is the only trustworthy direction signal on those rows.
 `future_realisations.gross_pnl_native` / `proceeds_gbp` are signed
 for the same reason: a close-out's net cashflow is a loss or a gain.
+The option run tables store magnitudes only; direction is carried by
+`option_grant_closes.kind` and `option_exercise_transfers.side`.
+
+Run-scoped tables whose native amounts are all in one instrument's
+currency (`future_realisations`, `option_grants`,
+`option_grant_closes`) store **no currency column**: the currency is
+the instrument's, and repeating it would be a transitive dependency
+(3NF). Readers rebuild `Money` values from the loaded instrument.
 
 ### Dates and datetimes
 

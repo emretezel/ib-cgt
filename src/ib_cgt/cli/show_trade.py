@@ -16,6 +16,7 @@ from ib_cgt.cli.app import show_app
 from ib_cgt.cli.common import build_fx_service, console
 from ib_cgt.config import resolve_db_path
 from ib_cgt.db import (
+    OptionExerciseLinkRepo,
     StatementRepo,
     StatementRow,
     StoredTrade,
@@ -23,7 +24,15 @@ from ib_cgt.db import (
     apply_migrations,
     open_connection,
 )
-from ib_cgt.domain import FutureInstrument, FXInstrument, Money, StockInstrument, Trade, TradeAction
+from ib_cgt.domain import (
+    FutureInstrument,
+    FXInstrument,
+    Money,
+    OptionInstrument,
+    StockInstrument,
+    Trade,
+    TradeAction,
+)
 from ib_cgt.fx import FXService, RateNotFoundError
 
 
@@ -58,10 +67,13 @@ def show_trade(
         # exactly what the rule engines would consume.
         fx_service = build_fx_service(conn)
         rate_preview = _fx_rate_preview(stored.trade, fx_service)
+        # The share trade an exercised / assigned option produced, if
+        # the ingest linked one (`option_exercise_links`).
+        linked_share = OptionExerciseLinkRepo(conn).for_option_trades([trade_id]).get(trade_id)
     finally:
         conn.close()
 
-    _render_show_trade(stored, statement, rate_preview, db_path)
+    _render_show_trade(stored, statement, rate_preview, db_path, linked_share)
 
 
 def _fx_rate_preview(trade: Trade, fx_service: FXService) -> Decimal | None:
@@ -92,6 +104,7 @@ def _render_show_trade(
     statement: StatementRow | None,
     rate_preview: Decimal | None,
     db_path: Path,
+    linked_share: int | None = None,
 ) -> None:
     """Render a Rich panel with all audit-relevant facts about one trade."""
     trade = stored.trade
@@ -145,13 +158,16 @@ def _render_show_trade(
         )
 
     # Asset-class-specific extras + GBP preview.
-    _render_show_trade_extras(table, stored, rate_preview)
+    _render_show_trade_extras(table, stored, rate_preview, linked_share)
 
     console.print(table)
 
 
 def _render_show_trade_extras(
-    table: Table, stored: StoredTrade, rate_preview: Decimal | None
+    table: Table,
+    stored: StoredTrade,
+    rate_preview: Decimal | None,
+    linked_share: int | None = None,
 ) -> None:
     """Add asset-class-specific rows + GBP preview to the dossier table."""
     trade = stored.trade
@@ -213,6 +229,29 @@ def _render_show_trade_extras(
             "Realisation linkage",
             "see `ib-cgt show realisation --close <id>` for any closeout this trade drove",
         )
+
+    elif isinstance(instrument, OptionInstrument):
+        table.add_row(
+            "Series",
+            f"conid={instrument.conid}  {instrument.right.value} on {instrument.underlying}  "
+            f"strike={instrument.strike}  expiry={instrument.expiry_date.isoformat()}  "
+            f"multiplier={instrument.contract_multiplier}",
+        )
+        # The premium a row moves is price x multiplier x contracts.
+        premium = trade.price.amount * instrument.contract_multiplier * trade.quantity
+        table.add_row(
+            "Premium (price*mult*qty)",
+            f"{premium} {trade.price.currency}  fees={trade.fees.amount} {trade.fees.currency}",
+        )
+        if rate_preview is not None:
+            table.add_row("GBP equivalent of premium", f"£{premium / rate_preview:.2f}")
+        if trade.action in (TradeAction.EXERCISE_LONG, TradeAction.ASSIGN_SHORT):
+            table.add_row(
+                "Exercise linkage",
+                f"share trade #{linked_share} (one transaction, TCGA 1992 s.144)"
+                if linked_share is not None
+                else "no share trade linked — treated as cash-settled (s.144A)",
+            )
 
     # GBP equivalents for forex trades — both legs, since each is
     # potentially its own pool event.

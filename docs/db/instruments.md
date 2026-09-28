@@ -9,8 +9,11 @@ across every asset class — a surrogate `instrument_id` and the
 natural key, lives on the matching child table:
 [`stock_instruments`](./stock_instruments.md) (keyed by IB `conid`),
 [`bond_instruments`](./bond_instruments.md) (keyed by ISIN),
-[`future_instruments`](./future_instruments.md) (keyed by IB `conid`), or
-[`fx_instruments`](./fx_instruments.md) (keyed by the pair).
+[`future_instruments`](./future_instruments.md) (keyed by IB `conid`),
+[`fx_instruments`](./fx_instruments.md) (keyed by the pair), or
+[`option_instruments`](./option_instruments.md) (keyed by IB `conid`;
+added by migration `023`, which rebuilt this table to widen the
+discriminator's CHECK — SQLite cannot alter a CHECK in place).
 
 The split exists because the pre-`003` single-table design used
 nullable subclass columns inside the natural-key UNIQUE. SQLite (per
@@ -36,7 +39,7 @@ symbol, ISIN, conid or expiry.
 | Column | Type | Nullable | Notes |
 |---|---|---|---|
 | `instrument_id` | `INTEGER` | No (PK) | Surrogate id; used by `trades.instrument_id`, `statement_positions.instrument_id`, `bond_coupons.instrument_id` and the run-scoped tables. Each parent row has exactly one matching child row, identified by `asset_class`. |
-| `asset_class` | `TEXT` | No | Discriminator — exactly one of `stock`, `bond`, `future`, `fx`. |
+| `asset_class` | `TEXT` | No | Discriminator — exactly one of `stock`, `bond`, `future`, `fx`, `option`. |
 
 ## Primary key
 
@@ -54,11 +57,14 @@ None outbound. Inbound references:
 - [`bond_coupons.instrument_id`](./bond_coupons.md)
 - [`matched_disposals.instrument_id`](./matched_disposals.md)
 - [`future_realisations.instrument_id`](./future_realisations.md)
+- [`option_grants.instrument_id`](./option_grants.md)
+- [`option_exercise_transfers.instrument_id`](./option_exercise_transfers.md)
 - [`tax_run_issues.instrument_id`](./tax_run_issues.md)
 - [`stock_instruments.instrument_id`](./stock_instruments.md) — `ON DELETE CASCADE`
 - [`bond_instruments.instrument_id`](./bond_instruments.md) — `ON DELETE CASCADE`
 - [`future_instruments.instrument_id`](./future_instruments.md) — `ON DELETE CASCADE`
 - [`fx_instruments.instrument_id`](./fx_instruments.md) — `ON DELETE CASCADE`
+- [`option_instruments.instrument_id`](./option_instruments.md) — `ON DELETE CASCADE`
 
 The cascade keeps the one-to-one parent / child invariant: deleting
 the parent automatically removes its child row. [`dividends`](./dividends.md)
@@ -72,9 +78,9 @@ tables.
 
 ## CHECK constraints
 
-- `CHECK (asset_class IN ('stock', 'bond', 'future', 'fx'))` — closes
-  the discriminator domain so an unknown class can never reach the
-  table.
+- `CHECK (asset_class IN ('stock', 'bond', 'future', 'fx', 'option'))`
+  — closes the discriminator domain so an unknown class can never
+  reach the table.
 
 ## Indexes
 
@@ -84,7 +90,8 @@ None beyond the primary-key index.
 
 [`v_instruments`](./index.md#views) joins this parent with the
 appropriate child via `instrument_id` to expose one flat column shape
-(`conid` for stocks and futures, `isin` for bonds, NULL otherwise)
+(`conid` for stocks, futures and options, `isin` for bonds,
+`underlying` / `strike` / `option_right` for options, NULL otherwise)
 for callers that don't care about the discriminator.
 
 ## Read paths
@@ -109,28 +116,30 @@ for callers that don't care about the discriminator.
   trade, position and coupon, upserts the `Instrument` (parent +
   child) before inserting the row.
 - `ib-cgt compute --year` — the persist step resolves every matched
-  disposal, realisation and issue to its `instrument_id` through the
-  same upsert.
+  disposal, realisation, option grant, exercise transfer and issue to
+  its `instrument_id` through the same upsert.
 
 ## Sample (first 5 rows)
 
-Captured after migration `021` with
+Captured after the full re-ingest following migration `023` with
 `SELECT instrument_id, asset_class FROM instruments LIMIT 5;` from the
-live DB, rendered as `column = value` blocks.
+live DB, rendered as `column = value` blocks. Ids are issued in ingest
+order, so the 2011 forex pair comes first and the 2012 XAUUSD call —
+the first option row in the history — is `5`.
 
 ```
 instrument_id = 1
-  asset_class = stock
+  asset_class = fx
 
 instrument_id = 2
-  asset_class = future
+  asset_class = stock
 
 instrument_id = 3
-  asset_class = future
+  asset_class = stock
 
 instrument_id = 4
-  asset_class = future
+  asset_class = stock
 
 instrument_id = 5
-  asset_class = future
+  asset_class = option
 ```

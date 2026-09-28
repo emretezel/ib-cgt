@@ -61,6 +61,13 @@ class RunIssueKind(StrEnum):
     `history_no_lookahead`: the account's history covers the year but
         not the 30-day matching window after it.
     `empty_year`: the year has no disposals and no realisations.
+    `option_grant_restated`: a closing purchase, assignment or cash
+        settlement dated in this year modifies a written option's grant
+        charged in an earlier year (TCGA 1992 s.148(3), s.144(2);
+        CG12317) — recompute that year and amend its return.
+    `option_exercise_unlinked`: an option was exercised or assigned but
+        no share trade at the strike was booked with it, so it was
+        treated as cash-settled (s.144A); verify against the statement.
     """
 
     POSITION_MISMATCH = "position_mismatch"
@@ -72,6 +79,8 @@ class RunIssueKind(StrEnum):
     HISTORY_INCOMPLETE = "history_incomplete"
     HISTORY_NO_LOOKAHEAD = "history_no_lookahead"
     EMPTY_YEAR = "empty_year"
+    OPTION_GRANT_RESTATED = "option_grant_restated"
+    OPTION_EXERCISE_UNLINKED = "option_exercise_unlinked"
 
     @property
     def severity(self) -> IssueSeverity:

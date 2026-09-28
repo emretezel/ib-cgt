@@ -4,10 +4,12 @@
 
 One row per completed `ib-cgt compute --year YYYY` invocation,
 capturing the tax year, when the computation ran, and the headline
-net-gain figure in GBP — the sum over both
+net-gain figure in GBP — the sum over
 [`matched_disposals`](./matched_disposals.md) and
 [`future_realisations`](./future_realisations.md) of proceeds minus
-cost. A re-run for the same tax year **replaces** its prior row
+cost, plus the gain on every chargeable
+[`option_grant`](./option_grants.md) (chargeable premium less the grant
+fee and its closes' costs). A re-run for the same tax year **replaces** its prior row
 atomically (delete-then-insert in a single transaction, cascading to
 every child table). Migration 018 emptied the table once, before any
 writer existed. The
@@ -41,10 +43,14 @@ surrogate keeps the FK narrow.
 None outbound. Inbound, all `ON DELETE CASCADE`:
 [`matched_disposals.run_id`](./matched_disposals.md),
 [`future_realisations.run_id`](./future_realisations.md),
+[`option_grants.run_id`](./option_grants.md) (and through it
+[`option_grant_closes`](./option_grant_closes.md)),
+[`option_exercise_transfers.run_id`](./option_exercise_transfers.md),
 [`fx_event_sources.run_id`](./fx_event_sources.md) and
 [`tax_run_issues.run_id`](./tax_run_issues.md) — replacing a run
-automatically removes its chunks, its futures realisations, its
-synthetic-id map and its issues.
+automatically removes its chunks, its futures realisations, its option
+grants with their closes, its exercise transfers, its synthetic-id map
+and its issues.
 
 ## Uniqueness constraints
 
@@ -95,17 +101,34 @@ None.
 ## Sample (first 5 rows)
 
 Captured via the Python `sqlite3` module in `-line` style after the
-first live `ib-cgt compute --year 2024/25` and `2025/26` runs (the
-system `sqlite3` binary predates STRICT tables).
+recompute of every year 2011/12–2025/26 that followed migration `023`
+(`SELECT * FROM tax_runs LIMIT 5`, no ordering; the system `sqlite3`
+binary predates STRICT tables). Run 2 (2012/13) is the year the two
+XAUUSD grants are charged in.
 
 ```
      run_id = 1
-   tax_year = 2024
-computed_at = 2026-09-06T23:17:02.857204+00:00
-    net_gbp = -65575.29462422834695378897446
+   tax_year = 2011
+computed_at = 2026-09-28T16:39:42.138547+00:00
+    net_gbp = 1588.327321262954131589714494
 
      run_id = 2
-   tax_year = 2025
-computed_at = 2026-09-06T23:18:06.264652+00:00
-    net_gbp = 158791.5819912538200485556807
+   tax_year = 2012
+computed_at = 2026-09-28T16:39:50.895007+00:00
+    net_gbp = -1951.980220323613613296385444
+
+     run_id = 3
+   tax_year = 2013
+computed_at = 2026-09-28T16:39:59.717519+00:00
+    net_gbp = 5339.328982726037998055281169
+
+     run_id = 4
+   tax_year = 2014
+computed_at = 2026-09-28T16:40:08.572549+00:00
+    net_gbp = 787.970506909860022804151295
+
+     run_id = 5
+   tax_year = 2015
+computed_at = 2026-09-28T16:40:17.414097+00:00
+    net_gbp = 2341.301924760238870341934747
 ```

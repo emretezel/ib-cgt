@@ -218,6 +218,25 @@ def check_futures(
     )
 
 
+@check_app.command("options")
+def check_options(
+    symbol: Annotated[str | None, typer.Option("--symbol", "-s", help=_CHECK_SYMBOL_HELP)] = None,
+    strict: Annotated[bool, typer.Option("--strict", help=_CHECK_STRICT_HELP)] = False,
+    as_json: Annotated[bool, typer.Option("--json", help=_CHECK_JSON_HELP)] = False,
+    since: Annotated[str | None, typer.Option("--since", help=_CHECK_SINCE_HELP)] = None,
+    until: Annotated[str | None, typer.Option("--until", help=_CHECK_UNTIL_HELP)] = None,
+) -> None:
+    """Run option-specific Tier C invariants only (engine runs, grant closure, exercise links)."""
+    _execute_check(
+        scope=Scope.OPTIONS,
+        strict=strict,
+        as_json=as_json,
+        symbol=symbol,
+        since_str=since,
+        until_str=until,
+    )
+
+
 @check_app.command("pool")
 def check_pool(
     symbol: Annotated[str | None, typer.Option("--symbol", "-s", help=_CHECK_SYMBOL_HELP)] = None,

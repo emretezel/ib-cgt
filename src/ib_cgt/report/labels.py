@@ -32,10 +32,14 @@ from ib_cgt.domain import (
     FutureInstrument,
     FXInstrument,
     MatchRule,
+    OptionCloseKind,
+    OptionExerciseTransfer,
+    OptionInstrument,
+    OptionRight,
     StockInstrument,
     Trade,
 )
-from ib_cgt.report.model import CloseOutBasis, LineBasis
+from ib_cgt.report.model import CloseOutBasis, GrantBasis, LineBasis
 
 # ---------------------------------------------------------------------------
 # Event labels — the citeable ids
@@ -116,6 +120,40 @@ def cash_description(event: CashEvent) -> str:
     return f"{event.kind.value}: {event.description}"
 
 
+def transfer_note(transfer: OptionExerciseTransfer) -> str:
+    """What an exercise did to the share trade it produced, in the line's description.
+
+    `s.144: option #12 exercised, 2,181.83 GBP added to cost` — the
+    option trade, which side of it the taxpayer was on, the amount
+    that moved and the direction the right implies (see
+    `StockRuleEngine` for the four cases).
+    """
+    right = transfer.instrument.right
+    if transfer.side == "LONG":
+        verb = "exercised"
+        effect = "added to cost" if right is OptionRight.CALL else "cost of disposal"
+    else:
+        verb = "assigned"
+        effect = "added to proceeds" if right is OptionRight.CALL else "deducted from cost"
+    return (
+        f"s.144: option {trade_label(transfer.option_trade_id)} {verb}, "
+        f"{transfer.amount_gbp.amount:,.2f} GBP {effect}"
+    )
+
+
+_CLOSE_KIND_LABELS: dict[OptionCloseKind, str] = {
+    OptionCloseKind.PURCHASE: "closing purchase (s.148)",
+    OptionCloseKind.LAPSE: "lapsed",
+    OptionCloseKind.ASSIGNMENT: "assigned (s.144(2))",
+    OptionCloseKind.CASH_SETTLEMENT: "cash-settled (s.144A)",
+}
+
+
+def close_kind_label(kind: OptionCloseKind) -> str:
+    """How a written option's close reads on the page, with its statutory hook."""
+    return _CLOSE_KIND_LABELS[kind]
+
+
 def _class_word(instrument: AnyInstrument) -> str:
     """The lower-case word the audit output uses for each instrument class."""
     if isinstance(instrument, FXInstrument):
@@ -162,6 +200,13 @@ def instrument_identifier(instrument: AnyInstrument) -> str:
             f"expiry {instrument.expiry_date.isoformat()}, "
             f"multiplier {_plain(instrument.contract_multiplier)}"
         )
+    if isinstance(instrument, OptionInstrument):
+        return (
+            f"conid {instrument.conid}, {instrument.currency}, {instrument.underlying} "
+            f"{instrument.right.value} strike {_plain(instrument.strike)}, "
+            f"expiry {instrument.expiry_date.isoformat()}, "
+            f"multiplier {_plain(instrument.contract_multiplier)}"
+        )
     return f"currency pool {instrument.currency}/GBP"
 
 
@@ -177,6 +222,8 @@ def rule_label(basis: LineBasis) -> str:
     """The identification rule a line was matched under, with its TCGA 1992 reference."""
     if isinstance(basis, CloseOutBasis):
         return "close-out (s.143)"
+    if isinstance(basis, GrantBasis):
+        return "grant of option (s.144(1))"
     return _RULE_LABELS[basis.rule]
 
 
@@ -184,6 +231,7 @@ __all__ = [
     "asset_class_label",
     "cash_description",
     "cash_label",
+    "close_kind_label",
     "coupon_description",
     "coupon_label",
     "dividend_description",
@@ -195,4 +243,5 @@ __all__ = [
     "rule_label",
     "trade_description",
     "trade_label",
+    "transfer_note",
 ]

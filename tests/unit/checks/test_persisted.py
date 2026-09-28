@@ -124,7 +124,7 @@ def test_tier_d_is_clean_on_a_fresh_run(
     persisted_db: sqlite3.Connection, fx_service: FXService
 ) -> None:
     results = _tier_d(persisted_db, fx_service)
-    assert {r.name for r in results} == {"D1", "D2", "D3", "D4", "D5", "D6"}
+    assert {r.name for r in results} == {"D1", "D2", "D3", "D4", "D5", "D6", "D7"}
     assert all(r.status is Status.OK for r in results), [
         (r.name, r.status, r.detail) for r in results
     ]

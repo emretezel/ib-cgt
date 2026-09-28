@@ -39,7 +39,7 @@ from decimal import Decimal
 from typing import ClassVar, Final
 from zoneinfo import ZoneInfo
 
-from ib_cgt.domain.enums import AssetClass, TradeAction
+from ib_cgt.domain.enums import AssetClass, OptionRight, TradeAction
 from ib_cgt.domain.money import CurrencyPair, Money, validate_currency_code
 
 # ---------------------------------------------------------------------------
@@ -65,16 +65,28 @@ class InvalidTradeError(ValueError):
 # asserting it matches trade_date.
 _UK_ZONE: Final = ZoneInfo("Europe/London")
 
-# Actions that only make sense for non-future asset classes.
-_NON_FUTURE_ACTIONS: Final = frozenset({TradeAction.BUY, TradeAction.SELL})
+# Actions for the asset classes that simply buy and sell (stocks, bonds, FX).
+_BUY_SELL_ACTIONS: Final = frozenset({TradeAction.BUY, TradeAction.SELL})
 
-# Actions that only make sense on a FutureInstrument.
+# Actions that open or close a position by trade — the whole vocabulary
+# of a FutureInstrument.
 _FUTURE_ACTIONS: Final = frozenset(
     {
         TradeAction.OPEN_LONG,
         TradeAction.CLOSE_LONG,
         TradeAction.OPEN_SHORT,
         TradeAction.CLOSE_SHORT,
+    }
+)
+
+# An option opens and closes like a future, and can also end by lapse,
+# exercise (long side) or assignment (short side).
+_OPTION_ACTIONS: Final = _FUTURE_ACTIONS | frozenset(
+    {
+        TradeAction.LAPSE_LONG,
+        TradeAction.EXERCISE_LONG,
+        TradeAction.LAPSE_SHORT,
+        TradeAction.ASSIGN_SHORT,
     }
 )
 
@@ -259,6 +271,55 @@ class FutureInstrument(Instrument):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class OptionInstrument(Instrument):
+    """One exchange-traded option series, identified by IB's contract id.
+
+    A series is one underlying, one expiry, one strike and one right —
+    exactly what one IB conid names. HMRC pools a holder's options "by
+    series" (CG55536) and the writer's grants are tracked per series, so
+    the series is the instrument the `OptionRuleEngine` works on.
+
+    Attributes:
+        conid: IB's contract id for the series — stable across statements
+            even when IB renames the display symbol (`XSP` became `XSPAM`
+            under conid 99465795).
+        underlying: The underlying's symbol as IB's Financial Instrument
+            Information prints it (`XAUUSD`, `AAPL`). For an equity option
+            it is the stock symbol the exercise / assignment share trade
+            is booked under, which is how the two are linked at ingest.
+        contract_multiplier: Units of the underlying per contract (100
+            for a standard equity option); premium x multiplier is the
+            cash per contract.
+        expiry_date: Last day the option can be exercised.
+        strike: The exercise price per unit of the underlying.
+        right: Call or put.
+    """
+
+    conid: int
+    underlying: str
+    contract_multiplier: Decimal
+    expiry_date: date
+    strike: Decimal
+    right: OptionRight
+    asset_class: ClassVar[AssetClass] = AssetClass.OPTION
+
+    def __post_init__(self) -> None:
+        """Validate the shared fields, the conid and the contract facts."""
+        # Explicit-class `super()` for the same `@dataclass(slots=True)`
+        # reason as `FutureInstrument.__post_init__`.
+        super(OptionInstrument, self).__post_init__()
+        _validate_conid(self.conid, owner="OptionInstrument")
+        if not self.underlying or not self.underlying.strip():
+            raise InvalidInstrumentError("OptionInstrument.underlying must be non-empty")
+        if self.contract_multiplier <= 0:
+            raise InvalidInstrumentError(
+                f"OptionInstrument.contract_multiplier must be > 0, got {self.contract_multiplier}"
+            )
+        if self.strike <= 0:
+            raise InvalidInstrumentError(f"OptionInstrument.strike must be > 0, got {self.strike}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class FXInstrument(Instrument):
     """An FX holding treated as its own CGT asset class.
 
@@ -287,7 +348,9 @@ class FXInstrument(Instrument):
 
 # Discriminated union of concrete instrument types. Rule engines should
 # accept this type, never the bare `Instrument` base.
-AnyInstrument = StockInstrument | BondInstrument | FutureInstrument | FXInstrument
+AnyInstrument = (
+    StockInstrument | BondInstrument | FutureInstrument | FXInstrument | OptionInstrument
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +369,10 @@ class Trade:
 
     Attributes:
         account_id: IB account this trade executed against.
-        instrument: One of the four concrete `*Instrument` subclasses.
-        action: Direction (stocks/bonds/FX) or open/close-long/short
-            (futures). See `TradeAction`.
+        instrument: One of the five concrete `*Instrument` subclasses.
+        action: Direction (stocks/bonds/FX), open/close-long/short
+            (futures and options), or one of the qualified option closes
+            (lapse, exercise, assignment). See `TradeAction`.
         trade_datetime: Timezone-aware execution timestamp; persisted in
             UTC for forensic audit.
         trade_date: The UK-local-date projection of `trade_datetime`,
@@ -415,15 +479,26 @@ class Trade:
             )
 
     def _check_action_vs_instrument(self) -> None:
-        """BUY/SELL only for non-futures; OPEN_*/CLOSE_* only for futures."""
-        is_future = isinstance(self.instrument, FutureInstrument)
-        if is_future and self.action not in _FUTURE_ACTIONS:
+        """Each asset class has its own action vocabulary.
+
+        Futures: exactly the four OPEN_* / CLOSE_* actions. Options: those
+        four plus the qualified closes (lapse, exercise, assignment).
+        Stocks, bonds and FX: BUY / SELL only.
+        """
+        if isinstance(self.instrument, FutureInstrument):
+            if self.action not in _FUTURE_ACTIONS:
+                raise InvalidTradeError(
+                    f"FutureInstrument requires OPEN_*/CLOSE_* action, got {self.action}"
+                )
+        elif isinstance(self.instrument, OptionInstrument):
+            if self.action not in _OPTION_ACTIONS:
+                raise InvalidTradeError(
+                    "OptionInstrument requires an OPEN_*/CLOSE_*/LAPSE_*/EXERCISE_LONG/"
+                    f"ASSIGN_SHORT action, got {self.action}"
+                )
+        elif self.action not in _BUY_SELL_ACTIONS:
             raise InvalidTradeError(
-                f"FutureInstrument requires OPEN_*/CLOSE_* action, got {self.action}"
-            )
-        if not is_future and self.action not in _NON_FUTURE_ACTIONS:
-            raise InvalidTradeError(
-                f"Non-future instruments require BUY/SELL action, got {self.action}"
+                f"{type(self.instrument).__name__} requires BUY/SELL action, got {self.action}"
             )
 
     def _check_accrued_interest(self) -> None:

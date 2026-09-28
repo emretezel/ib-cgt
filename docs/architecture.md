@@ -11,7 +11,8 @@ page in the same commit.
 
 ## Scope (confirmed decisions)
 
-- **Asset classes (v1)**: stocks, bonds, futures, FX.
+- **Asset classes**: stocks, bonds, futures, FX and, since 2026-09-28,
+  exchange-traded options (equity, index and futures options).
 - **FX treatment**: tracked as its own CGT asset class with full UK matching
   rules (same-day / 30-day / S.104 per currency pair vs GBP base), not just a
   rate-conversion mechanism.
@@ -58,6 +59,12 @@ Locked in so component responsibilities are unambiguous:
 - **Bonds**: UK gilts and Qualifying Corporate Bonds are CGT-exempt; other
   bonds fall under standard pooling rules. Per-instrument exempt flag required.
   Purchase / sale accrued interest adjusts cost basis / proceeds for bonds.
+- **Options** (TCGA 1992 s.144 / s.144A / s.148): a bought option is an
+  asset pooled by series under the share-matching rules; the grant of a
+  written option is a disposal in the year of grant, a closing purchase is
+  an incidental cost of that grant (FIFO per series), and an exercise or
+  assignment is one transaction with the share trade it produces. See
+  [`options.md`](./options.md).
 
 ## Component map
 
@@ -89,10 +96,14 @@ where noted.
    and a later overlapping one contributes only the days it alone covers
    (IB has no per-row ID and distinct fills can be byte-identical, so
    content cannot be the key). See [`ingestion.md`](./ingestion.md).
-   The assembler drops rows in the "Equity and Index Options" section
-   (`assemble._IGNORED_ASSET_CLASSES`): options are out of scope until
-   the [options proposal](./options.md) is adopted, and the OCC-formatted
-   symbols would otherwise be ingested as stocks. Bond `T. Price` is rescaled by 1/100 at the mapper boundary
+   Rows in the "Equity and Index Options" section are read like every
+   other class: the mapper resolves the series to its instrument-
+   information row by symbol, description or parsed series key, turns
+   the `Ep` / `Ex` / `A` code qualifiers into lapse / exercise /
+   assignment actions, and `ingest/option_exercises.py` links an
+   exercised or assigned row to the share trade IB booked at the strike
+   (`option_exercise_links`) — see [`options.md`](./options.md).
+   Bond `T. Price` is rescaled by 1/100 at the mapper boundary
    so the unit invariant `price * quantity == settlement cash` holds —
    IB quotes bond prices as a percentage of par (`98.602` = 98.602% of
    face value) while every other asset class uses true per-unit prices.
@@ -102,7 +113,7 @@ where noted.
    display text everywhere; the rule engines never compare symbol,
    ISIN, conid or expiry — they process whatever trades the runner
    loaded for one `instrument_id`.
-   * **Stocks and futures are keyed by IB's `conid`** (migration 021),
+   * **Stocks, futures and options are keyed by IB's `conid`** (migrations 021, 023),
      read from the `Conid` column that every Financial Instrument
      Information table carries. The mapper resolves each trade-row
      symbol to its instrument-information row (through one
@@ -194,40 +205,56 @@ where noted.
      share-matching rules (s.104 / s.105 / s.106A) do not apply to
      individual-investor futures (TCGA 1992 s.143(5)–(6), HMRC CG56079) — `MatchedDisposal` and
      `MatchRule` stay strictly for the share-matching engines.
-   - `FXRuleEngine` — four-rule matching per currency pair vs GBP.
+   - `OptionRuleEngine` — two sides per series: bought options go
+     through the shared matching engine (lapse = disposal for nil,
+     linked exercise = a cost transfer into the share trade rather
+     than a disposal); written options are a FIFO ledger of grants,
+     each grant a disposal in its year with closing purchases,
+     lapses, assignments and cash settlements recorded against it
+     (`OptionGrant`). Emits `OptionExerciseTransfer` records that
+     `StockRuleEngine` folds into the share trades (s.144(2)–(3)).
+   - `FXRuleEngine` — four-rule matching per currency pair vs GBP,
+     over nine cashflow sources including option premiums.
    A shared `MatchingEngine` implements the generic same-day /
-   30-day / S.104 / s.105(2) algorithm reused by Stock, Bond, and
-   FX engines. See [`rules.md`](./rules.md) for the per-engine
-   details.
+   30-day / S.104 / s.105(2) algorithm reused by Stock, Bond,
+   Option (holder side) and FX engines. See [`rules.md`](./rules.md)
+   for the per-engine details.
 
 6. **CGT calculator / orchestrator** — `ib_cgt.calculator` — entry point
    for a tax-year computation. Its `runner` module is the single canonical
    loader: it reads the trade / dividend / coupon history from the DB and
-   drives the four rule engines in the one order that works (futures before
-   FX, because realised futures P&L is an FX cashflow), with stocks and
-   bonds in soft-residual mode so an open short is reported rather than
-   raised. The `match` commands, the `check` tiers and the calculator all
-   consume that runner. `Calculator` on top runs the whole history once,
-   filters chunks and futures realisations into the target tax year
-   (6 Apr → 5 Apr), reconciles trade-derived positions with the latest
-   statements per taxpayer (`calculator/positions.py`), derives the run's
-   issues and persists everything in one transaction — five tables, "save
-   what worked". See [`rules.md`](./rules.md#persistence) and
+   drives the five rule engines in the one order that works (futures
+   before FX, because realised futures P&L is an FX cashflow; options
+   before stocks, because an exercise or assignment modifies the share
+   trade it produced), with stocks, bonds and options in soft-residual
+   mode so an open short is reported rather than raised. The `match`
+   commands, the `check` tiers and the calculator all consume that
+   runner. `Calculator` on top runs the whole history once, filters
+   chunks, futures realisations, option grants and exercise transfers
+   into the target tax year (6 Apr → 5 Apr), reconciles trade-derived
+   positions with the latest statements per taxpayer
+   (`calculator/positions.py`), derives the run's issues — including the
+   options warnings `option_grant_restated` and
+   `option_exercise_unlinked` — and persists everything in one
+   transaction — eight tables, "save what worked". See [`rules.md`](./rules.md#persistence) and
    [`rules.md`](./rules.md#the-engine-runner).
 
 7. **Reporting** — `ib_cgt.report` — consumes a persisted tax run
    (`calculator.load_persisted_run`) and renders the SA108 view of it:
    the five box figures per form section ("Listed shares and
    securities" for stocks and non-exempt bonds, boxes 23–27; "Other
-   property, assets and gains" for futures close-outs and currency
-   pools, boxes 14–19), split by asset class, then one computation per
+   property, assets and gains" for futures close-outs, option grants and
+   bought-option disposals, and currency pools, boxes 14–19), split by
+   asset class, then one computation per
    HMRC disposal (one instrument, one day) in the working-sheet layout
    of the SA108 notes (A proceeds, B incidental costs of disposal, C,
    D cost, E incidental costs of acquisition, G, H). `model` is the
    report shape, `builder` the only arithmetic (gross proceeds and fee
-   un-folding, the futures proceeds / cost convention, per-line
-   gain / loss classification), `sources` / `labels` resolve engine ids
-   to the citeable labels of `docs/audit.md`, `document` / `layout`
+   un-folding, the futures proceeds / cost convention, the grant line
+   for written options, per-line gain / loss classification),
+   `sources` / `labels` resolve engine ids to the citeable labels of
+   `docs/audit.md` and append the s.144 note to share trades an option
+   modified, `document` / `layout`
    form the page, and `render` emits console (rich), Markdown, JSON and
    CSV. Pure formatting on top of persisted results — no engine pass,
    no FX lookups. See [`reporting.md`](./reporting.md).
@@ -241,7 +268,8 @@ where noted.
    `app` for the `ib-cgt` console script. Helpers used by two or more
    command modules live in `cli/common.py` (console, FX-service
    factory, option parsers, number formatters), `cli/matching_render.py`
-   (share-matching tables shared by `match stocks` / `match bonds`) and
+   (share-matching tables shared by `match stocks` / `match bonds` /
+   `match options`) and
    `cli/fx_labels.py` (FX provenance labels shared by `match fx` /
    `show match`); a helper used by one command stays private to that
    command's module. `tests/unit/cli/test_app_tree.py` pins the
@@ -308,7 +336,7 @@ ib-cgt/
 │   ├── architecture.md          ← this page
 │   ├── reporting.md             ← SA108 report: box mapping, conventions, formats
 │   ├── ingestion.md             ← parser strategy, PDF grid, coverage rule
-│   ├── options.md               ← options: proposed CGT treatment (not implemented)
+│   ├── options.md               ← options: the implemented CGT treatment (s.144 / s.148)
 │   ├── cgt-rules.md             (planned)
 │   ├── fx.md                    ← Frankfurter caching, business-day fallback
 │   └── cli.md                   (planned)
@@ -319,18 +347,19 @@ ib-cgt/
 │       ├── config.py            ← env-var knobs (full TOML config planned)
 │       ├── domain/
 │       ├── db/
-│       │   ├── migrations/      ← `NNN_*.sql`, applied by `migrator.py`
-│       │   └── repos/           ← one repository class per table
+│       │   ├── migrations/      ← `NNN_*.sql`, applied by `migrator.py` (023 adds the option tables)
+│       │   └── repos/           ← one repository class per table (option_exercises.py, option_grants.py, …)
 │       ├── ingest/
 │       │   ├── raw.py           ← format-neutral ParsedStatement + Raw*Row containers
 │       │   ├── parsers/         ← StatementParser strategy: tables (neutral model),
 │       │   │                       assemble (semantics), html, pdf, and the registry
 │       │   ├── coverage.py      ← the day-ownership rule between overlapping statements
-│       │   ├── ingestor.py      ← hash → parse → map → coverage filter → one transaction
-│       │   └── mapper.py, dividends.py, cash_events.py, bond_coupons.py, …
+│       │   ├── ingestor.py      ← hash → parse → map → link exercises → coverage filter → one transaction
+│       │   ├── option_exercises.py ← option row ↔ share trade at the strike (`option_exercise_links`)
+│       │   └── mapper.py, dividends.py, cash_events.py, bond_coupons.py, positions.py, …
 │       ├── fx/
-│       ├── rules/
-│       ├── calculator/          ← engine runner (`runner.py`, `runs.py`)
+│       ├── rules/               ← matching.py, stocks.py, bonds.py, futures.py, options.py, fx.py, fx_cashflow.py
+│       ├── calculator/          ← engine runner (`runner.py`, `runs.py`), `calculator.py`, `positions.py`
 │       ├── checks/              ← `ib-cgt check` facility
 │       ├── cli/                 ← Typer package (component 8)
 │       │   ├── __init__.py      ← composition root; imports the command modules, exports `app`
@@ -343,9 +372,9 @@ ib-cgt/
 │       │   ├── ingest.py        ← `ingest`
 │       │   ├── trades.py        ← `trades`
 │       │   ├── fx.py            ← `fx sync`
-│       │   ├── match_futures.py / match_stocks.py / match_fx.py / match_bonds.py
+│       │   ├── match_futures.py / match_stocks.py / match_fx.py / match_bonds.py / match_options.py
 │       │   ├── show_trade.py / show_realisation.py / show_match.py
-│       │   ├── check.py         ← `check` callback + six subcommands
+│       │   ├── check.py         ← `check` callback + seven subcommands (incl. `check options`)
 │       │   ├── bonds.py         ← `bonds list`
 │       │   ├── compute.py       ← `compute --year`
 │       │   └── report.py        ← `report --year`
@@ -360,11 +389,12 @@ ib-cgt/
 └── tests/
     ├── __init__.py
     ├── conftest.py
-    ├── test_smoke.py
-    ├── fixtures/                (planned)
-    ├── unit/
-    │   └── domain/
-    └── integration/             (planned)
+    ├── conid.py                 ← deterministic fake conids for fixtures
+    ├── options_fixtures.py      ← the four real option series, flat FX stub, trade builders
+    ├── fixtures/                ← sanitised IB statements (`statements/`)
+    ├── unit/                    ← one folder per component (domain, db, ingest, rules,
+    │                               calculator, checks, report, cli); `test_*options*.py` per folder
+    └── integration/             ← `IB_CGT_REAL_STATEMENTS=1` runs against the private statements
 ```
 
 ## Implementation order
@@ -403,17 +433,18 @@ items marked ⬜ are pending.
     pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
     shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
     feeds two pools at once with independent per-leg GBP conversion.
-    The engine consumes **eight cashflow sources** per HMRC CG78315
+    The engine consumes **nine cashflow sources** per HMRC CG78315
     ("foreign currency arising from any source"): forex trades,
     non-GBP stock trades' settlement cash, non-GBP dividends (cash
     dividends, payment-in-lieu, withholding tax — see the
     `dividends` table at [`docs/db/dividends.md`](db/dividends.md)),
     non-GBP futures trade fees, futures realisation P&L, non-GBP
     bond coupon payments (extracted from IB's `Interest` section —
-    always inflows), non-GBP **bond trades'** settlement cash, and
+    always inflows), non-GBP **bond trades'** settlement cash,
     non-GBP **cash events** (broker interest, external deposits
     booked at spot, fees — see
-    [`docs/db/cash_events.md`](db/cash_events.md)).
+    [`docs/db/cash_events.md`](db/cash_events.md)), and non-GBP
+    **option trades'** premiums, commissions and settlements.
     Soft-residual mode surfaces any leftover shortfall (e.g. opening
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
@@ -423,14 +454,20 @@ items marked ⬜ are pending.
     command and `check` tier runs on; open positions reconcile against
     the latest statements per taxpayer (`ib_cgt.calculator.positions`,
     check C7); `Calculator` computes one tax year over the whole
-    history, records issues and persists five tables; CLI
-    `compute --year [--dry-run]`; Tier D checks D1–D6 verify the
+    history, records issues and persists the run tables; CLI
+    `compute --year [--dry-run]`; Tier D checks D1–D7 verify the
     persisted runs.
 12. ✅ **Reporting** — `ib-cgt report --year`: SA108 box figures per
     form section with a per-class split, one computation per HMRC
     disposal in the working-sheet layout, console / Markdown / JSON /
     CSV renderers. See [`reporting.md`](./reporting.md).
-13. ⬜ **End-to-end tests + docs** — golden-report integration tests;
+13. ✅ **Options** — `OptionRuleEngine` (TCGA 1992 s.144 / s.144A /
+    s.148: bought options pooled by series, grants charged in the year
+    of grant, FIFO closing purchases, exercise / assignment transfers
+    into the share trade), option rows and exercise links at ingest,
+    migration 023, `match options` / `check options`, the grant line in
+    the SA108 report. See [`options.md`](./options.md).
+14. ⬜ **End-to-end tests + docs** — golden-report integration tests;
     fill out remaining `docs/` pages.
 
 ## Status
@@ -440,14 +477,14 @@ items marked ⬜ are pending.
 | 1 | Project skeleton | — (build / tooling) | ✅ Done |
 | 2 | Domain model | `ib_cgt.domain` | ✅ Done |
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
-| 4 | Ingestion | `ib_cgt.ingest` | ✅ HTML + PDF adapters, coverage rule |
+| 4 | Ingestion | `ib_cgt.ingest` | ✅ HTML + PDF adapters, coverage rule, five asset classes, option exercise links |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
-| 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
-| 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner, open-position reconciliation, `Calculator.compute` / `persist` / `load` |
-| 8 | Reporting | `ib_cgt.report` | ✅ SA108 model + builder, console / Markdown / JSON / CSV renderers |
-| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` / `check` / `compute` / `report` |
+| 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `OptionRuleEngine` + `FXRuleEngine` |
+| 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner (five engines), open-position reconciliation, `Calculator.compute` / `persist` / `load` incl. option grants and exercise transfers |
+| 8 | Reporting | `ib_cgt.report` | ✅ SA108 model + builder (share, futures and option-grant lines), console / Markdown / JSON / CSV renderers |
+| 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `match options` / `show trade` / `show realisation` / `show match` / `check` (incl. `check options`) / `compute` / `report` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
-| 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
+| 11 | Tests & fixtures | `tests/` | 🟡 Unit suites per component (options included); opt-in real-statement integration tests |
 | 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `ingestion.md`, `fx.md`, `rules.md`, `reporting.md`, `options.md`, `db/` |
 
 ## How to keep this in sync

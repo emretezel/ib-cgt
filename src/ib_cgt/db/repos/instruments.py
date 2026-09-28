@@ -1,19 +1,20 @@
-"""Repository for the parent `instruments` table and its four child tables.
+"""Repository for the parent `instruments` table and its five child tables.
 
-Schema overview (post-migration 021)
+Schema overview (post-migration 023)
 ------------------------------------
 The persistence layer mirrors the domain's discriminated `Instrument`
 hierarchy with class-table inheritance:
 
 * `instruments` — thin parent: surrogate id + asset_class discriminator.
 * `stock_instruments`, `bond_instruments`, `future_instruments`,
-  `fx_instruments` — one child per asset class, holding that class's
-  natural key as `NOT NULL UNIQUE` plus its display / contract fields.
+  `fx_instruments`, `option_instruments` — one child per asset class,
+  holding that class's natural key as `NOT NULL UNIQUE` plus its
+  display / contract fields.
 
 Natural keys (what `upsert` recognises an instrument by):
 
-* stocks and futures — IB's `conid`, stable across statements even
-  when IB renames the symbol (migration 021);
+* stocks, futures and options — IB's `conid`, stable across statements
+  even when IB renames the symbol (migrations 021 and 023);
 * bonds — the ISIN (migration 014);
 * FX pairs — `(symbol, currency, fx_base, fx_quote)`.
 
@@ -51,6 +52,8 @@ from ib_cgt.domain import (
     CurrencyPair,
     FutureInstrument,
     FXInstrument,
+    OptionInstrument,
+    OptionRight,
     StockInstrument,
 )
 
@@ -86,6 +89,8 @@ class InstrumentRepo:
           that own it);
         * futures — `symbol` only; multiplier and expiry are contract
           facts fixed at insert;
+        * options — `symbol` only, for the same reason (IB renamed the
+          XSP put's root to XSPAM under one conid);
         * bonds — `symbol`, and `is_cgt_exempt` is **promoted, not
           demoted** (OR-merged) so an exempt gilt cannot be silently
           downgraded by a coupon-ingest path that passes a `False`
@@ -163,6 +168,7 @@ class InstrumentRepo:
             AssetClass.BOND: "bond_instruments",
             AssetClass.FUTURE: "future_instruments",
             AssetClass.FX: "fx_instruments",
+            AssetClass.OPTION: "option_instruments",
         }[asset_class]
         rows = self._conn.execute(
             f"SELECT instrument_id FROM {table} WHERE symbol = ? AND currency = ? "
@@ -320,6 +326,41 @@ class InstrumentRepo:
             for r in rows
         ]
 
+    def list_options(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> list[tuple[int, OptionInstrument]]:
+        """Return every option series as `(instrument_id, OptionInstrument)`.
+
+        Drives `ib-cgt match options` and the calculator's option pass —
+        the same shape as `list_futures`. Ordered by `(symbol, expiry_date)`
+        so the rendered output is stable run-to-run.
+
+        Args:
+            symbol: If supplied, restricts to series with that exact
+                display symbol. Display text, not identity.
+
+        Returns:
+            A list of `(instrument_id, OptionInstrument)` pairs. Empty
+            when no option rows match the filter.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        sql = (
+            "SELECT instrument_id, conid, symbol, currency, underlying, contract_multiplier, "
+            "expiry_date, strike, option_right FROM option_instruments"
+            + where_sql
+            + " ORDER BY symbol, expiry_date"
+        )
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [(int(r["instrument_id"]), _option_from_row(r)) for r in rows]
+
     # ------------------------------------------------------------------
     # Internals — write dispatch
     # ------------------------------------------------------------------
@@ -372,6 +413,32 @@ class InstrumentRepo:
                     "VALUES (?, ?, ?, ?, ?)",
                     (instrument_id, symbol, currency, pair.base, pair.quote),
                 )
+            case OptionInstrument(
+                conid=conid,
+                symbol=symbol,
+                currency=currency,
+                underlying=underlying,
+                contract_multiplier=mult,
+                expiry_date=expiry,
+                strike=strike,
+                right=right,
+            ):
+                self._conn.execute(
+                    "INSERT INTO option_instruments "
+                    "(instrument_id, conid, symbol, currency, underlying, contract_multiplier, "
+                    "expiry_date, strike, option_right) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        instrument_id,
+                        conid,
+                        symbol,
+                        currency,
+                        underlying,
+                        dec_to_text(mult),
+                        date_to_text(expiry),
+                        dec_to_text(strike),
+                        right.value,
+                    ),
+                )
             case _:  # pragma: no cover — exhaustive via AnyInstrument union
                 assert_never(instrument)
 
@@ -405,6 +472,11 @@ class InstrumentRepo:
                 # Every column of an FX row is part of its natural key,
                 # so a hit means the row is already exactly right.
                 pass
+            case OptionInstrument(symbol=symbol):
+                self._conn.execute(
+                    "UPDATE option_instruments SET symbol = ? WHERE instrument_id = ?",
+                    (symbol, instrument_id),
+                )
             case _:  # pragma: no cover — exhaustive via AnyInstrument union
                 assert_never(instrument)
 
@@ -483,6 +555,20 @@ class InstrumentRepo:
                     currency_pair=CurrencyPair(base=row["fx_base"], quote=row["fx_quote"]),
                 )
 
+            case AssetClass.OPTION:
+                row = self._conn.execute(
+                    "SELECT conid, symbol, currency, underlying, contract_multiplier, "
+                    "expiry_date, strike, option_right "
+                    "FROM option_instruments WHERE instrument_id = ?",
+                    (instrument_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"instrument {instrument_id} marked option but missing "
+                        "from option_instruments"
+                    )
+                return _option_from_row(row)
+
             case _:  # pragma: no cover — enum is closed
                 assert_never(asset_class)
 
@@ -522,10 +608,29 @@ class InstrumentRepo:
                     "AND fx_base = ? AND fx_quote = ?",
                     (symbol, currency, pair.base, pair.quote),
                 ).fetchone()
+            case OptionInstrument(conid=conid):
+                row = self._conn.execute(
+                    "SELECT instrument_id FROM option_instruments WHERE conid = ?",
+                    (conid,),
+                ).fetchone()
             case _:  # pragma: no cover — exhaustive via AnyInstrument union
                 assert_never(instrument)
 
         return None if row is None else int(row["instrument_id"])
+
+
+def _option_from_row(row: sqlite3.Row) -> OptionInstrument:
+    """Rebuild an `OptionInstrument` from an `option_instruments` row."""
+    return OptionInstrument(
+        conid=int(row["conid"]),
+        symbol=row["symbol"],
+        currency=row["currency"],
+        underlying=row["underlying"],
+        contract_multiplier=text_to_dec(row["contract_multiplier"]),
+        expiry_date=text_to_date(row["expiry_date"]),
+        strike=text_to_dec(row["strike"]),
+        right=OptionRight(row["option_right"]),
+    )
 
 
 __all__ = ["InstrumentRepo"]

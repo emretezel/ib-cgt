@@ -5,8 +5,9 @@ place that loads the trade / dividend / coupon history from the
 database and runs the four rule engines over it:
 
 * `runner` — per-engine loaders (`run_stock_engine`, `run_bond_engine`,
-  `run_future_engine`, `run_fx_engine`) plus `run_engines`, the
-  whole-history pass in the one order that works (futures before FX).
+  `run_future_engine`, `run_option_engine`, `run_fx_engine`) plus
+  `run_engines`, the whole-history pass in the one order that works
+  (futures before FX, options before stocks).
 * `runs` — the frozen result records those loaders return.
 
 The `match` CLI commands, the `check` tiers, and the tax-year
@@ -42,6 +43,7 @@ from ib_cgt.calculator.runner import (
     run_future_engine,
     run_fx_engine,
     run_fx_pools,
+    run_option_engine,
     run_stock_engine,
 )
 from ib_cgt.calculator.runs import (
@@ -51,6 +53,7 @@ from ib_cgt.calculator.runs import (
     FutureEngineRun,
     FXEngineRun,
     FXInputs,
+    OptionEngineRun,
     StockEngineRun,
 )
 
@@ -63,6 +66,7 @@ __all__ = [
     "FXEngineRun",
     "FXInputs",
     "FutureEngineRun",
+    "OptionEngineRun",
     "PersistedRun",
     "PositionReconciliation",
     "PositionStatus",
@@ -79,5 +83,6 @@ __all__ = [
     "run_future_engine",
     "run_fx_engine",
     "run_fx_pools",
+    "run_option_engine",
     "run_stock_engine",
 ]

@@ -35,7 +35,7 @@ class RawTradeRow:
 
     Attributes:
         asset_class: The section-header label — `"Stocks"`, `"Futures"`,
-            `"Forex"`, or `"Bonds"`.
+            `"Forex"`, `"Bonds"` or `"Equity and Index Options"`.
         currency: The sub-section currency header, e.g. `"USD"`.
         symbol: The IB ticker in the first column.
         datetime_text: Raw timestamp string, `"YYYY-MM-DD, HH:MM:SS"`.
@@ -43,8 +43,10 @@ class RawTradeRow:
             commas (mapper normalises).
         price_text: Execution price as printed.
         fees_text: The `Comm/Fee` column text (often negative, often 0).
-        code: The `Code` column — `"O"` (open), `"C"` (close), or other
-            status flags IB occasionally uses (ignored for non-futures).
+        code: The `Code` column — `;`-separated flags: `O` (open), `C`
+            (close), `Ep` (expired), `Ex` (exercised), `A` (assigned),
+            and status flags such as `P` (partial) or `L` (liquidation)
+            that the mappers ignore. Only futures and options read it.
     """
 
     asset_class: str
@@ -70,12 +72,21 @@ class RawInstrumentInfo:
       | Underlying | Listing Exch | Multiplier | Type | Issuer |
       Maturity | Code`. Populates `security_id` (the bond's ISIN)
       and `maturity_text`.
+    * **Options-style** — `Symbol | Description | Conid | Underlying |
+      Listing Exch | Multiplier | Expiry | Delivery Month | Type |
+      Strike | Code`. Populates `underlying`, `type_text` (`C` / `P`;
+      the stocks-shaped table prints `ETF` / `COMMON` in the same
+      column) and `strike_text` alongside the multiplier and expiry.
+      The `Symbol` cell can list several OCC codes for one series
+      (`XSPAM 141220P00140000, XSP 141220P00140000` when IB renamed the
+      root), which the option mapper splits.
 
-    Both shapes (and the stocks-shaped table, which mirrors the bonds
-    one without `Issuer` / `Maturity`) carry `Conid`, IB's contract id.
+    Every shape (and the stocks-shaped table, which mirrors the bonds
+    one without `Issuer` / `Maturity`) carries `Conid`, IB's contract id.
     It is kept as raw text here — `conid_text` — because the parser's
     contract is "don't interpret"; the mapper turns it into the `int`
-    that keys `stock_instruments` / `future_instruments`.
+    that keys `stock_instruments` / `future_instruments` /
+    `option_instruments`.
 
     The optional fields default to `None` so each table shape is opt-
     in: a stocks-only or futures-only statement parses unchanged.
@@ -91,6 +102,9 @@ class RawInstrumentInfo:
     maturity_text: str | None = None
     issuer_text: str | None = None
     conid_text: str | None = None
+    underlying: str | None = None
+    type_text: str | None = None
+    strike_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -222,7 +236,7 @@ class RawOpenPositionRow:
 
     Attributes:
         asset_class: The section-header label after normalisation —
-            `"Stocks"`, `"Bonds"`, `"Futures"`.
+            `"Stocks"`, `"Bonds"`, `"Futures"`, `"Equity and Index Options"`.
         currency: The sub-section currency header.
         symbol: The IB symbol. For bonds IB prints the long
             description and the symbol in one cell separated by a

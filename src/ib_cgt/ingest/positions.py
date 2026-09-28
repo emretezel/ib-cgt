@@ -2,11 +2,11 @@
 
 The parser emits one `RawOpenPositionRow` per symbol still held on
 the last day of the statement period. This module resolves each row
-to the same instrument identity the trade mapper produces — a stock
-or a futures contract by its IB `conid`, a bond by its ISIN, all
-read from the statement's Financial Instrument Information section —
-so the trade-derived position and the statement position can be
-compared instrument for instrument.
+to the same instrument identity the trade mapper produces — a stock,
+a futures contract or an option series by its IB `conid`, a bond by
+its ISIN, all read from the statement's Financial Instrument
+Information section — so the trade-derived position and the statement
+position can be compared instrument for instrument.
 
 Resolution is FII-based and pure. A held-over position on a legacy
 statement (traded in an earlier year, never touched in this one) can
@@ -26,20 +26,22 @@ from decimal import Decimal, InvalidOperation
 from ib_cgt.domain import AnyInstrument, StatementPosition
 from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.mapper import (
+    OPTION_LABELS,
     MappingError,
     build_bond_instrument,
     build_future_instrument,
+    build_option_instrument,
     build_stock_instrument,
 )
 from ib_cgt.ingest.raw import ParsedStatement, RawOpenPositionRow
 
 # Section labels, post-normalisation, that the mapper handles. Mirrors
-# the trade mapper's label sets; anything else (options, which the
-# parser already drops; unknown future sections) is a loud failure.
+# the trade mapper's label sets; anything else (an unknown future
+# section) is a loud failure.
 _STOCK_LABELS = frozenset({"Stocks"})
 _BOND_LABELS = frozenset({"Bonds", "Corporate and Municipal Bonds"})
 _FUTURE_LABELS = frozenset({"Futures"})
-_SUPPORTED_LABELS = _STOCK_LABELS | _BOND_LABELS | _FUTURE_LABELS
+_SUPPORTED_LABELS = _STOCK_LABELS | _BOND_LABELS | _FUTURE_LABELS | OPTION_LABELS
 
 
 def map_open_positions(
@@ -70,8 +72,7 @@ def map_open_positions(
     for raw in parsed.open_positions:
         if raw.asset_class not in _SUPPORTED_LABELS:
             # Checked before the resolver so an unmodelled class is a
-            # loud failure rather than a silent leftover: the parser
-            # already drops options, so anything else here is new.
+            # loud failure rather than a silent leftover.
             raise MappingError(
                 f"Unsupported asset class in Open Positions section: {raw.asset_class!r} ({raw=})"
             )
@@ -102,6 +103,8 @@ def _resolve_instrument(raw: RawOpenPositionRow, index: InstrumentInfoIndex) -> 
         return build_stock_instrument(raw.symbol, raw.currency, index)
     if raw.asset_class in _BOND_LABELS:
         return build_bond_instrument(raw.symbol, raw.currency, index)
+    if raw.asset_class in OPTION_LABELS:
+        return build_option_instrument(raw.symbol, raw.currency, index)
     # `map_open_positions` has already rejected every other label.
     return build_future_instrument(raw.symbol, raw.currency, index)
 

@@ -16,13 +16,14 @@ import csv
 import io
 from decimal import Decimal
 
-from ib_cgt.report.labels import instrument_identifier, rule_label
+from ib_cgt.report.labels import close_kind_label, instrument_identifier, rule_label
 from ib_cgt.report.model import (
     CloseOutBasis,
     ComputationLine,
     DirectBasis,
     DisposalComputation,
     EventRef,
+    GrantBasis,
     LineBasis,
     Sa108Report,
 )
@@ -108,6 +109,21 @@ def _acquisition_columns(basis: LineBasis) -> tuple[str, str, str, str]:
             f"{_decimal(basis.open_fx_rate)} close {_decimal(basis.close_fx_rate)}"
         )
         return (ref.label, _date(ref), ref.account_id or "", description)
+    if isinstance(basis, GrantBasis):
+        closes = "; ".join(
+            f"{close_kind_label(close.kind)} {close.close.label} {_date(close.close)} "
+            f"{_decimal(close.quantity)} for "
+            f"{_decimal((close.premium_native + close.fee_native).amount)} "
+            f"{close.premium_native.currency}"
+            for close in basis.closes
+        )
+        description = (
+            f"grant of {_decimal(basis.granted_quantity)} for "
+            f"{_decimal(basis.premium_native.amount)} {basis.premium_native.currency} less fee "
+            f"{_decimal(basis.grant_fee_native.amount)} {basis.grant_fee_native.currency}; FX "
+            f"{_decimal(basis.grant_fx_rate)}; later events: {closes or 'none'}"
+        )
+        return ("grant", "", "", description)
     description = (
         f"S.104 holding of {_decimal(basis.quantity_before)} units, cost "
         f"{_decimal(basis.total_cost_gbp_before.amount)} GBP, average "

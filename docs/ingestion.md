@@ -15,10 +15,13 @@ file bytes ──hash──▶ already imported?  ──yes──▶ stop (const
                                                           │
                             mappers: trades, corporate actions, dividends, coupons, cash events, positions
                                                           │
+                                      exercise links (option row ↔ share trade at the strike)
+                                                          │
                                         coverage filter (days an earlier statement owns)
                                                           │
-                                one transaction: statements + trades + dividends + bond_coupons
-                                                 + cash_events + statement_positions
+                                one transaction: statements + trades + option_exercise_links
+                                                 + dividends + bond_coupons + cash_events
+                                                 + statement_positions
 ```
 
 Every stage below the parser is format-blind: a PDF and an HTML statement of
@@ -55,9 +58,12 @@ behind both:
   the wrong fields.
 - **Asset-class and currency sub-headers** stamp the rows below them. The
   legacy custodian suffix (`Stocks - Held with Interactive Brokers …`) is
-  stripped. Rows under `Equity and Index Options` are dropped in every section
-  that has an asset header (options are out of scope until the
-  [options proposal](./options.md) is adopted).
+  stripped. Every asset class IB prints is read — stocks, bonds, futures,
+  forex and, since migration 023, `Equity and Index Options` / `Options On
+  Futures` (see [`options.md`](./options.md)). The Financial Instrument
+  Information aliases include the option columns `Underlying`, `Type` and
+  `Strike` (the stocks table also has a `Type` column — `ETF`, `COMMON` — so
+  the raw field is `type_text` and only the option mapper reads it).
 - **Aggregates are skipped**: total rows, rows too short to carry every
   required column, and rows whose marker cell (the date, the symbol, the
   quantity) is blank. A real row before any header or outside any currency
@@ -124,6 +130,62 @@ tested on hand-built geometry; `read_pages` is the only pdfplumber call.
 Against the seven real 2011–2017 files, every printed per-block total (trade
 quantities per symbol, amounts per currency block of every cash and dividend
 section) equals the sum of the rows the adapter produced.
+
+### Options: series resolution, event codes, exercise links
+
+An option row's symbol is IB's display form `ROOT DDMMMYY STRIKE C|P`
+(`TUR 17MAY19 22.0 P`). The instrument table may print the same series
+quite differently — its `Symbol` cell as one or more OCC codes
+(`XSPAM 141220P00140000, XSP 141220P00140000` after IB renamed the root),
+its `Description` as the display form under the table's own root. The
+mapper (`mapper.resolve_option_info`, shared with the Open Positions
+mapper) tries an **exact symbol** match, then an **exact description**
+match, then parses the trade symbol to a **series key** (root, expiry,
+right, strike) and matches it against the row's description, every OCC
+code in its `Symbol` cell, and its `Underlying` / `Expiry` / `Type` /
+`Strike` columns. Two rows with one key, or no row at all, is a
+`MappingError` — the conid comes from that row and nothing is guessed.
+`build_option_instrument` then reads conid, underlying, multiplier,
+expiry, strike and right (the columns first, the parsed key as fallback
+on the 2012 vintage, whose table lacks `Type` and `Strike`).
+
+Option rows open and close like futures rows (`O` / `C`, and the `C;O`
+reversal split by the statement-local running position — the shared
+`_derive_open_close_events`), plus one qualifier token that names *how*
+a close happened (`_derive_option_events`):
+
+| Code | Long close | Short close |
+|---|---|---|
+| `C;Ep` (lapse, price 0) | `LAPSE_LONG` | `LAPSE_SHORT` |
+| `C;Ex` (exercise, price 0) | `EXERCISE_LONG` | error — IB marks the writer with `A` |
+| `A` (assignment) | error — IB marks the holder with `Ex` | `ASSIGN_SHORT` |
+
+A qualifier on an opening row, on a reversal, or more than one qualifier
+on a row is a `MappingError`. The liquidation flag `L` is ignored as it is
+for futures.
+
+When an option is exercised or assigned IB books the share leg at the
+same instant as a Stocks row at the strike for `contracts × multiplier`
+shares (code `Ex;O`). `ingest/option_exercises.py` pairs the two on the
+mapped trades, before anything is persisted: same `trade_datetime`, a
+`StockInstrument` whose symbol is the option's underlying in the option's
+currency, `quantity == contracts × multiplier`, `price == strike`, and
+the direction the right implies (a holder's call or a writer's put buys
+shares; a holder's put or a writer's call sells them). Exactly one
+candidate is a link; none means IB booked no share trade (a cash-settled
+option, s.144A) and the row is counted as unlinked so the calculator can
+warn; several candidates, or one share trade claimed twice, is a
+`MappingError`. The ingestor resolves the pair's row positions to trade
+ids after the insert (`TradeRepo.ids_for_rows`) and writes
+[`option_exercise_links`](./db/option_exercise_links.md); both rows share
+a date, so the coverage rule keeps or skips them together. `ib-cgt ingest`
+prints the counts (`1 option exercise linked to a share trade` on
+`statements/futures/19_20.htm`; `N exercise(s) with no share trade`
+otherwise).
+
+Option rows in Open Positions are ingested as `statement_positions`
+through the same resolution, so option holdings reconcile against the
+statements like stocks and futures (check C7).
 
 ### Vintage quirks the mappers absorb
 
@@ -200,8 +262,9 @@ outside its own statement's period — the symptom of a mis-read period.
 
 | Section | Table | Notes |
 |---|---|---|
-| Trades | `trades` | Stocks, bonds, futures, forex. Corporate-action cash mergers and bond maturities are synthesised as SELL trades after the regular rows. |
-| Financial Instrument Information | `*_instruments` | The conid (stocks, futures) and ISIN (bonds) that key instruments. |
+| Trades | `trades` | Stocks, bonds, futures, options, forex. Corporate-action cash mergers and bond maturities are synthesised as SELL trades after the regular rows. |
+| Trades (options with `Ex` / `A`) | `option_exercise_links` | The option row and the share trade IB booked for it at the strike, when exactly one matches. |
+| Financial Instrument Information | `*_instruments` | The conid (stocks, futures, options) and ISIN (bonds) that key instruments; for options also underlying, multiplier, expiry, strike and right. |
 | Dividends, Withholding Tax | `dividends` | Instrument-less; withholding rows with no stock tag are cash events. |
 | Interest | `bond_coupons` / `cash_events` | Coupon payments to the former, everything else to the latter. |
 | Deposits & Withdrawals, Fees | `cash_events` | Internal transfers between the taxpayer's own accounts are dropped. |

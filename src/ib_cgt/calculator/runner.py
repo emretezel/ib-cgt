@@ -7,13 +7,13 @@ and the calculator all consume it, so the four engines always see the
 same inputs regardless of which command asked.
 
 Per-engine entry points (`run_stock_engine`, `run_bond_engine`,
-`run_future_engine`, `run_fx_engine`) exist so a narrowed command
-(`match stocks --symbol AAPL`, `check fx`) pays only for the engine it
-needs; `run_engines` composes them for the whole-history pass the
-calculator performs.
+`run_future_engine`, `run_option_engine`, `run_fx_engine`) exist so a
+narrowed command (`match stocks --symbol AAPL`, `check fx`) pays only
+for the engine it needs; `run_engines` composes them for the
+whole-history pass the calculator performs.
 
-Ordering constraint
--------------------
+Ordering constraints
+--------------------
 
 The FX engine consumes `FutureRealisation` objects — a closed futures
 contract settles its profit or loss in the contract's currency, which
@@ -21,9 +21,20 @@ is an acquisition or disposal of that currency on the close date.
 Only the futures engine produces those objects, so the futures pass
 must precede the FX pass. `load_fx_inputs` takes the futures runs as a
 required argument, `run_fx_engine` runs the futures engine itself when
-the caller has none to offer, and `run_engines` fixes the order
-outright: futures → stocks → bonds → FX. FX is a pure sink — nothing
-consumes its output — so it is the last stage by construction.
+the caller has none to offer.
+
+The stock engine consumes `OptionExerciseTransfer` objects — an
+exercised or assigned option is one transaction with the share trade
+IB booked for it (TCGA 1992 s.144(2)-(3)), and only the option engine
+knows what the option contributes. So the option pass must precede the
+stock pass: `run_stock_engine` takes the option runs, and performs a
+complete option pass itself when the caller has none — the only
+correct choice when the caller's own option pass was narrowed, because
+a transfer is keyed by the share trade, not by the series.
+
+`run_engines` fixes both orders outright: futures → options → stocks →
+bonds → FX. FX is a pure sink — nothing consumes its output — so it is
+the last stage by construction.
 
 Soft residuals
 --------------
@@ -64,9 +75,17 @@ from ib_cgt.calculator.runs import (
     FutureEngineRun,
     FXEngineRun,
     FXInputs,
+    OptionEngineRun,
     StockEngineRun,
 )
-from ib_cgt.db import BondCouponRepo, CashEventRepo, DividendRepo, InstrumentRepo, TradeRepo
+from ib_cgt.db import (
+    BondCouponRepo,
+    CashEventRepo,
+    DividendRepo,
+    InstrumentRepo,
+    OptionExerciseLinkRepo,
+    TradeRepo,
+)
 from ib_cgt.domain import (
     AssetClass,
     BondCoupon,
@@ -79,6 +98,7 @@ from ib_cgt.domain import (
     FutureRealisationRef,
     FXEventSource,
     FXInstrument,
+    OptionExerciseTransfer,
 )
 from ib_cgt.fx import RateNotFoundError
 from ib_cgt.rules import (
@@ -89,6 +109,8 @@ from ib_cgt.rules import (
     FXRuleEngine,
     InconsistentTradeError,
     MatchingResult,
+    OptionResult,
+    OptionRuleEngine,
     StockRuleEngine,
     UnmatchedDisposalError,
     WrongAssetClassError,
@@ -113,6 +135,10 @@ _FUTURE_ENGINE_ERRORS: tuple[type[Exception], ...] = (
     InconsistentTradeError,
     RateNotFoundError,
 )
+# The option engine has both a matcher (long side) and a FIFO ledger
+# (short side), so it can raise anything the stock and futures engines
+# can.
+_OPTION_ENGINE_ERRORS: tuple[type[Exception], ...] = _STOCK_ENGINE_ERRORS
 # The FX engine additionally raises `ValueError` for a malformed or GBP
 # currency code and for instrument-identity mismatches on projected
 # events; both are data problems worth reporting per pool.
@@ -149,6 +175,7 @@ def run_stock_engine(
     symbol: str | None = None,
     since: date | None = None,
     until: date | None = None,
+    option_runs: Sequence[OptionEngineRun] | None = None,
 ) -> tuple[StockEngineRun, ...]:
     """Run `StockRuleEngine` over every stock instrument, capturing errors.
 
@@ -164,10 +191,20 @@ def run_stock_engine(
         since: Inclusive lower bound on `trade_date`. Clipping the
             history breaks S.104 pool reconstruction — debugging only.
         until: Inclusive upper bound on `trade_date`; same caveat.
+        option_runs: A complete option pass to take exercise transfers
+            from (TCGA 1992 s.144(2)-(3)). Pass `None` to have the
+            runner perform that pass itself — the only correct choice
+            when the caller's own option pass was narrowed, because a
+            transfer is keyed by the share trade it modifies, not by
+            the series.
 
     Returns:
         One `StockEngineRun` per instrument, in `list_stocks` order.
     """
+    if option_runs is None:
+        option_runs = run_option_engine(conn, fx)
+    transfers_by_share_trade = _transfers_by_share_trade(option_runs)
+
     engine = StockRuleEngine(fx)
     trade_repo = TradeRepo(conn)
     out: list[StockEngineRun] = []
@@ -175,10 +212,18 @@ def run_stock_engine(
         trades = trade_repo.for_instrument_with_ids(
             instrument_id, account_id=None, since=since, until=until
         )
+        # The transfers that modify this stock's trades. A transfer whose
+        # share trade lies outside a date-clipped load is simply not
+        # applied; the engine's own check still guards direct callers.
+        transfers = [
+            transfer
+            for trade_id, _trade in trades
+            for transfer in transfers_by_share_trade.get(trade_id, ())
+        ]
         result: MatchingResult | None = None
         error: Exception | None = None
         try:
-            result = engine.compute(instrument, trades, soft_residuals=True)
+            result = engine.compute(instrument, trades, soft_residuals=True, transfers=transfers)
         except _STOCK_ENGINE_ERRORS as exc:
             error = exc
         out.append(
@@ -279,6 +324,65 @@ def run_future_engine(
     return tuple(out)
 
 
+def run_option_engine(
+    conn: sqlite3.Connection,
+    fx: FXConverter,
+    *,
+    symbol: str | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> tuple[OptionEngineRun, ...]:
+    """Run `OptionRuleEngine` over every option series, capturing errors.
+
+    Cross-account like stocks (a holder's options are pooled by series
+    per taxpayer). The series' exercise links are loaded from
+    `option_exercise_links` so the engine knows which exercises and
+    assignments delivered shares and which were cash-settled.
+
+    Returns:
+        One `OptionEngineRun` per series, in `list_options` order
+        (symbol, then expiry).
+    """
+    engine = OptionRuleEngine(fx)
+    trade_repo = TradeRepo(conn)
+    link_repo = OptionExerciseLinkRepo(conn)
+    out: list[OptionEngineRun] = []
+    for instrument_id, instrument in InstrumentRepo(conn).list_options(symbol=symbol):
+        trades = trade_repo.for_instrument_with_ids(
+            instrument_id, account_id=None, since=since, until=until
+        )
+        links = link_repo.for_option_trades(trade_id for trade_id, _trade in trades)
+        result: OptionResult | None = None
+        error: Exception | None = None
+        try:
+            result = engine.compute(instrument, trades, exercise_links=links, soft_residuals=True)
+        except _OPTION_ENGINE_ERRORS as exc:
+            error = exc
+        out.append(
+            OptionEngineRun(
+                instrument_id=instrument_id,
+                instrument=instrument,
+                trades=tuple(trades),
+                result=result,
+                error=error,
+            )
+        )
+    return tuple(out)
+
+
+def _transfers_by_share_trade(
+    option_runs: Sequence[OptionEngineRun],
+) -> dict[int, list[OptionExerciseTransfer]]:
+    """Every successful option run's transfers, grouped by the share trade they modify."""
+    grouped: dict[int, list[OptionExerciseTransfer]] = {}
+    for run in option_runs:
+        if run.result is None:
+            continue
+        for transfer in run.result.transfers:
+            grouped.setdefault(transfer.share_trade_id, []).append(transfer)
+    return grouped
+
+
 # ---------------------------------------------------------------------------
 # FX — one engine call per non-GBP currency pool
 # ---------------------------------------------------------------------------
@@ -323,6 +427,11 @@ def load_fx_inputs(
         for tid, t in trade_repo.for_asset_class(AssetClass.FUTURE, since=since, until=until)
         if t.instrument.currency != "GBP"
     )
+    option_trades = tuple(
+        (tid, t)
+        for tid, t in trade_repo.for_asset_class(AssetClass.OPTION, since=since, until=until)
+        if t.instrument.currency != "GBP"
+    )
 
     sources: dict[int, FXEventSource] = {}
 
@@ -357,7 +466,7 @@ def load_fx_inputs(
         if isinstance(trade.instrument, FXInstrument):
             seen.add(trade.instrument.currency_pair.base)
             seen.add(trade.instrument.currency_pair.quote)
-    for _tid, trade in (*stock_trades, *bond_trades, *future_trades):
+    for _tid, trade in (*stock_trades, *bond_trades, *future_trades, *option_trades):
         seen.add(trade.instrument.currency)
     dividend_repo = DividendRepo(conn)
     coupon_repo = BondCouponRepo(conn)
@@ -403,6 +512,7 @@ def load_fx_inputs(
         cash_events=tuple(cash_events),
         sources=MappingProxyType(sources),
         currencies=currencies,
+        option_trades=option_trades,
     )
 
 
@@ -433,6 +543,7 @@ def run_fx_pools(
                 dividends=inputs.dividends,
                 bond_coupons=inputs.bond_coupons,
                 cash_events=inputs.cash_events,
+                option_trades=inputs.option_trades,
             )
         except _FX_ENGINE_ERRORS as exc:
             error = exc
@@ -483,17 +594,21 @@ def run_fx_engine(
 
 
 def run_engines(conn: sqlite3.Connection, fx: FXConverter) -> EngineOutputs:
-    """Run all four engines over the entire history, futures first.
+    """Run all five engines over the entire history: futures, options, stocks, bonds, FX.
 
     No filters by design: S.104 pools and the 30-day rule need every
-    trade the taxpayer ever made, and the FX pools need every futures
-    realisation. This is the pass the calculator performs once per
-    computation and then slices by tax year.
+    trade the taxpayer ever made, the FX pools need every futures
+    realisation, and the stock pass needs every exercise transfer.
+    This is the pass the calculator performs once per computation and
+    then slices by tax year.
     """
     futures = run_future_engine(conn, fx)
-    stocks = run_stock_engine(conn, fx)
+    # Options before stocks: an exercised option's cost or premium
+    # belongs to the share trade it produced.
+    options = run_option_engine(conn, fx)
+    stocks = run_stock_engine(conn, fx, option_runs=options)
     bonds = run_bond_engine(conn, fx)
     # FX last: it consumes the futures realisations produced above and
     # nothing consumes its output.
     fx_runs = run_fx_engine(conn, fx, future_runs=futures)
-    return EngineOutputs(stocks=stocks, bonds=bonds, futures=futures, fx=fx_runs)
+    return EngineOutputs(stocks=stocks, bonds=bonds, futures=futures, fx=fx_runs, options=options)

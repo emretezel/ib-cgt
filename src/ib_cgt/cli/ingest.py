@@ -158,6 +158,9 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
     if result.position_count:
         plural = "" if result.position_count == 1 else "s"
         summary += f"; {result.position_count} open position{plural}"
+    if result.option_link_count:
+        plural = "" if result.option_link_count == 1 else "s"
+        summary += f"; {result.option_link_count} option exercise{plural} linked to a share trade"
     if result.withdrawn_statement_count:
         plural = "" if result.withdrawn_statement_count == 1 else "s"
         summary += (
@@ -183,6 +186,13 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
         console.print(
             f"[yellow]Skipped {len(result.unresolved_position_symbols)} open position(s) "
             f"with no resolvable instrument: {symbols}[/]"
+        )
+    if result.unlinked_exercise_count:
+        plural = "" if result.unlinked_exercise_count == 1 else "s"
+        console.print(
+            f"[yellow]{result.unlinked_exercise_count} option exercise{plural} with no share "
+            "trade at the strike beside it[/] — treated as cash-settled (TCGA 1992 s.144A); "
+            "`compute` will warn so it can be verified against the statement."
         )
     if result.withdrawn_overlaps:
         listed = ", ".join(result.withdrawn_overlaps)

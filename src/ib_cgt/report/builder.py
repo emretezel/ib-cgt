@@ -21,6 +21,11 @@ place, so the renderers can stay pure formatting:
   (s.143(5)). A winning close-out is proceeds; a losing one is a
   payment, reported as cost D so the form's boxes stay non-negative.
   Both commissions sit under E. Again H is the engine's gain.
+* **Written options.** The grant is the disposal (s.144(1)): A is the
+  premium still charged on it, B the grant commission plus every
+  closing purchase or cash settlement (s.148(3), s.144A), D and E are
+  nil. A bought option is share-matched and needs nothing special; an
+  exercise has already been folded into the share trade it produced.
 * **Gains versus losses.** Classified per line — each identification
   is its own computation under HMRC's rules and its own row in the
   `matched_disposals` table — while the disposal *count* is per day.
@@ -42,6 +47,7 @@ from ib_cgt.domain import (
     FutureRealisation,
     MatchedDisposal,
     Money,
+    OptionGrant,
     TaxYear,
 )
 from ib_cgt.report.labels import instrument_identifier
@@ -51,6 +57,8 @@ from ib_cgt.report.model import (
     ComputationLine,
     DirectBasis,
     DisposalComputation,
+    GrantBasis,
+    GrantCloseRef,
     LineBasis,
     PoolBasis,
     RunHeader,
@@ -86,6 +94,13 @@ def build_sa108_report(persisted: PersistedRun, resolver: EventResolver) -> Sa10
     for realisation in report.future_realisations:
         key = (realisation.instrument, realisation.close_date)
         lines_by_key.setdefault(key, []).append(_futures_line(realisation, resolver))
+    for grant in report.option_grants:
+        # A grant assigned in full is no longer charged here — its
+        # premium sits in the share trades the assignment produced.
+        if not grant.is_chargeable:
+            continue
+        key = (grant.instrument, grant.grant_date)
+        lines_by_key.setdefault(key, []).append(_grant_line(grant, resolver))
 
     disposals = sorted(
         (
@@ -114,7 +129,11 @@ def load_sa108_report(conn: sqlite3.Connection, tax_year: TaxYear) -> Sa108Repor
     persisted = load_persisted_run(conn, tax_year)
     if persisted is None:
         return None
-    resolver = DbEventResolver(conn, persisted.computation.fx_event_sources)
+    resolver = DbEventResolver(
+        conn,
+        persisted.computation.fx_event_sources,
+        persisted.computation.report.option_exercise_transfers,
+    )
     return build_sa108_report(persisted, resolver)
 
 
@@ -180,6 +199,46 @@ def _futures_line(realisation: FutureRealisation, resolver: EventResolver) -> Co
         disposal_costs_gbp=zero,
         cost_gbp=zero if won else -realisation.proceeds_gbp,
         acquisition_costs_gbp=realisation.cost_gbp,
+    )
+
+
+def _grant_line(grant: OptionGrant, resolver: EventResolver) -> ComputationLine:
+    """A written option's grant as a working-sheet line.
+
+    The disposal event is the grant trade itself. A is the gross
+    premium still charged on the grant (assigned contracts have left
+    it), B the grant commission's share plus every closing cost, D and
+    E nil — the writer never acquired the option. H is exactly
+    `OptionGrant.gain_gbp`.
+    """
+    zero = Money.zero("GBP")
+    basis = GrantBasis(
+        premium_native=grant.premium_native,
+        grant_fee_native=grant.grant_fee_native,
+        grant_fx_rate=grant.grant_fx_rate,
+        granted_quantity=grant.quantity,
+        chargeable_quantity=grant.chargeable_quantity,
+        closes=tuple(
+            GrantCloseRef(
+                close=resolver.resolve(close.close_trade_id),
+                kind=close.kind,
+                quantity=close.quantity,
+                premium_native=close.premium_native,
+                fee_native=close.fee_native,
+                fx_rate=close.fx_rate,
+                cost_gbp=close.cost_gbp,
+            )
+            for close in grant.closes
+        ),
+    )
+    return ComputationLine(
+        disposal=resolver.resolve(grant.grant_trade_id),
+        matched_quantity=grant.chargeable_quantity,
+        basis=basis,
+        gross_proceeds_gbp=grant.chargeable_proceeds_gbp,
+        disposal_costs_gbp=grant.incidental_costs_gbp,
+        cost_gbp=zero,
+        acquisition_costs_gbp=zero,
     )
 
 

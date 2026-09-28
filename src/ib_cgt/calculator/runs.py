@@ -33,10 +33,11 @@ from ib_cgt.domain import (
     FutureInstrument,
     FutureRealisation,
     FXEventSource,
+    OptionInstrument,
     StockInstrument,
     Trade,
 )
-from ib_cgt.rules import BondResult, FutureResult, MatchingResult
+from ib_cgt.rules import BondResult, FutureResult, MatchingResult, OptionResult
 from ib_cgt.rules.fx_cashflow import make_pool_instrument
 
 
@@ -89,6 +90,23 @@ class FutureEngineRun:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class OptionEngineRun:
+    """One option series' pass through `OptionRuleEngine`.
+
+    `result` carries both sides — the holder's matched disposals and
+    the writer's grants — plus the exercise transfers the stock engine
+    consumes, which is why the runner performs this pass before the
+    stock pass.
+    """
+
+    instrument_id: int
+    instrument: OptionInstrument
+    trades: tuple[tuple[int, Trade], ...]
+    result: OptionResult | None
+    error: Exception | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class FXInputs:
     """Every cashflow source the FX engine projects into per-currency pools.
 
@@ -124,6 +142,8 @@ class FXInputs:
         sources: Synthetic id → provenance reference.
         currencies: Every non-GBP currency touched by any source,
             sorted — the list of pools a full pass computes.
+        option_trades: Non-GBP option trades only — their premiums,
+            commissions and settlements are the cashflow.
     """
 
     forex_trades: tuple[tuple[int, Trade], ...]
@@ -136,6 +156,7 @@ class FXInputs:
     cash_events: tuple[tuple[int, CashEvent], ...]
     sources: Mapping[int, FXEventSource]
     currencies: tuple[str, ...]
+    option_trades: tuple[tuple[int, Trade], ...] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -173,19 +194,20 @@ class EngineFailure:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EngineOutputs:
-    """Everything one whole-history pass of all four engines produced."""
+    """Everything one whole-history pass of all five engines produced."""
 
     stocks: tuple[StockEngineRun, ...]
     bonds: tuple[BondEngineRun, ...]
     futures: tuple[FutureEngineRun, ...]
     fx: tuple[FXEngineRun, ...]
+    options: tuple[OptionEngineRun, ...] = ()
 
     @property
     def failures(self) -> tuple[EngineFailure, ...]:
-        """Every captured engine error across the four asset classes.
+        """Every captured engine error across the five asset classes.
 
-        Order is stocks → bonds → futures → FX, each in run order, so
-        the list is stable run-to-run for a given database.
+        Order is stocks → bonds → futures → options → FX, each in run
+        order, so the list is stable run-to-run for a given database.
         """
         out: list[EngineFailure] = []
         for stock_run in self.stocks:
@@ -197,6 +219,9 @@ class EngineOutputs:
         for future_run in self.futures:
             if future_run.error is not None:
                 out.append(EngineFailure(instrument=future_run.instrument, error=future_run.error))
+        for option_run in self.options:
+            if option_run.error is not None:
+                out.append(EngineFailure(instrument=option_run.instrument, error=option_run.error))
         for fx_run in self.fx:
             if fx_run.error is not None:
                 out.append(

@@ -9,6 +9,7 @@ idempotent on the real files.
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -111,3 +112,46 @@ def test_fesx_dec_23_multifill_opens_all_land(db_conn) -> None:  # type: ignore[
     # All fills carry quantity 1 (each row is one contract); the bug
     # symptom was missing rows, not wrong-quantity rows.
     assert all(str(r["quantity"]) == "1" for r in rows)
+
+
+def test_options_land_with_their_series_and_the_tur_exercise_link(db_conn) -> None:  # type: ignore[no-untyped-def]
+    """The four option series of 2012-2019 ingest, and the 2019 TUR exercise links its share sale.
+
+    XAUUSD call and put (2012, both written), the XSP/XSPAM put (2013-14,
+    bought) and the TUR put (2019, bought and exercised into a sale of
+    1,500 TUR at 22). Every other exercise-shaped row is absent, so the
+    history has exactly one link and no cash-settled fallback.
+    """
+    from ib_cgt.db import InstrumentRepo, OptionExerciseLinkRepo
+
+    statements = _gather_statements()
+    if not statements:
+        pytest.skip("No statements found")
+    unlinked = 0
+    for p in statements:
+        unlinked += ingest_statement(p, db_conn).unlinked_exercise_count
+
+    series = {instrument.symbol for _iid, instrument in InstrumentRepo(db_conn).list_options()}
+    assert series == {
+        "XAUUSD 21DEC12 1920.0 C",
+        "XAUUSD 21DEC12 1600.0 P",
+        "XSPAM 20DEC14 140.0 P",
+        "TUR 17MAY19 22.0 P",
+    }
+    assert unlinked == 0
+    links = OptionExerciseLinkRepo(db_conn).all_links()
+    assert len(links) == 1
+    ((option_id, share_id),) = links.items()
+    row = db_conn.execute(
+        "SELECT o.action, o.quantity AS contracts, s.quantity AS shares, "
+        "s.price_amount AS price, s.action AS side "
+        "FROM trades o JOIN trades s ON s.trade_id = ? WHERE o.trade_id = ?",
+        (share_id, option_id),
+    ).fetchone()
+    assert (row["action"], row["contracts"], row["shares"], row["side"]) == (
+        "exercise_long",
+        "15",
+        "1500",
+        "sell",
+    )
+    assert Decimal(row["price"]) == Decimal("22")
