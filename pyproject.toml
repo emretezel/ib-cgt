@@ -32,6 +32,11 @@ dependencies = [
     # Ingestion (component 3) — parse IB HTML activity statements.
     "beautifulsoup4>=4.12",   # convenient DOM navigation; our only practical choice
     "lxml>=5.0",              # fast C parser backend used by BeautifulSoup
+    # Ingestion — IB PDF activity statements. pdfplumber exposes every
+    # drawn rectangle and every word with coordinates and font size,
+    # which is what the PDF adapter's grid model is built on; it (and
+    # its pdfminer.six backend) ship `py.typed`, so no stubs are needed.
+    "pdfplumber>=0.11",
     # CLI (component 8) — minimal subset (`db init`, `ingest`, `trades`) shipped
     # alongside ingestion so the pipeline is runnable end-to-end today.
     "typer>=0.15",            # Typer builds on Click; good type-hint ergonomics

@@ -23,6 +23,7 @@ from typing import Final, Protocol
 
 from ib_cgt.ingest.parsers.assemble import assemble
 from ib_cgt.ingest.parsers.html import parse_html
+from ib_cgt.ingest.parsers.pdf import parse_pdf
 from ib_cgt.ingest.raw import ParsedStatement, StatementParseError
 
 
@@ -31,6 +32,7 @@ class StatementFormat(StrEnum):
 
     AUTO = "auto"
     HTML = "html"
+    PDF = "pdf"
 
 
 class StatementParser(Protocol):
@@ -49,10 +51,25 @@ class HtmlStatementParser:
         return assemble(parse_html(source_bytes))
 
 
+class PdfStatementParser:
+    """The `.pdf` strategy: pdfplumber grid adapter plus the shared assembler."""
+
+    def parse(self, source_bytes: bytes) -> ParsedStatement:
+        """Parse an IB PDF activity statement."""
+        return assemble(parse_pdf(source_bytes))
+
+
 # File suffixes (lower-case) → the format they imply.
 _SUFFIX_FORMATS: Final[dict[str, StatementFormat]] = {
     ".htm": StatementFormat.HTML,
     ".html": StatementFormat.HTML,
+    ".pdf": StatementFormat.PDF,
+}
+
+# Concrete strategy per format. `AUTO` is resolved before the lookup.
+_PARSERS: Final[dict[StatementFormat, type[StatementParser]]] = {
+    StatementFormat.HTML: HtmlStatementParser,
+    StatementFormat.PDF: PdfStatementParser,
 }
 
 
@@ -83,7 +100,7 @@ def parser_for(fmt: StatementFormat, *, path: Path | None = None) -> StatementPa
         if path is None:
             raise StatementParseError("A file path is needed to detect the statement format.")
         fmt = detect_format(path)
-    return HtmlStatementParser()
+    return _PARSERS[fmt]()
 
 
 def parse_statement(
@@ -102,6 +119,7 @@ def parse_statement_file(
 
 __all__ = [
     "HtmlStatementParser",
+    "PdfStatementParser",
     "StatementFormat",
     "StatementParser",
     "detect_format",

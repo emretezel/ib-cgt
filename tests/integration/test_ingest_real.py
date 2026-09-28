@@ -38,9 +38,10 @@ def db_conn(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def _gather_statements() -> list[Path]:
+    """Every real statement, HTML and PDF, in path order."""
     if not _REAL_STATEMENTS.exists():
         return []
-    return sorted(_REAL_STATEMENTS.rglob("*.htm"))
+    return sorted(p for p in _REAL_STATEMENTS.rglob("*") if p.suffix in {".htm", ".pdf"})
 
 
 @pytest.mark.parametrize(

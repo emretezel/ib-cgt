@@ -227,6 +227,75 @@ def test_currency_grouping_preserved_across_multiple_currency_sections() -> None
     assert [d.amount.currency for d in out] == ["EUR", "USD", "EUR"]
 
 
+# ---------------------------------------------------------------------------
+# The 2013-2014 vintage: no `(SECID)` tag, "Dividend" rather than "Cash Dividend"
+# ---------------------------------------------------------------------------
+
+
+def test_old_vintage_dividend_without_security_tag_is_a_cash_dividend() -> None:
+    """`AAPL Dividend 3.05 USD per Share (Ordinary Dividend)` classifies like the modern shape."""
+    parsed = _make_parsed(
+        [
+            _div_row(
+                description="AAPL Dividend 3.05 USD per Share (Ordinary Dividend)",
+                date_text="2013-05-16",
+                amount_text="91.51",
+            )
+        ]
+    )
+    [div] = map_dividends(parsed)
+    assert div.kind is DividendKind.CASH_DIVIDEND
+    assert div.symbol == "AAPL"
+
+
+def test_old_vintage_payment_in_lieu_without_security_tag() -> None:
+    parsed = _make_parsed(
+        [_div_row(description="INTC Payment in Lieu of Dividend (Ordinary Dividend)")]
+    )
+    [div] = map_dividends(parsed)
+    assert div.kind is DividendKind.PAYMENT_IN_LIEU
+    assert div.symbol == "INTC"
+
+
+def test_old_vintage_withholding_rows_name_the_stock() -> None:
+    parsed = _make_parsed(
+        [
+            _div_row(
+                section="withholding_tax",
+                description="AAPL Dividend 3.05 USD per Share - US Tax",
+                amount_text="-13.73",
+            ),
+            _div_row(
+                section="withholding_tax",
+                description="INTC Payment in Lieu of Dividend - US Tax",
+                amount_text="-1.21",
+            ),
+        ]
+    )
+    kinds = [(d.symbol, d.kind) for d in map_dividends(parsed)]
+    assert kinds == [
+        ("AAPL", DividendKind.WITHHOLDING_TAX),
+        ("INTC", DividendKind.WITHHOLDING_TAX),
+    ]
+
+
+def test_symbol_with_a_space_survives_the_optional_tag() -> None:
+    """The kind phrase anchors the symbol: `EOLU B Dividend …` is symbol `EOLU B`."""
+    parsed = _make_parsed(
+        [_div_row(description="EOLU B Dividend 1.50 SEK per Share (Ordinary Dividend)")]
+    )
+    [div] = map_dividends(parsed)
+    assert div.symbol == "EOLU B"
+
+
+def test_interest_withholding_rows_never_look_like_a_dividend() -> None:
+    """The optional tag must not widen `has_instrument_prefix` to any upper-case-led text."""
+    assert has_instrument_prefix("Withholding @ 30% on Credit Interest for Dec-2018") is False
+    assert has_instrument_prefix("CANCEL WITHHOLDING ON Credit Interest for Dec-2018") is False
+    assert has_instrument_prefix("AAPL Dividend 3.05 USD per Share - US Tax") is True
+    assert has_instrument_prefix("SEGA(IE00B4WXJJ64) Payment In Lieu Of Dividend EUR 0.5") is True
+
+
 def test_withholding_on_broker_interest_is_left_to_the_cash_event_mapper() -> None:
     """A withholding-section row with no `<SYMBOL>(<SECID>)` prefix is skipped, not raised.
 

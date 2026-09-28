@@ -9,19 +9,25 @@ cashflow projector can consume.
 
 Scope (intentionally narrow, mirrors `corporate_actions.py`):
 
-* `tblCombDiv` rows whose description starts with
+* Dividends-section rows whose description starts with
   ``"<SYMBOL>(<SECID>) Cash Dividend <CCY>"`` produce a
   `Dividend(kind=CASH_DIVIDEND)`.
-* `tblCombDiv` rows whose description starts with
+* Dividends-section rows whose description starts with
   ``"<SYMBOL>(<SECID>) Payment In Lieu Of Dividend"`` produce a
   `Dividend(kind=PAYMENT_IN_LIEU)`. Stock-yield-enhancement
   programme rebates appear in this shape.
-* `tblWithholdingTax` rows whose description names a stock
+* Withholding-section rows whose description names a stock
   (``"<SYMBOL>(<SECID>) Cash Dividend … - US Tax"``) produce
   `Dividend(kind=WITHHOLDING_TAX)` with the absolute amount. Rows in
   that section with no security tag — withholding on broker interest
   and its cancellation — are left to `ingest/cash_events.py`; the two
   mappers partition the section through `has_instrument_prefix`.
+* The 2013-2014 vintage prints the same rows without the `(SECID)`
+  tag and without the word "Cash": ``"AAPL Dividend 3.05 USD per
+  Share (Ordinary Dividend)"``, ``"INTC Payment in Lieu of Dividend
+  (Ordinary Dividend)"``, ``"AAPL Dividend 3.05 USD per Share - US
+  Tax"``. The tag is optional and the kind phrase is anchored right
+  after the symbol, so both vintages classify identically.
 * IB's Change in Dividend Accruals section never reaches this module:
   accrual adjustments move no cash, so the parsers do not read it.
 
@@ -55,19 +61,24 @@ from ib_cgt.ingest.raw import ParsedStatement, RawDividendRow
 # Constants
 # ---------------------------------------------------------------------------
 
-# Description prefix shape: `<SYMBOL>(<SECID>) <KIND_PHRASE> ...`. The
-# symbol is matched non-greedily up to the security-id's open paren
-# so tickers with spaces or dots survive. The bracketed slot is one
-# of two shapes IB has been observed to emit:
+# Description shape: `<SYMBOL>[(<SECID>)] <KIND_PHRASE> ...`. The symbol
+# is matched non-greedily so tickers with spaces or dots survive; the
+# kind phrase anchored right after it is what stops the match at the
+# right word (`EOLU B Dividend …` reads as symbol `EOLU B`). The
+# bracketed slot, present from the 2015 vintage on, is one of two
+# shapes IB has been observed to emit:
 #   * a 12-character ISIN (`IE00B2NPL135`), the common case for ETFs.
 #   * IB's own numeric contract id (`102048570`), which IB sometimes
 #     substitutes when the ISIN is unavailable (observed on JNKE
 #     dividend rows).
 # We accept anything non-empty alphanumeric to absorb both; neither is
-# interpreted, because a dividend is not tied to an instrument.
+# interpreted, because a dividend is not tied to an instrument. The
+# phrase alternation is what keeps `has_instrument_prefix` selective:
+# `Withholding @ 30% on Credit Interest` matches nothing here.
 _DESCRIPTION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?P<symbol>[A-Z0-9.\- ]+?)"
-    r"\((?P<secid>[A-Z0-9]+)\)\s+"
+    r"(?:\((?P<secid>[A-Z0-9]+)\))?\s+"
+    r"(?P<phrase>Cash Dividend|Dividend|Payment [Ii]n [Ll]ieu [Oo]f Dividend)\b"
     r"(?P<rest>.*)$"
 )
 
@@ -76,14 +87,14 @@ _DESCRIPTION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
 _SECTION_DIVIDENDS: Final = "dividends"
 _SECTION_WITHHOLDING: Final = "withholding_tax"
 
-# `rest` (description after `<symbol>(<secid>) `) prefixes that
-# discriminate cash dividends from payment-in-lieu rows inside the
-# `dividends` section. Tested by case-insensitive prefix match
-# because IB inconsistently capitalises the connectives — observed
-# both `"Payment In Lieu Of Dividend"` and `"Payment in Lieu of
-# Dividend"` in the same corpus. We compare lower-cased phrases so
-# either spelling works.
-_CASH_DIVIDEND_PHRASE: Final = "cash dividend"
+# The kind phrase, lower-cased, that discriminates cash dividends from
+# payment-in-lieu rows inside the `dividends` section. IB
+# inconsistently capitalises the connectives — both `"Payment In Lieu
+# Of Dividend"` and `"Payment in Lieu of Dividend"` occur in one
+# corpus — and the 2013-2014 vintage says `"Dividend"` where later
+# ones say `"Cash Dividend"`; comparing lower-cased phrases absorbs
+# all of it.
+_CASH_DIVIDEND_PHRASES: Final[frozenset[str]] = frozenset({"cash dividend", "dividend"})
 _PAYMENT_IN_LIEU_PHRASE: Final = "payment in lieu"
 
 
@@ -149,19 +160,15 @@ def _classify(raw: RawDividendRow) -> DividendKind | None:
     match = _DESCRIPTION_PREFIX_RE.match(raw.description)
     if match is None:
         raise MappingError(
-            f"Dividend description {raw.description!r} does not start with "
-            "the expected '<SYMBOL>(<SECID>) ...' prefix."
+            f"Dividend-section row with unrecognised description {raw.description!r} — "
+            "expected '<SYMBOL>[(<SECID>)] Cash Dividend | Dividend | Payment in Lieu of "
+            "Dividend ...'."
         )
-    rest_lc = match.group("rest").lower()
-    if rest_lc.startswith(_CASH_DIVIDEND_PHRASE):
+    phrase_lc = match.group("phrase").lower()
+    if phrase_lc in _CASH_DIVIDEND_PHRASES:
         return DividendKind.CASH_DIVIDEND
-    if rest_lc.startswith(_PAYMENT_IN_LIEU_PHRASE):
-        return DividendKind.PAYMENT_IN_LIEU
-    raise MappingError(
-        f"Dividend-section row with unrecognised description {raw.description!r} — "
-        f"expected {_CASH_DIVIDEND_PHRASE!r} or {_PAYMENT_IN_LIEU_PHRASE!r} "
-        "(case-insensitive) after the symbol/secid prefix."
-    )
+    # The alternation admits nothing else.
+    return DividendKind.PAYMENT_IN_LIEU
 
 
 def _synthesize_one(
@@ -177,7 +184,7 @@ def _synthesize_one(
         # check, so we re-run the regex to surface a clean error.
         raise MappingError(
             f"Dividend description {raw.description!r} does not start with "
-            "the expected '<SYMBOL>(<SECID>) ...' prefix."
+            "the expected '<SYMBOL>[(<SECID>)] <kind phrase> ...' prefix."
         )
 
     symbol = match.group("symbol").strip()
@@ -212,7 +219,7 @@ def _synthesize_one(
 
 
 def has_instrument_prefix(description: str) -> bool:
-    """True when `description` opens with IB's `<SYMBOL>(<SECID>)` security tag.
+    """True when `description` names a stock's distribution: `<SYMBOL>[(<SECID>)] <kind>`.
 
     Shared with `ingest/cash_events.py` so the two mappers partition
     the Withholding Tax section without duplicating the regex.
