@@ -12,8 +12,16 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+from ib_cgt.ingest.coverage import Coverage
 from ib_cgt.ingest.hashing import compute_statement_hash
-from ib_cgt.ingest.ingestor import IngestResult, ingest_statement
+from ib_cgt.ingest.ingestor import (
+    IngestResult,
+    LoadedStatement,
+    ingest_parsed,
+    ingest_statement,
+    ingest_statements,
+    load_statement,
+)
 from ib_cgt.ingest.mapper import DEFAULT_STATEMENT_TZ, MappingError, map_rows
 from ib_cgt.ingest.parsers import (
     StatementFormat,
@@ -32,7 +40,9 @@ from ib_cgt.ingest.raw import (
 
 __all__ = [
     "DEFAULT_STATEMENT_TZ",
+    "Coverage",
     "IngestResult",
+    "LoadedStatement",
     "MappingError",
     "ParsedStatement",
     "RawInstrumentInfo",
@@ -42,7 +52,10 @@ __all__ = [
     "StatementParser",
     "compute_statement_hash",
     "detect_format",
+    "ingest_parsed",
     "ingest_statement",
+    "ingest_statements",
+    "load_statement",
     "map_rows",
     "parse_statement",
     "parse_statement_file",

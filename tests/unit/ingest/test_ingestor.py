@@ -23,7 +23,7 @@ from ib_cgt.db import (
     TradeRepo,
 )
 from ib_cgt.domain import FutureInstrument, Money
-from ib_cgt.ingest.ingestor import ingest_statement
+from ib_cgt.ingest.ingestor import ingest_statement, ingest_statements
 from tests.conid import fake_conid
 
 
@@ -543,3 +543,188 @@ def test_modified_file_without_replace_is_added_beside_the_old_import(
     assert second.withdrawn_statement_count == 0
     n = db.execute("SELECT COUNT(*) AS n FROM statements WHERE source_path = ?", (str(path),))
     assert n.fetchone()["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Overlapping statements — the coverage rule
+# ---------------------------------------------------------------------------
+
+
+def _variant(path: Path, source: Path, *, title_period: str, extra_row: str = "") -> Path:
+    """Write a copy of an HTML fixture with a different period and an optional extra trade.
+
+    The extra row is inserted before the Forex block of `mixed_tiny.htm`
+    (inside the Stocks / GBP block), so it inherits that block's asset
+    class and currency.
+    """
+    html = source.read_text()
+    html = html.replace("April 8, 2024 - April 4, 2025", title_period)
+    if extra_row:
+        marker = "<!-- Subtotal — must be skipped -->"
+        assert marker in html
+        html = html.replace(marker, extra_row + marker)
+    path.write_text(html)
+    return path
+
+
+def _stock_row(day: str, symbol: str = "CNKY") -> str:
+    return (
+        f"<tbody><tr><td>{symbol}</td><td>{day}, 11:00:00</td><td align='right'>5</td>"
+        "<td align='right'>200.00</td><td align='right'>0</td><td align='right'>-1000.00</td>"
+        "<td align='right'>-1.00</td><td align='right'>1001.00</td><td align='right'>0.00</td>"
+        "<td align='right'>0.00</td><td align='right'>0.00</td><td align='right'>O</td>"
+        "</tr></tbody>\n"
+    )
+
+
+def test_overlapping_statement_adds_only_the_days_it_alone_covers(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A re-download that runs further than the file on record duplicates nothing."""
+    first = ingest_statement(_FIXTURES / "mixed_tiny.htm", db)
+    assert first.inserted_count == 5
+
+    longer = _variant(
+        tmp_path / "longer.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 8, 2024 - May 30, 2025",
+        extra_row=_stock_row("2025-05-10"),
+    )
+    second = ingest_statement(longer, db)
+
+    assert second.trade_count == 6
+    assert second.inserted_count == 1
+    assert second.covered_trade_count == 5
+    assert second.fully_covered is False
+    assert TradeRepo(db).count() == 6
+    # The surviving row keeps the position it had in the file — it was
+    # the third stock row, after the two CNKY fills — so the audit
+    # trail still points at the right source row.
+    kept = db.execute(
+        "SELECT statement_row_index, trade_date FROM trades WHERE source_statement_hash = ?",
+        (second.statement_hash,),
+    ).fetchall()
+    assert [(r["statement_row_index"], r["trade_date"]) for r in kept] == [(2, "2025-05-10")]
+
+
+def test_statement_with_the_same_period_is_fully_covered(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A modified file without --replace records the statement but no duplicate rows."""
+    ingest_statement(_FIXTURES / "mixed_tiny.htm", db)
+    same = _variant(
+        tmp_path / "same.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 8, 2024 - April 4, 2025",
+        extra_row="<!-- re-downloaded -->",
+    )
+    second = ingest_statement(same, db)
+    assert second.fully_covered is True
+    assert second.inserted_count == 0
+    assert second.covered_trade_count == 5
+    assert TradeRepo(db).count() == 5
+    assert StatementRepo(db).get(second.statement_hash) is not None
+
+
+def test_consecutive_statements_keep_rows_dated_before_their_period(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """IB files a late-evening fill in the next period, printed with the previous date.
+
+    The two periods do not overlap, so the later statement owns every
+    row it carries — including the one dated on the earlier
+    statement's last day.
+    """
+    ingest_statement(_FIXTURES / "mixed_tiny.htm", db)  # April 8, 2024 - April 4, 2025
+    following = _variant(
+        tmp_path / "following.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 7, 2025 - April 3, 2026",
+        extra_row=_stock_row("2025-04-04"),
+    )
+    second = ingest_statement(following, db)
+    # The five copied fixture rows (dated 2024) are not owned by the
+    # first statement either: nothing overlaps, nothing is skipped.
+    assert second.covered_trade_count == 0
+    assert second.inserted_count == 6
+
+
+def test_first_ingested_owns_the_shared_days_whatever_the_order(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Ingesting the longer file first makes the shorter one the redundant one."""
+    longer = _variant(
+        tmp_path / "longer.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 8, 2024 - May 30, 2025",
+        extra_row=_stock_row("2025-05-10"),
+    )
+    first = ingest_statement(longer, db)
+    assert first.inserted_count == 6
+    second = ingest_statement(_FIXTURES / "mixed_tiny.htm", db)
+    assert second.fully_covered is True
+    assert second.inserted_count == 0
+    assert TradeRepo(db).count() == 6
+
+
+def test_ingest_statements_persists_earliest_period_first(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A batch is ordered by period, so the shell's expansion order cannot change ownership."""
+    longer = _variant(
+        tmp_path / "a_longer.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 8, 2024 - May 30, 2025",
+        extra_row=_stock_row("2025-05-10"),
+    )
+    results = ingest_statements([longer, _FIXTURES / "mixed_tiny.htm"], db)
+    # The shorter period sorts first (same start, earlier end) and so owns the shared days.
+    assert [p.name for p, _r in results] == ["mixed_tiny.htm", "a_longer.htm"]
+    assert results[0][1].inserted_count == 5
+    assert results[1][1].inserted_count == 1
+    assert results[1][1].covered_trade_count == 5
+
+
+def test_ingest_statements_short_circuits_files_already_on_record(
+    db: sqlite3.Connection,
+) -> None:
+    ingest_statement(_FIXTURES / "mixed_tiny.htm", db)
+    results = ingest_statements(
+        [_FIXTURES / "mixed_tiny.htm", _FIXTURES / "with_dividends.htm"], db
+    )
+    assert results[0][1].already_imported is True
+    assert results[1][1].already_imported is False
+    assert results[1][1].dividends_inserted == 4
+
+
+def test_replace_reads_coverage_after_withdrawing_the_prior_version(
+    db: sqlite3.Connection,
+) -> None:
+    """A withdrawn version must not count as owning its own days."""
+    first = ingest_statement(_FIXTURES / "mixed_tiny.htm", db)
+    second = ingest_statement(_FIXTURES / "mixed_tiny.htm", db, replace=True)
+    assert second.replaced is True
+    assert second.covered_trade_count == 0
+    assert second.inserted_count == first.inserted_count
+    assert second.withdrawn_overlaps == ()
+
+
+def test_replace_reports_statements_that_overlapped_the_withdrawn_version(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The overlapping file may have had rows skipped in the withdrawn version's favour."""
+    path = tmp_path / "24_25.htm"
+    path.write_bytes((_FIXTURES / "mixed_tiny.htm").read_bytes())
+    ingest_statement(path, db)
+    longer = _variant(
+        tmp_path / "longer.htm",
+        _FIXTURES / "mixed_tiny.htm",
+        title_period="April 8, 2024 - May 30, 2025",
+        extra_row=_stock_row("2025-05-10"),
+    )
+    ingest_statement(longer, db)  # five of its six rows skipped in favour of 24_25.htm
+
+    path.write_bytes(path.read_bytes().replace(b"</body>", b"<!-- v2 -->\n</body>"))
+    result = ingest_statement(path, db, replace=True)
+    assert result.withdrawn_statement_count == 1
+    assert result.withdrawn_overlaps == (str(longer),)

@@ -55,10 +55,12 @@ def test_failed_ingest_leaves_nothing_behind(
 ) -> None:
     fixture = _FIXTURES / "mixed_tiny.htm"
 
-    def boom(self: TradeRepo, trades: Iterable[Trade], *, source_statement_hash: str) -> int:
+    def boom(
+        self: TradeRepo, trades: Iterable[tuple[int, Trade]], *, source_statement_hash: str
+    ) -> int:
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(TradeRepo, "insert_many", boom)
+    monkeypatch.setattr(TradeRepo, "insert_indexed", boom)
     with pytest.raises(RuntimeError, match="disk full"):
         ingest_statement(fixture, db)
 

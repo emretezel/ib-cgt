@@ -184,3 +184,20 @@ def test_A14_warns_on_zero_amount(db: sqlite3.Connection, fx_service: FXService)
     db.commit()
     report = run_all(db, fx=fx_service, scope=Scope.DATA)
     assert _check(report.results, "A14").status is Status.WARN
+
+
+def test_A15_flags_a_fact_dated_far_outside_its_statement_period(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """A trade dated months outside its statement's period trips A15; days outside do not."""
+    db.execute("UPDATE trades SET trade_date = '2024-04-01' WHERE rowid = 1")  # 5 days early
+    db.commit()
+    clean = _check(run_all(db, fx=fx_service, scope=Scope.DATA).results, "A15")
+    assert clean.status is Status.OK
+
+    db.execute("UPDATE trades SET trade_date = '2023-01-01' WHERE rowid = 1")
+    db.commit()
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    a15 = _check(report.results, "A15")
+    assert a15.status is Status.WARN
+    assert any(ev["source_table"] == "trades" for ev in a15.evidence)

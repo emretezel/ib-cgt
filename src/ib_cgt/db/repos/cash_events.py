@@ -45,17 +45,29 @@ class CashEventRepo:
     def insert_many(self, events: Iterable[CashEvent], *, source_statement_hash: str) -> int:
         """Insert each event with a dense per-statement row index; return inserted count.
 
-        The row index is the event's position across the three cash
-        sections in parser emit order (interest, then deposits and
-        withdrawals, then fees) — one row-index space per statement,
-        independent of every other table's.
+        The index is the zero-based offset in the iterable; see
+        `insert_indexed` for the identity contract.
+        """
+        return self.insert_indexed(enumerate(events), source_statement_hash=source_statement_hash)
+
+    def insert_indexed(
+        self, events: Iterable[tuple[int, CashEvent]], *, source_statement_hash: str
+    ) -> int:
+        """Insert `(statement_row_index, event)` pairs; return the inserted count.
+
+        The row index is the event's position across the cash sections
+        in parser emit order (interest, then deposits and withdrawals,
+        then fees, then the instrument-less withholding rows) — one
+        row-index space per statement, independent of every other
+        table's. The ingestor supplies it so rows the coverage rule
+        skips leave the others at their positions in the file.
         """
         materialised = list(events)
         if not materialised:
             return 0
 
         rows: list[tuple[object, ...]] = []
-        for row_index, event in enumerate(materialised):
+        for row_index, event in materialised:
             amount, currency = money_to_cols(event.amount)
             rows.append(
                 (

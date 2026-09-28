@@ -61,11 +61,28 @@ class DividendRepo:
     ) -> int:
         """Insert each dividend with a dense per-statement row index; return inserted count.
 
+        The index is the zero-based offset in the iterable; see
+        `insert_indexed` for the identity contract.
+        """
+        return self.insert_indexed(
+            enumerate(dividends), source_statement_hash=source_statement_hash
+        )
+
+    def insert_indexed(
+        self,
+        dividends: Iterable[tuple[int, Dividend]],
+        *,
+        source_statement_hash: str,
+    ) -> int:
+        """Insert `(statement_row_index, dividend)` pairs; return the inserted count.
+
         Identity is `(source_statement_hash, statement_row_index)` —
-        same provenance-plus-position contract `TradeRepo.insert_many`
-        uses. The dividends section has its **own** row-index space
-        (independent of trades), starting at zero — each table owns
-        its own index.
+        same provenance-plus-position contract `TradeRepo.insert_indexed`
+        uses, and supplied by the ingestor for the same reason: rows
+        the coverage rule skips leave the others at their positions in
+        the file. The dividends section has its **own** row-index
+        space (independent of trades), starting at zero — each table
+        owns its own index.
 
         The `source_statement_hash` must already exist in
         `statements`; the FK will raise `IntegrityError` otherwise.
@@ -76,7 +93,7 @@ class DividendRepo:
                 statement_row_index=row_index,
                 source_statement_hash=source_statement_hash,
             )
-            for row_index, dividend in enumerate(dividends)
+            for row_index, dividend in dividends
         ]
         if not rows:
             return 0

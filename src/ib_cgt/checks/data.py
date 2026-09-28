@@ -400,6 +400,59 @@ def _check_statement_path_collisions(ctx: CheckContext) -> Finding:
 
 
 # ---------------------------------------------------------------------------
+# A15 — every dated fact lies inside (or just before) its own statement's period
+# ---------------------------------------------------------------------------
+
+
+# IB assigns a transaction to a statement by the exchange trading date
+# or the value date, which can differ from the printed calendar date by
+# a few days (a 17:06 ET CME fill on 5 April sits in the statement that
+# starts on 6 April; a deposit can be valued the day before an account
+# opens). A month of slack on either side is far more than that and
+# still catches what the check is for: a period mis-read from the wrong
+# header line, which would make the coverage rule of `ingest` own the
+# wrong days.
+_PERIOD_SLACK_DAYS: Final = 31
+
+# One `(table, date column)` per dated child of `statements`.
+_DATED_TABLES: Final[tuple[tuple[str, str], ...]] = (
+    ("trades", "trade_date"),
+    ("dividends", "pay_date"),
+    ("bond_coupons", "pay_date"),
+    ("cash_events", "value_date"),
+)
+
+
+@register_check(
+    name="A15",
+    description="every dated fact lies inside its own statement's period (a month's slack)",
+    tier=Tier.A,
+    scopes={Scope.ALL, Scope.DATA},
+    severity=Severity.WARN,
+)
+def _check_facts_inside_statement_period(ctx: CheckContext) -> Finding:
+    rows: list[sqlite3.Row] = []
+    for table, column in _DATED_TABLES:
+        rows.extend(
+            ctx.conn.execute(
+                f"SELECT '{table}' AS source_table, x.rowid AS row_id, x.{column} AS fact_date, "
+                "s.period_start, s.period_end, s.source_path "
+                f"FROM {table} x JOIN statements s ON s.statement_hash = x.source_statement_hash "
+                f"WHERE x.{column} < date(s.period_start, ?) "
+                f"OR x.{column} > date(s.period_end, ?)",
+                (f"-{_PERIOD_SLACK_DAYS} days", f"+{_PERIOD_SLACK_DAYS} days"),
+            ).fetchall()
+        )
+    if not rows:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(rows)} fact(s) dated outside their statement's period",
+        evidence=_rows_to_evidence(rows),
+    )
+
+
+# ---------------------------------------------------------------------------
 # A11 — fx_rates covers every non-GBP price_currency for the trade-date span
 # ---------------------------------------------------------------------------
 

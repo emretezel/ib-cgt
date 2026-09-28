@@ -31,6 +31,7 @@ _EXPECTED_CHECK_IDS = {
     "A12",
     "A13",
     "A14",
+    "A15",
     # Tier B
     "B1",
     "B2",

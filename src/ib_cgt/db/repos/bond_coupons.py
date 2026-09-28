@@ -64,11 +64,25 @@ class BondCouponRepo:
     ) -> int:
         """Insert each coupon with a dense per-statement row index; return inserted count.
 
+        The index is the zero-based offset in the iterable; see
+        `insert_indexed` for the identity contract.
+        """
+        return self.insert_indexed(enumerate(coupons), source_statement_hash=source_statement_hash)
+
+    def insert_indexed(
+        self,
+        coupons: Iterable[tuple[int, BondCoupon]],
+        *,
+        source_statement_hash: str,
+    ) -> int:
+        """Insert `(statement_row_index, coupon)` pairs; return the inserted count.
+
         Identity is `(source_statement_hash, statement_row_index)` —
-        same provenance-plus-position contract `DividendRepo.insert_many`
-        and `TradeRepo.insert_many` use. The Interest section has its
-        **own** row-index space (independent of trades, dividends),
-        starting at zero.
+        same provenance-plus-position contract `TradeRepo.insert_indexed`
+        uses, with the index supplied by the ingestor so rows the
+        coverage rule skips leave the others at their positions in the
+        file. The Interest section has its **own** row-index space
+        (independent of trades, dividends), starting at zero.
 
         The `source_statement_hash` must already exist in `statements`;
         the FK will raise `IntegrityError` otherwise.
@@ -78,7 +92,7 @@ class BondCouponRepo:
             return 0
 
         rows: list[tuple[object, ...]] = []
-        for row_index, coupon in enumerate(materialised):
+        for row_index, coupon in materialised:
             instrument_id = self._instruments.upsert(coupon.instrument)
             rows.append(
                 _coupon_to_row(

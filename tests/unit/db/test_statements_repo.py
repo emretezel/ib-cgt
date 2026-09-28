@@ -175,3 +175,46 @@ def test_delete_by_path_returns_zero_when_nothing_matches(db: sqlite3.Connection
     _record(repo, statement_hash="only", source_path="/s/25_26.htm")
     assert repo.delete_by_path("U1", "/s/25_26.htm", except_hash="only") == 0
     assert repo.delete_by_path("U1", "/s/nowhere.htm", except_hash="x") == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage queries (overlap-safe ingest)
+# ---------------------------------------------------------------------------
+
+
+def test_periods_for_account_lists_every_period_sorted(db: sqlite3.Connection) -> None:
+    _seed_account(db)
+    _seed_account(db, "U2")
+    repo = StatementRepo(db)
+    _record(repo, statement_hash="h-25", period_end=date(2026, 4, 3))
+    _record(repo, statement_hash="h-23", period_end=date(2024, 4, 5))
+    _record(repo, statement_hash="u2", account_id="U2", period_end=date(2025, 4, 4))
+    assert repo.periods_for_account("U1") == (
+        (date(2023, 4, 5), date(2024, 4, 5)),
+        (date(2025, 4, 3), date(2026, 4, 3)),
+    )
+    assert repo.periods_for_account("U-none") == ()
+
+
+def test_overlapping_returns_statements_touching_the_span(db: sqlite3.Connection) -> None:
+    """Inclusive on both ends: a statement ending on the span's first day overlaps it."""
+    _seed_account(db)
+    repo = StatementRepo(db)
+    _record(repo, statement_hash="h-ends-on-start", period_end=date(2025, 4, 7))
+    _record(repo, statement_hash="h-inside", period_end=date(2026, 1, 1))
+    _record(repo, statement_hash="h-before", period_end=date(2025, 4, 6))
+    rows = repo.overlapping("U1", date(2025, 4, 7), date(2026, 4, 3))
+    assert [r.statement_hash for r in rows] == ["h-ends-on-start", "h-inside"]
+
+
+def test_list_by_path_previews_what_delete_by_path_would_withdraw(
+    db: sqlite3.Connection,
+) -> None:
+    _seed_account(db)
+    repo = StatementRepo(db)
+    _record(repo, statement_hash="old", source_path="/s/25_26.htm")
+    _record(repo, statement_hash="new", source_path="/s/25_26.htm")
+    _record(repo, statement_hash="other", source_path="/s/24_25.htm")
+    rows = repo.list_by_path("U1", "/s/25_26.htm", except_hash="new")
+    assert [r.statement_hash for r in rows] == ["old"]
+    assert repo.exists("old")  # a preview, not a withdrawal

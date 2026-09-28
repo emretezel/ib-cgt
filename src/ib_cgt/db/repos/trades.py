@@ -82,15 +82,33 @@ class TradeRepo:
     ) -> int:
         """Insert each trade with a dense per-statement row index; return inserted count.
 
+        The index is the zero-based offset of each `Trade` in the
+        iterable — the shape every caller that persists a whole
+        statement, or a hand-built list in a test, wants. See
+        `insert_indexed` for the identity contract.
+        """
+        return self.insert_indexed(enumerate(trades), source_statement_hash=source_statement_hash)
+
+    def insert_indexed(
+        self,
+        trades: Iterable[tuple[int, Trade]],
+        *,
+        source_statement_hash: str,
+    ) -> int:
+        """Insert `(statement_row_index, trade)` pairs; return the inserted count.
+
         Identity is `(source_statement_hash, statement_row_index)` —
-        provenance plus position within the source. The index is the
-        zero-based offset of each `Trade` in the iterable, which mirrors
+        provenance plus position within the source. The index mirrors
         the order produced by `ingest.mapper.map_rows` (= the order the
         fills appeared in the IB statement, after the `C;O` reversal
-        split). One ingest call corresponds to one statement, so the
-        composite is unique by construction and `INSERT OR IGNORE`
-        backstops a partial-batch retry without ever silently merging
-        two genuinely-distinct fills.
+        split), which is why the ingestor supplies it explicitly: when
+        the coverage rule skips rows an earlier statement already
+        owns, the surviving rows keep the positions they had in the
+        file, so `show trade` still points at the right source row.
+        One ingest call corresponds to one statement, so the composite
+        is unique by construction and `INSERT OR IGNORE` backstops a
+        partial-batch retry without ever silently merging two
+        genuinely-distinct fills.
 
         The `source_statement_hash` must already exist in
         `statements`; the FK will raise `IntegrityError` otherwise.
@@ -100,7 +118,7 @@ class TradeRepo:
             return 0
 
         rows: list[tuple[object, ...]] = []
-        for row_index, trade in enumerate(materialised):
+        for row_index, trade in materialised:
             # Resolve (or create) the instrument id — every trade needs one,
             # and upsert is idempotent. Batching by distinct instrument would
             # shave some calls but ingestion batches are small enough that

@@ -1,8 +1,11 @@
-"""`ib-cgt ingest PATH` — parse one IB HTML statement into the database.
+"""`ib-cgt ingest PATH...` — parse IB statements into the database.
 
-Thin wrapper over `ib_cgt.ingest.ingest_statement`: resolves the DB,
+Thin wrapper over `ib_cgt.ingest.ingest_statements`: resolves the DB,
 applies migrations, hands the parser an FX service for the corporate-
-action conversions, and renders the `IngestResult` summary.
+action conversions, and renders one `IngestResult` summary per file.
+Several files are parsed first and then persisted earliest period
+first, so the coverage rule ("the first statement ingested owns its
+days") does not depend on the order the shell expanded the paths.
 
 Author: Emre Tezel
 """
@@ -18,20 +21,26 @@ from ib_cgt.cli.app import app
 from ib_cgt.cli.common import build_fx_service, console
 from ib_cgt.config import resolve_db_path
 from ib_cgt.db import apply_migrations, open_connection
-from ib_cgt.ingest import IngestResult, ingest_statement
+from ib_cgt.ingest import (
+    IngestResult,
+    MappingError,
+    StatementFormat,
+    StatementParseError,
+    ingest_statements,
+)
 
 
 @app.command("ingest")
 def ingest(
-    path: Annotated[
-        Path,
+    paths: Annotated[
+        list[Path],
         typer.Argument(
             exists=True,
             file_okay=True,
             dir_okay=False,
             readable=True,
             resolve_path=True,
-            help="IB HTML activity statement (.htm).",
+            help="IB activity statement(s): .htm / .html or .pdf.",
         ),
     ],
     replace: Annotated[
@@ -40,7 +49,7 @@ def ingest(
             "--replace",
             "-r",
             help=(
-                "If this statement was already imported, delete the prior "
+                "If a statement was already imported, delete the prior "
                 "import (cascading to its trades, dividends, coupons, cash "
                 "events and open positions) and re-ingest fresh. Also "
                 "withdraws any earlier import of a *different* file at the "
@@ -51,8 +60,26 @@ def ingest(
             ),
         ),
     ] = False,
+    fmt: Annotated[
+        StatementFormat,
+        typer.Option(
+            "--format",
+            "-f",
+            case_sensitive=False,
+            help=(
+                "Statement file format. `auto` (the default) picks the parser "
+                "from each file's suffix; name one to override a misleading suffix."
+            ),
+        ),
+    ] = StatementFormat.AUTO,
 ) -> None:
-    """Parse an IB statement and persist its trades into the database."""
+    """Parse IB statements and persist their trades, cash rows and positions.
+
+    Days already covered by an earlier statement of the same account
+    are owned by that statement: a later, overlapping file adds only
+    the rows dated on days it does not own, so a re-downloaded
+    statement that runs further never duplicates anything.
+    """
     db_path = resolve_db_path()
     conn = open_connection(db_path)
     try:
@@ -67,18 +94,29 @@ def ingest(
         # synthesis raises `RateNotFoundError`; the operator runs
         # `ib-cgt fx sync` to populate the cache and retries.
         fx_service = build_fx_service(conn)
-        result = ingest_statement(path, conn, replace=replace, fx_service=fx_service)
+        try:
+            results = ingest_statements(
+                paths, conn, replace=replace, fx_service=fx_service, fmt=fmt
+            )
+        except (StatementParseError, MappingError) as exc:
+            # A file that is not a statement, or a row the mappers do
+            # not understand: say which file, not where in the code.
+            # Files persisted earlier in the batch stay persisted —
+            # each is its own transaction.
+            console.print(f"[red]error:[/] {exc}")
+            raise typer.Exit(code=1) from exc
     finally:
         conn.close()
 
-    _render_ingest_result(result, path)
+    for path, result in results:
+        _render_ingest_result(result, path)
 
 
 def _render_ingest_result(result: IngestResult, source: Path) -> None:
-    """Print a short, structured summary of an ingestion run."""
+    """Print a short, structured summary of one file's ingestion."""
     if result.already_imported:
         console.print(
-            f"[yellow]Already imported[/] — hash "
+            f"[yellow]Already imported[/] [bold]{source.name}[/] — hash "
             f"[dim]{result.statement_hash[:12]}…[/] "
             f"(account {result.account_id}, {result.trade_count} trades on record)."
         )
@@ -127,9 +165,29 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
             "of this statement"
         )
     console.print(summary + ".")
+    if result.fully_covered:
+        console.print(
+            "[yellow]Period already covered[/] by earlier statements of this account — "
+            "only the open positions were new information."
+        )
+    elif result.covered_count:
+        plural = "" if result.covered_count == 1 else "s"
+        console.print(
+            f"[yellow]Skipped {result.covered_count} row{plural}[/] dated on days an earlier "
+            f"statement already covers ({result.covered_trade_count} trades, "
+            f"{result.covered_dividend_count} dividends, {result.covered_bond_coupon_count} "
+            f"coupons, {result.covered_cash_event_count} cash events)."
+        )
     if result.unresolved_position_symbols:
         symbols = ", ".join(result.unresolved_position_symbols)
         console.print(
             f"[yellow]Skipped {len(result.unresolved_position_symbols)} open position(s) "
             f"with no resolvable instrument: {symbols}[/]"
+        )
+    if result.withdrawn_overlaps:
+        listed = ", ".join(result.withdrawn_overlaps)
+        console.print(
+            "[yellow]Note:[/] the withdrawn version overlapped statements still on file "
+            f"({listed}). If those were ingested after it, rows on the shared days were "
+            "skipped in its favour — re-ingest them with --replace to restore them."
         )

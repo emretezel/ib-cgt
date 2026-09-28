@@ -155,6 +155,51 @@ class StatementRepo:
             return None
         return _row_to_statement(row)
 
+    def periods_for_account(self, account_id: str) -> tuple[tuple[date, date], ...]:
+        """Return every `(period_start, period_end)` on file for `account_id`, sorted.
+
+        The ingestor builds its `Coverage` from this: the days these
+        periods span are already owned, and a new statement that
+        overlaps them contributes only the rest. Served by
+        `ix_statements_account_period`.
+        """
+        rows = self._conn.execute(
+            "SELECT period_start, period_end FROM statements WHERE account_id = ? "
+            "ORDER BY period_start, period_end",
+            (account_id,),
+        ).fetchall()
+        return tuple(
+            (text_to_date(row["period_start"]), text_to_date(row["period_end"])) for row in rows
+        )
+
+    def overlapping(self, account_id: str, start: date, end: date) -> list[StatementRow]:
+        """Return the statements of `account_id` whose period overlaps `[start, end]`.
+
+        Backs the `ingest --replace` notice: when a statement is
+        withdrawn, the statements that overlapped it may have had rows
+        skipped in its favour when they were ingested, and the user is
+        told which ones to re-ingest.
+        """
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM statements "
+            "WHERE account_id = ? AND period_start <= ? AND period_end >= ? "
+            "ORDER BY period_start, period_end",
+            (account_id, date_to_text(end), date_to_text(start)),
+        ).fetchall()
+        return [_row_to_statement(row) for row in rows]
+
+    def list_by_path(
+        self, account_id: str, source_path: str, *, except_hash: str
+    ) -> list[StatementRow]:
+        """Return the statements `delete_by_path` would withdraw, without withdrawing them."""
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM statements "
+            "WHERE account_id = ? AND source_path = ? AND statement_hash <> ? "
+            "ORDER BY imported_at",
+            (account_id, source_path, except_hash),
+        ).fetchall()
+        return [_row_to_statement(row) for row in rows]
+
     def latest_per_account(self) -> list[StatementRow]:
         """Return the latest statement of every account that has one, by account id.
 
