@@ -26,11 +26,11 @@ from importlib.resources import files
 
 import pytest
 
-from ib_cgt.db import AccountRepo, FXRateRepo, StatementRepo, TaxRunRepo, open_memory_connection
+from ib_cgt.db import AccountRepo, FXRateRepo, TaxRunRepo, open_memory_connection
 from ib_cgt.db.migrator import _apply_one, _ensure_bookkeeping_table
 from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import Account, Money, TaxYear
-from tests.unit.db.legacy_schema import insert_legacy_stock
+from tests.unit.db.legacy_schema import insert_legacy_stock, insert_v15_statement
 
 
 def _apply_through(conn: sqlite3.Connection, last_version: int) -> None:
@@ -67,7 +67,8 @@ def _seed_pre021_world(conn: sqlite3.Connection) -> None:
     SQL of that era.
     """
     AccountRepo(conn).upsert(Account(account_id="U1"))
-    StatementRepo(conn).record(
+    insert_v15_statement(
+        conn,
         statement_hash="hash-a",
         source_path="/tmp/a.htm",
         account_id="U1",
@@ -253,7 +254,8 @@ def test_dividends_carry_a_symbol_and_no_instrument_link() -> None:
     assert "instrument_id" not in columns
 
     AccountRepo(conn).upsert(Account(account_id="U1"))
-    StatementRepo(conn).record(
+    insert_v15_statement(
+        conn,
         statement_hash="hash-a",
         source_path="/tmp/a.htm",
         account_id="U1",

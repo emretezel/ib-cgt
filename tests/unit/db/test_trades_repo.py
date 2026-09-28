@@ -30,6 +30,7 @@ def _seed_account_and_statement(
 ) -> None:
     AccountRepo(db).upsert(Account(account_id=account_id))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path="/tmp/stmt.html",
         account_id=account_id,

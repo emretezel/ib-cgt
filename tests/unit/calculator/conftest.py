@@ -35,6 +35,7 @@ from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -196,6 +197,7 @@ def seed_accounts_and_statement(conn: sqlite3.Connection) -> None:
     AccountRepo(conn).upsert(Account(account_id="U1"))
     AccountRepo(conn).upsert(Account(account_id="U2"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=STATEMENT_HASH,
         source_path="/tmp/calc.htm",
         account_id="U1",

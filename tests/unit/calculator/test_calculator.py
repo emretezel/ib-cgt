@@ -13,6 +13,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -98,6 +99,7 @@ def seed_statements_and_positions(conn: sqlite3.Connection) -> None:
         [FXRate(base="GBP", quote="JPY", rate_date=date(2025, 4, 3), rate=Decimal("190"))]
     )
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=U2_HASH,
         source_path="/tmp/u2.htm",
         account_id="U2",
@@ -260,6 +262,7 @@ def test_statement_holding_with_no_trades_is_an_error(
     calc_db: sqlite3.Connection, fx_service: FXService
 ) -> None:
     StatementRepo(calc_db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-u2-newer",
         source_path="/tmp/u2-newer.htm",
         account_id="U2",
@@ -317,6 +320,7 @@ def test_weekday_rule_treats_a_friday_statement_as_covering_a_sunday_year_end(
 ) -> None:
     """Fri 3 Apr 2026 covers Sun 5 Apr 2026; the look-ahead is still missing."""
     StatementRepo(calc_db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="u1-2026",
         source_path="/tmp/u1-2026.htm",
         account_id="U1",
@@ -325,6 +329,7 @@ def test_weekday_rule_treats_a_friday_statement_as_covering_a_sunday_year_end(
         period_end=date(2026, 4, 3),
     )
     StatementRepo(calc_db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="u2-2026",
         source_path="/tmp/u2-2026.htm",
         account_id="U2",

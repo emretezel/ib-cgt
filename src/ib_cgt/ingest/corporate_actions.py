@@ -51,7 +51,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Final, Protocol
 from zoneinfo import ZoneInfo
@@ -60,11 +60,11 @@ from ib_cgt.config import resolve_exempt_bonds_allowlist
 from ib_cgt.domain import BondInstrument, Money, Trade, TradeAction
 from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
 from ib_cgt.ingest.mapper import (
-    DEFAULT_STATEMENT_TZ,
     MappingError,
     _canonicalise_gilt_symbol,
     _classify_bond_exempt,
     build_stock_instrument,
+    parse_statement_datetime,
 )
 from ib_cgt.ingest.raw import ParsedStatement, RawCorporateActionRow
 
@@ -134,7 +134,6 @@ def map_corporate_actions(
     parsed: ParsedStatement,
     *,
     fx_service: FXConverter,
-    assume_timezone: ZoneInfo = DEFAULT_STATEMENT_TZ,
 ) -> list[Trade]:
     """Synthesize SELL `Trade`s from cash-for-shares merger rows.
 
@@ -146,8 +145,6 @@ def map_corporate_actions(
             requiring the parameter unconditionally keeps the
             signature simple and the call sites honest about the
             dependency.
-        assume_timezone: Zone to attach to IB's naive timestamps.
-            Defaults to Europe/London (matches `mapper.map_rows`).
 
     Returns:
         A list of `Trade(action=SELL, fees=0)` objects, one per merger
@@ -180,7 +177,7 @@ def map_corporate_actions(
                 account_id=parsed.account_id,
                 index=index,
                 fx_service=fx_service,
-                assume_timezone=assume_timezone,
+                time_zone=parsed.time_zone,
             )
         )
     return out
@@ -246,7 +243,7 @@ def _synthesize_one(
     account_id: str,
     index: InstrumentInfoIndex,
     fx_service: FXConverter,
-    assume_timezone: ZoneInfo,
+    time_zone: ZoneInfo,
 ) -> Trade:
     """Build a single SELL Trade from one merger event's row(s)."""
     # Pre-parse the numeric columns once so the row-selection logic
@@ -280,7 +277,7 @@ def _synthesize_one(
 
     quantity = abs(signed_qty)
 
-    trade_datetime = _parse_datetime(disposal_match.row.datetime_text, assume_timezone)
+    trade_datetime = parse_statement_datetime(disposal_match.row.datetime_text, time_zone)
     trade_date = Trade.uk_date_of(trade_datetime)
 
     # Express the cash proceeds in the stock's listing currency. The
@@ -341,25 +338,12 @@ def _parse_decimal(text: str) -> Decimal:
         raise MappingError(f"Unparseable corporate-action numeric cell {text!r}") from exc
 
 
-def _parse_datetime(text: str, tz: ZoneInfo) -> datetime:
-    """Parse IB's `YYYY-MM-DD, HH:MM:SS` timestamp with a tz assumption."""
-    try:
-        naive = datetime.strptime(text, "%Y-%m-%d, %H:%M:%S")
-    except ValueError as exc:
-        raise MappingError(f"Unparseable corporate-action datetime {text!r}") from exc
-    return naive.replace(tzinfo=tz)
-
-
 # ---------------------------------------------------------------------------
 # Bond maturities
 # ---------------------------------------------------------------------------
 
 
-def map_bond_maturities(
-    parsed: ParsedStatement,
-    *,
-    assume_timezone: ZoneInfo = DEFAULT_STATEMENT_TZ,
-) -> list[Trade]:
+def map_bond_maturities(parsed: ParsedStatement) -> list[Trade]:
     """Synthesize SELL `Trade`s from Bond Maturity Corporate Actions rows.
 
     A bond maturity is, for HMRC purposes, a disposal at par on the
@@ -373,8 +357,6 @@ def map_bond_maturities(
             `parsed.corporate_actions` (the source rows) and
             `parsed.instruments` (used to recover the gilt-classifying
             description) are consulted.
-        assume_timezone: Zone to attach to IB's naive timestamps.
-            Defaults to Europe/London.
 
     Returns:
         A list of `Trade(action=SELL, fees=0)` objects, one per
@@ -410,7 +392,7 @@ def map_bond_maturities(
                 index=index,
                 overrides=overrides,
                 account_id=parsed.account_id,
-                assume_timezone=assume_timezone,
+                time_zone=parsed.time_zone,
             )
         )
     return out
@@ -423,7 +405,7 @@ def _synthesize_bond_maturity(
     index: InstrumentInfoIndex,
     overrides: frozenset[str],
     account_id: str,
-    assume_timezone: ZoneInfo,
+    time_zone: ZoneInfo,
 ) -> Trade:
     """Build one SELL Trade from a Bond Maturity row's regex match."""
     raw_symbol = match.group("symbol").strip()
@@ -444,7 +426,7 @@ def _synthesize_bond_maturity(
         )
     quantity = abs(signed_qty)
 
-    trade_datetime = _parse_datetime(row.datetime_text, assume_timezone)
+    trade_datetime = parse_statement_datetime(row.datetime_text, time_zone)
     trade_date = Trade.uk_date_of(trade_datetime)
 
     # Recover the canonical display symbol + description from the

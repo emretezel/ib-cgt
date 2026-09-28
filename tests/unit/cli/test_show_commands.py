@@ -80,6 +80,7 @@ def _seed_trades(conn: sqlite3.Connection) -> dict[str, int]:
     """
     AccountRepo(conn).upsert(Account(account_id="U1"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/U1.html",
         account_id="U1",
@@ -184,6 +185,18 @@ def test_show_trade_gbp_stock_omits_fx_rate_row(
     assert "/tmp/U1.html" in result.output
     # No FX-rate row for the GBP path.
     assert "1 GBP =" not in result.output
+
+
+def test_show_trade_prints_the_time_as_the_statement_prints_it(
+    runner: CliRunner, populated_db: tuple[Path, dict[str, int]]
+) -> None:
+    """14:00 London on 1 May 2024 was printed as 09:00 in the statement's Eastern clock."""
+    _db_path, ids = populated_db
+    result = runner.invoke(app, ["show", "trade", str(ids["stock_buy"])])
+    assert result.exit_code == 0
+    assert "As printed" in result.output
+    assert "2024-05-01, 09:00:00" in result.output
+    assert "America/New_York" in result.output
 
 
 def test_show_trade_usd_forex_includes_fx_rate(

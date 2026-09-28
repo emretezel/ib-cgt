@@ -48,12 +48,14 @@ FXRuleEngine downstream, so no information is lost; the v1 Trade.price
 for FX is best thought of as "the exchange rate, typed for invariant
 compliance".
 
-Timezones: IB writes trade timestamps with no tz indicator. The plan
-(approved by the user) is to treat them as Europe/London local time —
-that matches HMRC's UK-contract-note-date interpretation for a UK
-taxpayer. The default can be overridden per-ingest via the
-`assume_timezone` parameter if a future statement is known to be in
-another zone.
+Timezones: IB prints trade timestamps with no offset, but every
+statement declares in its notes which zone they are in ("Trade
+execution times are displayed in Eastern Time."), and the parser
+carries that declaration as `ParsedStatement.time_zone`. The mapper
+attaches it to the naive text (`parse_statement_datetime`) to get the
+execution instant, and `Trade.uk_date_of` projects that instant into
+Europe/London for `trade_date` — the date UK CGT works with. A fill
+printed at 21:41 Eastern on 5 April is therefore dated 6 April.
 
 Author: Emre Tezel
 """
@@ -130,28 +132,19 @@ _GILT_DATE_RE: Final = re.compile(r"\b\d{2}/\d{2}/\d{2}\b")
 # so divide the IB-quoted price by 100 once at the ingest boundary.
 _BOND_PRICE_PAR_DIVISOR: Final = Decimal(100)
 
-# UK taxpayer default — confirmed with the user during planning. Kept at
-# module level so tests can `import` it without reaching into a function.
-DEFAULT_STATEMENT_TZ: Final = ZoneInfo("Europe/London")
-
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 
-def map_rows(
-    parsed: ParsedStatement,
-    *,
-    assume_timezone: ZoneInfo = DEFAULT_STATEMENT_TZ,
-) -> list[Trade]:
+def map_rows(parsed: ParsedStatement) -> list[Trade]:
     """Translate every raw trade row into a domain `Trade`.
 
     Args:
-        parsed: Output of `parser.parse_statement`.
-        assume_timezone: Zone to attach to the naive IB timestamps.
-            Defaults to Europe/London; override if importing a statement
-            known to be in a different clock.
+        parsed: Output of `parser.parse_statement`. Its `time_zone` —
+            the zone the statement declares for its timestamps — is
+            attached to every row's `datetime_text`.
 
     Returns:
         A list of fully validated `Trade` objects in the order they
@@ -194,7 +187,7 @@ def map_rows(
                 account_id=parsed.account_id,
                 index=index,
                 futures_pos=futures_pos,
-                assume_timezone=assume_timezone,
+                time_zone=parsed.time_zone,
             )
         )
     return trades
@@ -211,7 +204,7 @@ def _map_one(
     account_id: str,
     index: InstrumentInfoIndex,
     futures_pos: dict[str, Decimal],
-    assume_timezone: ZoneInfo,
+    time_zone: ZoneInfo,
 ) -> list[Trade]:
     """Dispatch a single raw row into one or more `Trade` objects.
 
@@ -222,7 +215,7 @@ def _map_one(
     """
     # Parse the timestamp and the signed quantity once — every asset
     # class needs both, and doing it here keeps the per-class code tidy.
-    trade_datetime = _parse_datetime(raw.datetime_text, assume_timezone)
+    trade_datetime = parse_statement_datetime(raw.datetime_text, time_zone)
     signed_qty = _parse_decimal(raw.quantity_text, field="quantity", raw=raw)
     price = _parse_decimal(raw.price_text, field="price", raw=raw)
     fees = _parse_decimal(raw.fees_text, field="fees", raw=raw) if raw.fees_text else Decimal(0)
@@ -666,18 +659,27 @@ def _build_fx(raw: RawTradeRow, signed_qty: Decimal) -> tuple[FXInstrument, Trad
 # ---------------------------------------------------------------------------
 
 
-def _parse_datetime(text: str, tz: ZoneInfo) -> datetime:
-    """Parse IB's `YYYY-MM-DD, HH:MM:SS` timestamp with a tz assumption."""
+def parse_statement_datetime(text: str, time_zone: ZoneInfo) -> datetime:
+    """Parse IB's `YYYY-MM-DD, HH:MM:SS` cell into the execution instant.
+
+    Shared by the trade mapper and the corporate-action synthesisers so
+    there is exactly one reading of a statement timestamp. `time_zone`
+    is the zone the statement declares for its clock times
+    (`ParsedStatement.time_zone`).
+
+    Raises:
+        MappingError: The text is not in IB's timestamp shape.
+    """
     # `datetime.strptime` is strict — it'll raise if the format drifts,
     # which we want: a silently-mis-parsed datetime could corrupt an
     # entire tax year's same-day matching.
     try:
         naive = datetime.strptime(text, "%Y-%m-%d, %H:%M:%S")
     except ValueError as exc:
-        raise MappingError(f"Unparseable trade datetime {text!r}") from exc
-    # Attach (not convert) the timezone — IB is writing the local clock
-    # at the reporting zone already, so `.replace(tzinfo=...)` is correct.
-    return naive.replace(tzinfo=tz)
+        raise MappingError(f"Unparseable statement datetime {text!r}") from exc
+    # Attach (not convert) the zone — IB prints the wall clock of the
+    # declared zone, so `.replace(tzinfo=...)` yields the true instant.
+    return naive.replace(tzinfo=time_zone)
 
 
 def _parse_decimal(text: str, *, field: str, raw: RawTradeRow) -> Decimal:
@@ -824,11 +826,11 @@ def _derive_futures_events(
 
 
 __all__ = [
-    "DEFAULT_STATEMENT_TZ",
     "MappingError",
     "build_bond_instrument",
     "build_future_instrument",
     "build_stock_instrument",
     "map_rows",
+    "parse_statement_datetime",
     "resolve_bond_info",
 ]

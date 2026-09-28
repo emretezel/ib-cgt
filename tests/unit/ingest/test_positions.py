@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -31,6 +32,7 @@ def _parsed(
 ) -> ParsedStatement:
     """Wrap position rows in a minimal `ParsedStatement`."""
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2025, 4, 7),
         period_end=date(2026, 4, 3),

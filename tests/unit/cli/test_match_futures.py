@@ -134,6 +134,7 @@ def _seed_trades(conn: sqlite3.Connection) -> None:
     """Seed the three test scenarios at once."""
     AccountRepo(conn).upsert(Account(account_id="U1"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1",
@@ -425,6 +426,7 @@ def test_match_futures_collects_errors_in_trailing_block(
     conn = open_connection(populated_db)
     try:
         StatementRepo(conn).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="hash-eur",
             source_path="/tmp/stmt-eur.html",
             account_id="U1",

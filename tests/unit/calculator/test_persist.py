@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -45,6 +46,7 @@ def calc_db(db: sqlite3.Connection) -> sqlite3.Connection:
     # Row identity is (statement, row index) per insert call, so the fee
     # needs its own (older) statement rather than the baseline's hash.
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-fee",
         source_path="/tmp/fee.htm",
         account_id="U1",
@@ -173,6 +175,7 @@ def test_partial_run_persists_what_worked_and_records_the_failure(
         expiry_date=date(2025, 12, 19),
     )
     StatementRepo(calc_db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-nq",
         source_path="/tmp/nq.htm",
         account_id="U1",

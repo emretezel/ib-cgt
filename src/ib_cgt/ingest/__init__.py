@@ -22,7 +22,7 @@ from ib_cgt.ingest.ingestor import (
     ingest_statements,
     load_statement,
 )
-from ib_cgt.ingest.mapper import DEFAULT_STATEMENT_TZ, MappingError, map_rows
+from ib_cgt.ingest.mapper import MappingError, map_rows
 from ib_cgt.ingest.parsers import (
     StatementFormat,
     StatementParser,
@@ -39,7 +39,6 @@ from ib_cgt.ingest.raw import (
 )
 
 __all__ = [
-    "DEFAULT_STATEMENT_TZ",
     "Coverage",
     "IngestResult",
     "LoadedStatement",

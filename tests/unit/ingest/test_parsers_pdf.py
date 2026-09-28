@@ -33,10 +33,14 @@ _DATED_COLUMNS = ((36.0, 105.0), (105.0, 312.0), (312.0, 382.0))
 class _Page:
     """Accumulates cells and words for one synthetic page."""
 
-    def __init__(self, number: int = 1) -> None:
+    def __init__(self, number: int = 1, *, note: bool = True) -> None:
         self.number = number
         self.cells: list[Cell] = []
         self.words: list[Word] = []
+        # Whether `build` stamps IB's time-zone note ("Trade execution
+        # times are displayed in Eastern Time.") on the page, as every
+        # real statement carries it; a test opts out to assert the error.
+        self.note = note
 
     def title(self, top: float, text: str, span: tuple[float, float] = _FULL) -> _Page:
         """A 10 pt title in a band of its own."""
@@ -90,12 +94,29 @@ class _Page:
         return self
 
     def build(self) -> PageGeometry:
-        return PageGeometry(number=self.number, cells=tuple(self.cells), words=tuple(self.words))
+        words = list(self.words)
+        if self.note:
+            x = 40.0
+            for token in [
+                "Trade",
+                "execution",
+                "times",
+                "are",
+                "displayed",
+                "in",
+                "Eastern",
+                "Time.",
+            ]:
+                words.append(
+                    Word(text=token, x0=x, x1=x + 4 * len(token), top=580, bottom=586, size=6)
+                )
+                x += 4 * len(token) + 3
+        return PageGeometry(number=self.number, cells=tuple(self.cells), words=tuple(words))
 
 
-def _first_page(number: int = 1) -> _Page:
+def _first_page(number: int = 1, *, note: bool = True) -> _Page:
     """A page carrying the statement header facts the adapter reads from page one."""
-    page = _Page(number)
+    page = _Page(number, note=note)
     page.words.extend(
         [
             Word(text="Activity", x0=600, x1=640, top=10, bottom=20, size=10),
@@ -136,7 +157,21 @@ def test_account_and_period_come_from_the_first_page() -> None:
     assert document.account_id == "U1004320"
     assert document.period_start == date(2012, 1, 1)
     assert document.period_end == date(2012, 12, 31)
+    assert document.time_zone.key == "America/New_York"
     assert document.tables == ()
+
+
+def test_time_zone_note_is_read_from_any_page() -> None:
+    """IB prints the note on the last page; the adapter searches every page."""
+    first = _first_page(note=False)
+    last = _Page(2)
+    document = build_document([first.build(), last.build()])
+    assert document.time_zone.key == "America/New_York"
+
+
+def test_missing_time_zone_note_fails_loudly() -> None:
+    with pytest.raises(StatementParseError, match="time-zone note"):
+        build_document([_first_page(note=False).build()])
 
 
 def test_missing_period_fails_loudly() -> None:
@@ -349,6 +384,7 @@ def _fixture_pdf() -> bytes:
     )
     page.row(280, 291, [(410, 670), (670, 756)], ["Interest Accrued", "-487.53"])
     page.row(291, 302, list(_DATED_COLUMNS), ["Total", "", "3.59"])
+    page.text(40, 580, "Trade execution times are displayed in Eastern Time.", size=6)
     page.text(40, 595, "Activity Statement - January 1, 2012 - December 31, 2012", size=6)
     return build_pdf([page])
 
@@ -357,6 +393,7 @@ def test_pdf_strategy_parses_a_hand_written_statement_end_to_end() -> None:
     parsed = PdfStatementParser().parse(_fixture_pdf())
     assert parsed.account_id == "U1004320"
     assert (parsed.period_start, parsed.period_end) == (date(2012, 1, 1), date(2012, 12, 31))
+    assert parsed.time_zone.key == "America/New_York"
     (trade,) = parsed.trades
     assert trade.asset_class == "Stocks"
     assert trade.currency == "USD"

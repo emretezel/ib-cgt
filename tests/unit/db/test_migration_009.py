@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -51,6 +52,7 @@ def test_kind_check_rejects_unknown_label(db: sqlite3.Connection) -> None:
     """The CHECK on `kind` rejects values outside the documented set."""
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-x",
         source_path="/tmp/s.htm",
         account_id="U1",
@@ -72,6 +74,7 @@ def test_cascade_delete_on_statement_clears_dividends(db: sqlite3.Connection) ->
     """Deleting a statement cascades to its dividend rows."""
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-y",
         source_path="/tmp/s.htm",
         account_id="U1",

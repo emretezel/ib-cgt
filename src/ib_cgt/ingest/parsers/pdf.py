@@ -60,6 +60,7 @@ from ib_cgt.ingest.parsers.tables import (
     SectionKind,
     TableRow,
     period_from_text,
+    time_zone_from_text,
 )
 from ib_cgt.ingest.raw import StatementParseError
 
@@ -171,8 +172,8 @@ def parse_pdf(source_bytes: bytes) -> RawDocument:
     """Read an IB PDF activity statement into the neutral table model.
 
     Raises:
-        StatementParseError: No account id or no statement period can
-            be found on the first page.
+        StatementParseError: No account id or no statement period on
+            the first page, or no time-zone note on any page.
     """
     return build_document(read_pages(source_bytes))
 
@@ -225,17 +226,23 @@ def build_document(pages: Sequence[PageGeometry]) -> RawDocument:
 
     Raises:
         StatementParseError: The first page carries no account id or
-            no statement period, or there is no first page.
+            no statement period, no page carries the time-zone note,
+            or there is no first page.
     """
     if not pages:
         raise StatementParseError("The PDF has no pages.")
     first = pages[0]
     account_id = _extract_account_id(first)
     period_start, period_end = period_from_text(_page_text(first), source="first page")
+    # The note is in the Notes/Legal Notes section, which IB prints on
+    # the last page; searching every page's text keeps the adapter
+    # indifferent to where that section lands.
+    time_zone = time_zone_from_text(" ".join(_page_text(p) for p in pages), source="notes")
     return RawDocument(
         account_id=account_id,
         period_start=period_start,
         period_end=period_end,
+        time_zone=time_zone,
         tables=tuple(_tables(pages)),
     )
 

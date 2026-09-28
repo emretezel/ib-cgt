@@ -22,6 +22,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 from importlib.resources import files
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -40,6 +41,7 @@ def _seed_account_and_statement(
     """Insert minimal parents so a `trades` row's FKs resolve."""
     AccountRepo(conn).upsert(Account(account_id=account_id))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path="/tmp/stmt.html",
         account_id=account_id,

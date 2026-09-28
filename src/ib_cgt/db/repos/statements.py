@@ -1,7 +1,7 @@
 """Repository for statement-level ingestion idempotency and coverage.
 
-One row per imported IB HTML statement, keyed by a SHA-256 of the
-normalised source bytes. The statement hash is how ingestion answers
+One row per imported IB activity statement (HTML or PDF), keyed by a
+SHA-256 of the source bytes. The statement hash is how ingestion answers
 "have I already processed this file?" in O(1), and is what each trade's
 `source_statement_hash` column points back to for provenance.
 
@@ -11,6 +11,12 @@ ask two questions the trades alone cannot answer: "how far does the
 history reach for this account?" and "which statement is the latest
 one, whose open positions the trades must reconcile against?".
 
+Since migration 022 the row also carries the time zone the statement
+declares for its clock times (IB's "Trade execution times are
+displayed in Eastern Time." note). Every trade instant was read in
+that zone, so the audit commands can print a trade's time exactly as
+the file prints it.
+
 Author: Emre Tezel
 """
 
@@ -19,8 +25,9 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
-from ib_cgt.db.codecs import date_to_text, text_to_date
+from ib_cgt.db.codecs import date_to_text, text_to_date, text_to_zone, zone_to_text
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -31,6 +38,8 @@ class StatementRow:
     to *read* a statement's metadata back so the dossier can print
     the source path the trade came from, and the calculator reads the
     period bounds. This DTO is the smallest shape that serves both.
+    `time_zone` is the zone the statement's `Date/Time` cells are
+    printed in — what `show trade` uses to print a time as printed.
     """
 
     statement_hash: str
@@ -40,12 +49,14 @@ class StatementRow:
     trade_count: int
     period_start: date
     period_end: date
+    time_zone: ZoneInfo
 
 
 # Every column, in the order `_row_to_statement` expects. Named rather
 # than `SELECT *` so a future column addition is a deliberate change here.
 _COLUMNS = (
-    "statement_hash, source_path, account_id, imported_at, trade_count, period_start, period_end"
+    "statement_hash, source_path, account_id, imported_at, trade_count, period_start, "
+    "period_end, time_zone"
 )
 
 
@@ -69,8 +80,12 @@ class StatementRepo:
         trade_count: int,
         period_start: date,
         period_end: date,
+        time_zone: ZoneInfo,
     ) -> None:
         """Record a newly-imported statement.
+
+        `time_zone` is the zone the statement declares for its clock
+        times (`ParsedStatement.time_zone`), stored by IANA key.
 
         Raises `sqlite3.IntegrityError` if a statement with the same hash
         is already recorded — callers should consult `exists()` first if
@@ -80,8 +95,8 @@ class StatementRepo:
         self._conn.execute(
             "INSERT INTO statements "
             "(statement_hash, source_path, account_id, imported_at, trade_count, "
-            "period_start, period_end) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "period_start, period_end, time_zone) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 statement_hash,
                 source_path,
@@ -90,6 +105,7 @@ class StatementRepo:
                 trade_count,
                 date_to_text(period_start),
                 date_to_text(period_end),
+                zone_to_text(time_zone),
             ),
         )
 
@@ -227,4 +243,5 @@ def _row_to_statement(row: sqlite3.Row) -> StatementRow:
         trade_count=int(row["trade_count"]),
         period_start=text_to_date(row["period_start"]),
         period_end=text_to_date(row["period_end"]),
+        time_zone=text_to_zone(str(row["time_zone"])),
     )

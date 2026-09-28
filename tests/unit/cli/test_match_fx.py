@@ -57,6 +57,7 @@ def runner() -> CliRunner:
 def _seed(conn: sqlite3.Connection) -> None:
     AccountRepo(conn).upsert(Account(account_id="U1"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-fx",
         source_path="/tmp/fx.htm",
         account_id="U1",

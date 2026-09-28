@@ -5,7 +5,7 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date
 from pathlib import Path
 from typing import Annotated
 
@@ -93,16 +93,16 @@ def _render_trades(rows: list[Trade], db_path: Path) -> None:
     table.add_column("Fees", justify="right")
 
     for trade in rows:
-        # UTC timestamp in the table keeps it comparable across rows that
-        # might carry different local offsets; the UK-local trade_date is
-        # the one that drives CGT matching so we show both.
-        utc_time = trade.trade_datetime.astimezone(tz=datetime.now().astimezone().tzinfo)
+        # The UTC clock keeps rows comparable whatever zone their
+        # statement printed them in; the UK-local trade_date is the one
+        # that drives CGT matching, so both are shown.
+        utc_time = trade.trade_datetime.astimezone(UTC)
         table.add_row(
             trade.account_id,
             trade.instrument.asset_class.value,
             trade.instrument.symbol,
             trade.trade_date.isoformat(),
-            utc_time.strftime("%H:%M:%S %Z"),
+            utc_time.strftime("%H:%M:%S"),
             trade.action.value,
             f"{trade.quantity}",
             f"{trade.price.amount} {trade.price.currency}",

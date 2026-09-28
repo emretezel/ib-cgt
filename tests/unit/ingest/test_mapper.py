@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from ib_cgt.domain import (
     StockInstrument,
     TradeAction,
 )
-from ib_cgt.ingest.mapper import DEFAULT_STATEMENT_TZ, MappingError, map_rows
+from ib_cgt.ingest.mapper import MappingError, map_rows
 from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawInstrumentInfo,
@@ -54,6 +55,7 @@ def _make(
     trades: list[RawTradeRow], instruments: list[RawInstrumentInfo] | None = None
 ) -> ParsedStatement:
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U9999999",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
@@ -563,41 +565,48 @@ def test_forex_malformed_symbol_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_tz_is_europe_london() -> None:
-    # 2024-04-05 21:41:02 London is BST (UTC+1), so UTC equivalent is 20:41:02.
-    row = RawTradeRow(
+def _row_at(datetime_text: str) -> RawTradeRow:
+    return RawTradeRow(
         asset_class="Stocks",
         currency="GBP",
         symbol="CNKY",
-        datetime_text="2024-04-05, 21:41:02",
+        datetime_text=datetime_text,
         quantity_text="1",
         price_text="100",
         fees_text="0",
         code="O",
     )
-    trade = map_rows(_make([row], [_stock_info()]))[0]
-    assert trade.trade_datetime.tzinfo is DEFAULT_STATEMENT_TZ
-    assert trade.trade_datetime.astimezone(UTC) == datetime(2024, 4, 5, 20, 41, 2, tzinfo=UTC)
-    assert trade.trade_date == date(2024, 4, 5)
 
 
-def test_custom_tz_applied() -> None:
-    row = RawTradeRow(
-        asset_class="Stocks",
-        currency="USD",
-        symbol="AAPL",
-        datetime_text="2024-05-01, 23:45:00",
-        quantity_text="1",
-        price_text="180",
-        fees_text="0",
-        code="O",
-    )
-    ny = ZoneInfo("America/New_York")
-    trade = map_rows(_make([row], [_stock_info("AAPL")]), assume_timezone=ny)[0]
-    assert trade.trade_datetime.tzinfo is ny
-    # 23:45 NY on 2024-05-01 is 2024-05-02 04:45 London — the UK-local
-    # projection rolls to the next day.
-    assert trade.trade_date == date(2024, 5, 2)
+def test_timestamp_is_read_in_the_statements_zone() -> None:
+    """The instant is the printed clock in `ParsedStatement.time_zone` (Eastern here)."""
+    parsed = _make([_row_at("2024-04-05, 21:41:02")], [_stock_info()])
+    trade = map_rows(parsed)[0]
+    assert trade.trade_datetime.tzinfo is parsed.time_zone
+    # 21:41:02 EDT (UTC-4) on 5 April is 01:41:02 UTC on 6 April.
+    assert trade.trade_datetime.astimezone(UTC) == datetime(2024, 4, 6, 1, 41, 2, tzinfo=UTC)
+
+
+def test_evening_eastern_fill_gets_the_next_uk_date() -> None:
+    """21:41 Eastern on 5 April is 02:41 BST on 6 April — the 2024/25 tax year."""
+    trade = map_rows(_make([_row_at("2024-04-05, 21:41:02")], [_stock_info()]))[0]
+    assert trade.trade_date == date(2024, 4, 6)
+
+
+def test_daytime_eastern_fill_keeps_its_printed_date() -> None:
+    """03:00 Eastern (a Eurex open) is 08:00 London the same day."""
+    trade = map_rows(_make([_row_at("2023-04-11, 03:00:04")], [_stock_info()]))[0]
+    assert trade.trade_datetime.astimezone(UTC) == datetime(2023, 4, 11, 7, 0, 4, tzinfo=UTC)
+    assert trade.trade_date == date(2023, 4, 11)
+
+
+def test_zone_of_the_parsed_statement_is_honoured() -> None:
+    """A statement declaring another zone is read in that zone, not Eastern."""
+    parsed = _make([_row_at("2024-05-01, 23:45:00")], [_stock_info()])
+    london = dataclasses.replace(parsed, time_zone=ZoneInfo("Europe/London"))
+    trade = map_rows(london)[0]
+    assert trade.trade_datetime.astimezone(UTC) == datetime(2024, 5, 1, 22, 45, tzinfo=UTC)
+    assert trade.trade_date == date(2024, 5, 1)
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ def _seed(db: sqlite3.Connection) -> None:
     AccountRepo(db).upsert(Account(account_id="U1"))
     AccountRepo(db).upsert(Account(account_id="U2"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="h1",
         source_path="/fake",
         account_id="U1",

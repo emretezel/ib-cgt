@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -81,6 +82,7 @@ def _make(
     instruments: list[RawInstrumentInfo] | None = None,
 ) -> ParsedStatement:
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U9999998",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
@@ -127,7 +129,8 @@ def test_synthesizes_sell_trade_from_gilt_maturity_with_description() -> None:
     assert trade.quantity == Decimal("215000")
     assert trade.price.amount == Decimal("1.00")
     assert trade.price.currency == "GBP"
-    assert trade.trade_date == date(2025, 1, 30)
+    # The row is printed 2025-01-30, 20:25:00 Eastern — 01:25 UK on the 31st.
+    assert trade.trade_date == date(2025, 1, 31)
     # Bond maturities carry no commissions and no accrued interest.
     assert trade.fees.amount == Decimal("0")
     assert trade.accrued_interest is None

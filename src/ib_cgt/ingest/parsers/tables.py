@@ -8,8 +8,9 @@ asset-class sub-header, a currency sub-header, data rows and total
 rows, whichever file it came from. This module names exactly that
 shared meaning:
 
-* `RawDocument` — the account id, the period and the tables of one
-  statement, in document order;
+* `RawDocument` — the account id, the period, the zone its clock
+  times are printed in, and the tables of one statement, in document
+  order;
 * `RawTable` — one table with the `SectionKind` it belongs to;
 * `TableRow` — one row, classified by `RowKind`, with its cell texts.
 
@@ -36,6 +37,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ib_cgt.ingest.raw import StatementParseError
 
@@ -105,16 +107,26 @@ class RawTable:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RawDocument:
-    """A statement as the format adapters see it: header facts plus tables in document order."""
+    """A statement as the format adapters see it: header facts plus tables in document order.
+
+    Attributes:
+        account_id: The primary IB account the statement belongs to.
+        period_start: First day the statement covers (inclusive).
+        period_end: Last day the statement covers (inclusive).
+        time_zone: The zone every `Date/Time` cell is printed in, as
+            the statement's own notes declare it (`time_zone_from_text`).
+        tables: The recognised tables, in document order.
+    """
 
     account_id: str
     period_start: date
     period_end: date
+    time_zone: ZoneInfo
     tables: tuple[RawTable, ...]
 
 
 # ---------------------------------------------------------------------------
-# Statement header — the two facts every vintage prints in a fixed shape
+# Statement header — the three facts every vintage prints in a fixed shape
 # ---------------------------------------------------------------------------
 
 # The statement period as IB prints it: `"April 7, 2025 - April 3,
@@ -156,6 +168,58 @@ def period_from_text(text: str, *, source: str) -> tuple[date, date]:
     return start, end
 
 
+# The statement's own declaration of the zone its clock times are in.
+# IB prints it once, in the Notes/Legal Notes section of every vintage
+# (HTML and PDF alike): "Trade execution times are displayed in Eastern
+# Time." The phrase is IB's wording for the account's display zone, not
+# an IANA name, so it is mapped through the table below.
+_TIME_ZONE_NOTE_PATTERN: Final = re.compile(
+    r"Trade execution times are displayed in (?P<zone>[^.]+)\."
+)
+
+# IB phrase → IANA zone. Only the phrase IB has actually printed is
+# listed; an unlisted phrase that is itself an IANA key (should IB ever
+# print one) is accepted as it stands, anything else is rejected — a
+# statement whose zone is unknown cannot be read correctly.
+_IB_TIME_ZONES: Final[dict[str, str]] = {
+    "Eastern Time": "America/New_York",
+}
+
+
+def time_zone_from_text(text: str, *, source: str) -> ZoneInfo:
+    """Return the zone the statement declares its `Date/Time` cells are printed in.
+
+    IB never prints an offset next to a trade time; the only statement
+    of the zone is the note quoted above, which applies to the whole
+    file. A statement without that note — or with a phrase this module
+    does not know — is rejected rather than guessed at, for the same
+    reason `period_from_text` rejects a missing period: every trade
+    instant, and so every UK-local trade date, would be hours out.
+    `source` names where the text came from so the error reads
+    naturally for either format.
+
+    Raises:
+        StatementParseError: No note, or a phrase that is neither in
+            the IB table nor a valid IANA zone key.
+    """
+    match = _TIME_ZONE_NOTE_PATTERN.search(text)
+    if match is None:
+        raise StatementParseError(
+            f"Could not locate the time-zone note in the {source} (expected "
+            "'Trade execution times are displayed in <zone>.')."
+        )
+    # Collapse the whitespace a wrapped PDF line or an HTML newline may
+    # have left inside the phrase.
+    phrase = " ".join(match.group("zone").split())
+    key = _IB_TIME_ZONES.get(phrase, phrase)
+    try:
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise StatementParseError(
+            f"Unknown time zone {phrase!r} in the {source}; add it to the IB zone table."
+        ) from exc
+
+
 __all__ = [
     "ACCOUNT_ID_PATTERN",
     "RawDocument",
@@ -164,4 +228,5 @@ __all__ = [
     "SectionKind",
     "TableRow",
     "period_from_text",
+    "time_zone_from_text",
 ]

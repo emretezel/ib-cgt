@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,6 +20,7 @@ def _conn() -> sqlite3.Connection:
     apply_migrations(conn)
     AccountRepo(conn).upsert(Account(account_id="U1"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="h",
         source_path="/tmp/h",
         account_id="U1",

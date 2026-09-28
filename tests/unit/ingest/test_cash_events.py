@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -24,6 +25,7 @@ from ib_cgt.ingest.raw import ParsedStatement, RawCashRow, RawDividendRow
 
 def _parsed(*rows: RawCashRow) -> ParsedStatement:
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2025, 4, 7),
         period_end=date(2026, 4, 3),
@@ -285,6 +287,7 @@ def _wht_row(*, description: str, amount_text: str, currency: str = "GBP") -> Ra
 
 def test_withholding_on_broker_interest_becomes_withholding_event() -> None:
     parsed = ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2018, 4, 6),
         period_end=date(2019, 4, 5),
@@ -312,6 +315,7 @@ def test_withholding_on_broker_interest_becomes_withholding_event() -> None:
 def test_withholding_on_a_dividend_is_not_a_cash_event() -> None:
     """Rows that name a stock are the dividend mapper's; they must not double-count."""
     parsed = ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2018, 4, 6),
         period_end=date(2019, 4, 5),
@@ -332,6 +336,7 @@ def test_withholding_on_a_dividend_is_not_a_cash_event() -> None:
 def test_withholding_events_come_after_the_cash_sections() -> None:
     """The row-index space runs interest → deposits → fees → withholding."""
     parsed = ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2018, 4, 6),
         period_end=date(2019, 4, 5),

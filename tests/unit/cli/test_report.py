@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from typer.testing import CliRunner
@@ -153,6 +154,7 @@ def test_incomplete_run_renders_then_exits_one(runner: CliRunner, populated_db: 
             expiry_date=date(2025, 12, 19),
         )
         StatementRepo(conn).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="hash-nq",
             source_path="/tmp/nq.htm",
             account_id="U1",

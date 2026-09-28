@@ -113,6 +113,7 @@ def _seed_trades(conn: sqlite3.Connection) -> None:
     AccountRepo(conn).upsert(Account(account_id="U1004320"))
     AccountRepo(conn).upsert(Account(account_id="U10049818"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1004320",
@@ -361,6 +362,7 @@ def test_match_stocks_unmatched_disposal_lands_in_unmatched_block(
         apply_migrations(conn)
         AccountRepo(conn).upsert(Account(account_id="U1"))
         StatementRepo(conn).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="hash-short",
             source_path="/tmp/short.html",
             account_id="U1",

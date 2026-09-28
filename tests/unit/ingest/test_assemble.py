@@ -11,6 +11,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 from datetime import date
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -69,6 +70,7 @@ def _document(*tables: RawTable) -> RawDocument:
         account_id="U1",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
+        time_zone=ZoneInfo("America/New_York"),
         tables=tables,
     )
 
@@ -393,5 +395,6 @@ def test_header_facts_are_passed_through() -> None:
     assert parsed.account_id == "U1"
     assert parsed.period_start == date(2024, 4, 6)
     assert parsed.period_end == date(2025, 4, 5)
+    assert parsed.time_zone.key == "America/New_York"
     assert parsed.trades == ()
     assert parsed.open_positions == ()

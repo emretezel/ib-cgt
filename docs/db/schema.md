@@ -98,8 +98,10 @@ ever compares `instrument_id`.
 | `trade_count` | INTEGER | |
 | `period_start` | TEXT | |
 | `period_end` | TEXT | |
+| `time_zone` | TEXT | IANA zone key of the statement's `Date/Time` cells |
 
 - CHECK `(period_start <= period_end)`
+- CHECK `(length(time_zone) > 0)`
 - INDEX `ix_statements_account_period` `(account_id, period_end)`
 
 ### `statement_positions`

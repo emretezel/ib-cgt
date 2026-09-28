@@ -155,6 +155,7 @@ def _record_statement(conn: sqlite3.Connection, statement_hash: str) -> None:
     row-index spaces disjoint.
     """
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path=f"/tmp/{statement_hash}.html",
         account_id="U1",

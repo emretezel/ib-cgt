@@ -25,6 +25,7 @@ def _seed(db: sqlite3.Connection) -> int:
     """Seed one account, one statement, one trade — return its trade_id."""
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1",

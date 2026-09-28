@@ -26,7 +26,7 @@ exists in the source tree.
 ## Migration version documented
 
 This page documents the live schema **as currently migrated to version
-`21`** (`001_initial.sql` through `021_instrument_conid_identity.sql`
+`22`** (`001_initial.sql` through `022_statement_time_zone.sql`
 all applied — see [`schema_migrations.md`](./schema_migrations.md) for
 the full list). Whenever a new migration lands in the repository, run
 `ib-cgt db init` against this database and regenerate this
@@ -158,6 +158,7 @@ for the same reason: a close-out's net cashflow is a loss or a gain.
 |---|---|---|
 | `date` | `TEXT` | `YYYY-MM-DD` |
 | `datetime` (UTC) | `TEXT` | ISO-8601 with `+00:00` offset, e.g. `2026-04-18T22:19:57.419700+00:00` |
+| `ZoneInfo` | `TEXT` | IANA key, e.g. `America/New_York` (`codecs.zone_to_text` / `text_to_zone`) |
 
 ### Booleans
 

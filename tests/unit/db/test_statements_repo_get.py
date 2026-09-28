@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from ib_cgt.db import AccountRepo, StatementRepo, StatementRow
 from ib_cgt.domain import Account
@@ -21,6 +22,7 @@ def test_get_returns_recorded_metadata(db: sqlite3.Connection) -> None:
     """Round-trip: what `record` writes is what `get` returns."""
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="abc123",
         source_path="/tmp/U1_2024.html",
         account_id="U1",
@@ -35,6 +37,9 @@ def test_get_returns_recorded_metadata(db: sqlite3.Connection) -> None:
     assert row.source_path == "/tmp/U1_2024.html"
     assert row.account_id == "U1"
     assert row.trade_count == 42
+    assert row.period_start == date(2024, 4, 6)
+    assert row.period_end == date(2025, 4, 5)
+    assert row.time_zone == ZoneInfo("America/New_York")
     # `imported_at` is set by `record` to a UTC ISO string; just
     # verify it round-trips as a non-empty string.
     assert isinstance(row.imported_at, str)

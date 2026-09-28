@@ -123,6 +123,14 @@ def _render_show_trade(
     else:
         table.add_row("Statement", f"[red]hash {stored.statement_hash} not found[/]")
     table.add_row("Trade datetime", trade.trade_datetime.isoformat())
+    if statement is not None:
+        # The clock as the statement prints it — the value to look for
+        # in the source file when verifying the row by hand.
+        printed = trade.trade_datetime.astimezone(statement.time_zone)
+        table.add_row(
+            "As printed",
+            f"{printed.strftime('%Y-%m-%d, %H:%M:%S')}  ({statement.time_zone.key})",
+        )
     table.add_row("Trade date (UK)", trade.trade_date.isoformat())
     table.add_row("Settlement date", trade.settlement_date.isoformat())
     table.add_row(

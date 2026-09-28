@@ -36,6 +36,7 @@ def _seed(db: sqlite3.Connection, *, account_id: str = "U1") -> None:
     """Insert one account and one owning statement so trades can attach."""
     AccountRepo(db).upsert(Account(account_id=account_id))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id=account_id,

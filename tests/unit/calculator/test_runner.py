@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from ib_cgt.calculator import (
     BondEngineRun,
@@ -198,6 +199,7 @@ def test_engine_error_is_captured_per_instrument(
     # its own statement — re-using the baseline hash would collide with
     # row 0 and be silently ignored.
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-nq",
         source_path="/tmp/nq.htm",
         account_id="U1",

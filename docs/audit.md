@@ -46,7 +46,9 @@ Single-trade audit dossier. Resolves the trade through
 `StatementRepo.get`, and prints:
 
 - Account, statement file path, statement row index.
-- Trade datetime / trade date / settlement date.
+- Trade datetime (UTC), the time **as printed** in the statement's own
+  zone (`statements.time_zone` — `2024-05-01, 09:00:00 (America/New_York)`),
+  the UK-local trade date and the settlement date.
 - Native qty / price / fees (and accrued interest for bonds).
 - For non-GBP trades: the cached `1 GBP = r native` rate at
   `trade_date` — exactly what the rule engines feed into their

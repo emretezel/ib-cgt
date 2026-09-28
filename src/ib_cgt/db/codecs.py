@@ -13,6 +13,9 @@ Rules honoured here:
 * Dates use ISO-8601 (`YYYY-MM-DD`). Datetimes are *always* persisted in
   UTC with the trailing `+00:00` offset; rehydration reattaches
   `timezone.utc` so the domain's tz-aware invariant holds.
+* Time zones are stored by IANA key (`America/New_York`) and come back
+  as `ZoneInfo`, so the zone a statement's clock times were read in is
+  a plain, greppable fact in the row.
 * `Money` splits into two columns `(amount TEXT, currency CHAR(3))` so
   aggregate functions can operate on the amount without parsing JSON.
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from ib_cgt.domain import Money
 
@@ -94,6 +98,21 @@ def text_to_dt(value: str) -> datetime:
         # domain invariant on the consumer side.
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Time zone
+# ---------------------------------------------------------------------------
+
+
+def zone_to_text(value: ZoneInfo) -> str:
+    """Serialise a `ZoneInfo` as its IANA key, e.g. `America/New_York`."""
+    return value.key
+
+
+def text_to_zone(value: str) -> ZoneInfo:
+    """Rehydrate an IANA key into a `ZoneInfo`."""
+    return ZoneInfo(value)
 
 
 # ---------------------------------------------------------------------------

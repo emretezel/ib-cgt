@@ -408,6 +408,14 @@ def test_ingest_records_statement_period(db: sqlite3.Connection) -> None:
     assert row.account_id == "U9999996"
 
 
+def test_ingest_records_statement_time_zone(db: sqlite3.Connection) -> None:
+    """The zone the statement declares for its clock times lands on the row."""
+    result = ingest_statement(_FIXTURES / "with_open_positions.htm", db)
+    row = StatementRepo(db).get(result.statement_hash)
+    assert row is not None
+    assert row.time_zone.key == "America/New_York"
+
+
 def test_ingest_persists_open_positions_and_cash_events(db: sqlite3.Connection) -> None:
     """Positions and cash events land in their tables; the unresolved row is reported.
 

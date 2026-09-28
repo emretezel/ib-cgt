@@ -213,6 +213,7 @@ def assemble(document: RawDocument) -> ParsedStatement:
         account_id=document.account_id,
         period_start=document.period_start,
         period_end=document.period_end,
+        time_zone=document.time_zone,
         trades=tuple(_emit(document, (SectionKind.TRADES,), _trade_row)),
         instruments=tuple(_emit(document, (SectionKind.INSTRUMENTS,), _instrument_row)),
         corporate_actions=tuple(

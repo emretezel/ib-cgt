@@ -57,6 +57,7 @@ def _seed_baseline(conn: sqlite3.Connection) -> None:
     AccountRepo(conn).upsert(Account(account_id="U1004320"))
     AccountRepo(conn).upsert(Account(account_id="U10049818"))
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1004320",

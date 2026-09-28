@@ -1,13 +1,14 @@
 """The raw statement model — what every parser produces, whatever the file format.
 
 A statement parser's output is a `ParsedStatement`: the account, the
-period, and one dumb string-typed container per row of every section
-we consume. Every field is a string because the parser's contract is
-"don't interpret" — Decimal / date / enum coercion happens in the
-mappers (`mapper.py`, `dividends.py`, `cash_events.py`, …). That
-separation means the mappers are all about CGT business rules while
-the parsers are all about absorbing the quirks of IB's HTML or PDF
-layout, and neither has to know the other's concerns.
+period, the zone its clock times are printed in, and one dumb
+string-typed container per row of every section we consume. Every
+field is a string because the parser's contract is "don't interpret"
+— Decimal / date / enum coercion happens in the mappers (`mapper.py`,
+`dividends.py`, `cash_events.py`, …). That separation means the
+mappers are all about CGT business rules while the parsers are all
+about absorbing the quirks of IB's HTML or PDF layout, and neither
+has to know the other's concerns.
 
 The containers are format-neutral on purpose: the HTML and PDF
 adapters under `ingest/parsers/` both hand their tables to one
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from zoneinfo import ZoneInfo
 
 
 class StatementParseError(RuntimeError):
@@ -243,11 +245,18 @@ class RawOpenPositionRow:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ParsedStatement:
-    """The parsed statement: account, period, trade rows, and every side section."""
+    """The parsed statement: account, period, time zone, trade rows, and every side section.
+
+    `time_zone` is the zone every `datetime_text` is printed in, as the
+    statement itself declares it (IB prints "Trade execution times are
+    displayed in Eastern Time." in its notes). The mappers attach it to
+    the naive timestamps; nothing downstream assumes a zone.
+    """
 
     account_id: str
     period_start: date
     period_end: date
+    time_zone: ZoneInfo
     trades: tuple[RawTradeRow, ...]
     instruments: tuple[RawInstrumentInfo, ...]
     corporate_actions: tuple[RawCorporateActionRow, ...]

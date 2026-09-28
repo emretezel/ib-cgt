@@ -19,6 +19,14 @@ covered, whether the 30-day look-ahead after the year end is visible
 yet, and which statement is the **latest** one whose Open Positions
 the trade-derived positions must reconcile against.
 
+Since migration 022 the row also records the **time zone** the
+statement's `Date/Time` cells are printed in (`time_zone`, an IANA key
+read from the file's own note: *"Trade execution times are displayed in
+Eastern Time."*). Every trade instant of the statement was read in that
+zone, so `ib-cgt show trade` can print a trade's time exactly as the
+file prints it. The zone is a fact about the statement — the note
+applies to the whole file — so it lives here once, not on every trade.
+
 ## Columns
 
 | Column | Type | Nullable | Notes |
@@ -30,6 +38,7 @@ the trade-derived positions must reconcile against.
 | `trade_count` | `INTEGER` | No | Count of trade rows produced from this statement, captured at ingestion. |
 | `period_start` | `TEXT` | No | `YYYY-MM-DD`, first day the statement covers (inclusive). |
 | `period_end` | `TEXT` | No | `YYYY-MM-DD`, last day the statement covers (inclusive). The Open Positions section is as of this date. |
+| `time_zone` | `TEXT` | No | IANA zone key (`America/New_York`) of the statement's `Date/Time` cells, as declared in its notes. |
 
 See [`index.md`](./index.md#encoding-conventions) for date and
 datetime encoding.
@@ -81,6 +90,8 @@ dated more than a month outside its own statement's period.
 ## CHECK constraints
 
 - `period_start <= period_end`.
+- `length(time_zone) > 0` — the zone is validated as an IANA key in
+  Python (`codecs.text_to_zone`); SQL can only insist it is present.
 
 ## Indexes
 
@@ -117,7 +128,8 @@ None.
 ## Write paths
 
 - [`StatementRepo.record(...)`](../../src/ib_cgt/db/repos/statements.py)
-  — `INSERT` of a fresh row (hash, path, account, trade count, period);
+  — `INSERT` of a fresh row (hash, path, account, trade count, period,
+  time zone);
   raises `sqlite3.IntegrityError` on hash collision so callers must
   call `exists()` first when softer idempotency is needed.
 - [`StatementRepo.delete_by_path(account_id, source_path, *, except_hash)`](../../src/ib_cgt/db/repos/statements.py)
@@ -127,12 +139,18 @@ None.
   statement (new bytes, same file) replaces the earlier version
   instead of sitting beside it.
 
-## Migration 015 and re-ingest
+## Migrations 015 and 022: re-ingest
 
 The two period columns are `NOT NULL` and nothing already stored can
 supply them, so migration 015 rebuilt the table **empty** and cleared
 the dependent tables through the cascades (precedent: migration 014
-for bonds). After applying it, re-ingest every statement:
+for bonds). Migration 022 did the same for `time_zone`: the trade
+instants on file had been read as Europe/London rather than the
+Eastern Time the statements declare, SQLite cannot convert them, and
+the coverage decisions taken at ingest depended on the wrong dates, so
+every statement-derived row and every tax run was wiped (`accounts`,
+`instruments` and `fx_rates` were kept). After applying either,
+re-ingest every statement:
 
 ```
 ib-cgt ingest statements/older/*.pdf statements/futures/*.htm statements/stocks/*.htm
@@ -155,46 +173,51 @@ persisted earliest period first.
 ## Sample (first 5 rows)
 
 Captured via the Python `sqlite3` module in `-line` style after the
-first full re-ingest following migration 015.
+full re-ingest following migration 022.
 
 ```
-statement_hash = a7d240d88f17027046f6725b3f5c916663342dc94eaa0b2c45ff4dc699f122b7
-   source_path = /Users/emre/opt/ib-cgt/statements/futures/17_18.htm
+statement_hash = f297080a8153ee02931926eca514cebd63f26aa4c92f21425972c0b9871b2f1a
+   source_path = /Users/emre/opt/ib-cgt/statements/older/U1004320.20110101.20111231.pdf
     account_id = U1004320
-   imported_at = 2026-09-06T22:46:34.449002+00:00
-   trade_count = 34
-  period_start = 2017-11-22
-    period_end = 2018-04-05
+   imported_at = 2026-09-28T10:50:30.478525+00:00
+   trade_count = 1
+  period_start = 2011-01-01
+    period_end = 2011-12-31
+     time_zone = America/New_York
 
-statement_hash = 2f0de6f346b089b10cf14816048a889e39cead2579300a58d53ab8eb4076d5da
-   source_path = /Users/emre/opt/ib-cgt/statements/futures/18_19.htm
+statement_hash = 513d632e815894ee18c8e6c844611f4e8d76357f3f861787d371fcf5a3f4b32a
+   source_path = /Users/emre/opt/ib-cgt/statements/older/U1004320.20120101.20121231.pdf
     account_id = U1004320
-   imported_at = 2026-09-06T22:46:35.823147+00:00
-   trade_count = 33
-  period_start = 2018-04-06
-    period_end = 2019-04-05
+   imported_at = 2026-09-28T10:50:30.481628+00:00
+   trade_count = 104
+  period_start = 2012-01-01
+    period_end = 2012-12-31
+     time_zone = America/New_York
 
-statement_hash = 39f66f21fc74fe9f82a0c022b31f7892ce28581f5d31533854798ef3e780f2f5
-   source_path = /Users/emre/opt/ib-cgt/statements/futures/19_20.htm
+statement_hash = de13d221ab88ed18d4a0389fc7d2db6d18eb65f506f20164a70e9a462821b23b
+   source_path = /Users/emre/opt/ib-cgt/statements/older/U1004320.20130101.20131231.pdf
     account_id = U1004320
-   imported_at = 2026-09-06T22:46:37.108405+00:00
-   trade_count = 9
-  period_start = 2019-04-08
-    period_end = 2020-04-03
+   imported_at = 2026-09-28T10:50:30.483835+00:00
+   trade_count = 27
+  period_start = 2013-01-01
+    period_end = 2013-12-31
+     time_zone = America/New_York
 
-statement_hash = 1d239e7f20b1dc0f527afe431936a81a799a31942a332ba5a83888ae0dfb4029
-   source_path = /Users/emre/opt/ib-cgt/statements/futures/20_21.htm
+statement_hash = fdc62a881dc04b14e91ce0535a01838ad7cc2de838c811e38a5e06beef0ce7fc
+   source_path = /Users/emre/opt/ib-cgt/statements/older/U1004320.20140101.20141231.pdf
     account_id = U1004320
-   imported_at = 2026-09-06T22:46:38.510984+00:00
-   trade_count = 193
-  period_start = 2020-04-06
-    period_end = 2021-04-05
+   imported_at = 2026-09-28T10:50:30.485040+00:00
+   trade_count = 28
+  period_start = 2014-01-01
+    period_end = 2014-12-31
+     time_zone = America/New_York
 
-statement_hash = 77b11071fc2aaeb8ced27c38c5169ce418c9f3604b9f4bb59239eb5050c23c31
-   source_path = /Users/emre/opt/ib-cgt/statements/futures/21_22.htm
+statement_hash = 11b7c20ec03daee639307655c1d7dc24cf606a2589a0841334faf66f96dbac30
+   source_path = /Users/emre/opt/ib-cgt/statements/older/U1004320.20150101.20151231.pdf
     account_id = U1004320
-   imported_at = 2026-09-06T22:46:40.148329+00:00
-   trade_count = 452
-  period_start = 2021-04-06
-    period_end = 2022-04-05
+   imported_at = 2026-09-28T10:50:30.486173+00:00
+   trade_count = 24
+  period_start = 2015-01-01
+    period_end = 2015-12-31
+     time_zone = America/New_York
 ```

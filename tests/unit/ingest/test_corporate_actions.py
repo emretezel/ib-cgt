@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -110,6 +111,7 @@ def _make(
     instruments: tuple[RawInstrumentInfo, ...] = _DEFAULT_INFO,
 ) -> ParsedStatement:
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U9999998",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
@@ -204,7 +206,9 @@ def test_synthesizes_sell_trade_from_cash_merger_cross_currency() -> None:
     [(amount, target, on)] = fx.calls
     assert amount == Money.of(Decimal("14425.52"), "USD")
     assert target == "GBP"
-    assert on == date(2025, 8, 15)
+    # The row is printed 2025-08-15, 20:25:00 Eastern — 01:25 UK on the 16th,
+    # which is the UK-local trade date the conversion is priced on.
+    assert on == date(2025, 8, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +362,7 @@ def test_synthesizer_ignores_regular_trades_and_unrelated_instruments() -> None:
     symbol matches the merger description supplies the conid.
     """
     parsed = ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U9999998",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),

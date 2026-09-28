@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from ib_cgt.db import AccountRepo, DividendRepo, StatementRepo
 from ib_cgt.domain import Account, Dividend, DividendKind, Money
@@ -21,6 +22,7 @@ def _seed_statement(db: sqlite3.Connection, statement_hash: str = "hash-1") -> N
     """Insert one statement + account so dividends have FK targets."""
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path="/tmp/s.htm",
         account_id="U1",

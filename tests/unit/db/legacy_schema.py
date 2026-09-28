@@ -13,6 +13,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 
 def insert_legacy_statement(
@@ -49,3 +50,33 @@ def insert_legacy_stock(conn: sqlite3.Connection, *, symbol: str, currency: str)
         (instrument_id, symbol, currency),
     )
     return instrument_id
+
+
+def insert_v15_statement(
+    conn: sqlite3.Connection,
+    *,
+    statement_hash: str,
+    source_path: str,
+    account_id: str,
+    trade_count: int,
+    period_start: date,
+    period_end: date,
+) -> None:
+    """Insert a `statements` row in the 015-to-021 shape (period columns, no `time_zone`).
+
+    Mirrors what `StatementRepo.record` wrote between migrations 015
+    and 021, for tests that replay a pre-022 schema.
+    """
+    conn.execute(
+        "INSERT INTO statements (statement_hash, source_path, account_id, "
+        "imported_at, trade_count, period_start, period_end) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            statement_hash,
+            source_path,
+            account_id,
+            "2025-01-01T00:00:00+00:00",
+            trade_count,
+            period_start.isoformat(),
+            period_end.isoformat(),
+        ),
+    )

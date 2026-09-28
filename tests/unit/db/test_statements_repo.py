@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,6 +22,7 @@ def test_record_and_exists(db: sqlite3.Connection) -> None:
 
     assert not repo.exists("hash-a")
     repo.record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1",
@@ -35,6 +37,7 @@ def test_duplicate_hash_raises_integrity_error(db: sqlite3.Connection) -> None:
     _seed_account(db)
     repo = StatementRepo(db)
     repo.record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-a",
         source_path="/tmp/stmt.html",
         account_id="U1",
@@ -44,6 +47,7 @@ def test_duplicate_hash_raises_integrity_error(db: sqlite3.Connection) -> None:
     )
     with pytest.raises(sqlite3.IntegrityError):
         repo.record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="hash-a",
             source_path="/tmp/other.html",
             account_id="U1",
@@ -57,6 +61,7 @@ def test_unknown_account_rejected_by_foreign_key(db: sqlite3.Connection) -> None
     repo = StatementRepo(db)
     with pytest.raises(sqlite3.IntegrityError):
         repo.record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="hash-a",
             source_path="/tmp/stmt.html",
             account_id="U-unknown",
@@ -81,6 +86,7 @@ def _record(
 ) -> None:
     """Record a statement whose period runs for a year up to `period_end`."""
     repo.record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path=source_path,
         account_id=account_id,
@@ -105,6 +111,7 @@ def test_period_end_before_start_is_rejected(db: sqlite3.Connection) -> None:
     _seed_account(db)
     with pytest.raises(sqlite3.IntegrityError):
         StatementRepo(db).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="h-bad",
             source_path="/tmp/bad.html",
             account_id="U1",

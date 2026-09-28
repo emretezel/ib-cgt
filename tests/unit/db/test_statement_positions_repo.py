@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -36,6 +37,7 @@ BRE = FutureInstrument(
 def _seed_statement(db: sqlite3.Connection, statement_hash: str = "hash-1") -> None:
     AccountRepo(db).upsert(Account(account_id="U1"))
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path=f"/tmp/{statement_hash}.htm",
         account_id="U1",

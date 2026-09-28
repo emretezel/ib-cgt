@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from ib_cgt.ingest.parsers import parse_statement
+from ib_cgt.ingest.parsers.tables import time_zone_from_text
 from ib_cgt.ingest.raw import StatementParseError
 
 # Fixture files live next to the real statements folder — they are
@@ -24,6 +25,14 @@ _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
 
 def _load(name: str) -> bytes:
     return (_FIXTURES / name).read_bytes()
+
+
+# IB's time-zone note, printed in every real statement's Notes section.
+# Inline documents carry it so they parse, exactly as the fixtures do.
+_NOTE_HTML = (
+    '<div id="tblFootnotes_U0000000Body"><p>Trade execution times are '
+    "displayed in Eastern Time.</p></div>"
+)
 
 
 def test_parse_mixed_statement_extracts_account() -> None:
@@ -107,7 +116,7 @@ def test_parse_title_fallback() -> None:
     html = (
         b"<html><head><title>U1234567 Activity Statement "
         b"April 6, 2024 - April 5, 2025</title></head>"
-        b"<body>no tables</body></html>"
+        b"<body>no tables" + _NOTE_HTML.encode() + b"</body></html>"
     )
     parsed = parse_statement(html)
     assert parsed.account_id == "U1234567"
@@ -178,7 +187,7 @@ def test_parse_skips_options_with_custodian_suffix() -> None:
     <td>1.8500</td><td>0</td><td>-2775.00</td><td>-0.51</td>
     <td>0</td><td>0</td><td>0</td><td>0</td><td>O</td>
     </tr></tbody>
-    </table></div></body></html>""".encode()
+    </table></div>{_NOTE_HTML}</body></html>""".encode()
     parsed = parse_statement(html)
     assert parsed.trades == ()
 
@@ -256,7 +265,7 @@ def test_parse_corporate_actions_normalises_asset_class() -> None:
     <td>{description}</td>
     <td>-200</td><td>1,000.00</td><td>0.00</td><td>0.00</td><td>&nbsp;</td>
     </tr>
-    </table></div></body></html>""".encode()
+    </table></div>{_NOTE_HTML}</body></html>""".encode()
     parsed = parse_statement(html)
     assert len(parsed.corporate_actions) == 1
     assert parsed.corporate_actions[0].asset_class == "Stocks"
@@ -291,7 +300,7 @@ def test_parse_legacy_custodian_suffix_normalises_asset_class() -> None:
     <td>29.7000</td><td>0</td><td>74250.00</td><td>-49.00</td>
     <td>0</td><td>0</td><td>0</td><td>0</td><td>C;P</td>
     </tr></tbody>
-    </table></div></body></html>""".encode()
+    </table></div>{_NOTE_HTML}</body></html>""".encode()
     parsed = parse_statement(html)
     assert len(parsed.trades) == 1
     assert parsed.trades[0].asset_class == "Stocks"
@@ -336,6 +345,54 @@ def test_parse_rejects_period_end_before_start() -> None:
     )
     with pytest.raises(StatementParseError):
         parse_statement(html)
+
+
+# ---------------------------------------------------------------------------
+# Time zone (from the Notes/Legal Notes section)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_reads_the_time_zone_note() -> None:
+    """IB's "displayed in Eastern Time" note is the statement's declared zone."""
+    parsed = parse_statement(_load("mixed_tiny.htm"))
+    assert parsed.time_zone.key == "America/New_York"
+
+
+def test_parse_rejects_statement_without_time_zone_note() -> None:
+    """No note → no way to place a trade in time, so the file is rejected."""
+    html = _load("mixed_tiny.htm").replace(b"Trade execution times are displayed in", b"")
+    with pytest.raises(StatementParseError, match="time-zone note"):
+        parse_statement(html)
+
+
+def test_time_zone_from_text_maps_ib_phrase() -> None:
+    zone = time_zone_from_text(
+        "… Trade execution times are displayed in Eastern Time. …", source="x"
+    )
+    assert zone.key == "America/New_York"
+
+
+def test_time_zone_from_text_collapses_wrapped_whitespace() -> None:
+    """A phrase wrapped over a PDF line still names the zone."""
+    zone = time_zone_from_text(
+        "Trade execution times are displayed in Eastern\n   Time.", source="x"
+    )
+    assert zone.key == "America/New_York"
+
+
+def test_time_zone_from_text_accepts_an_iana_key() -> None:
+    zone = time_zone_from_text("Trade execution times are displayed in Europe/London.", source="x")
+    assert zone.key == "Europe/London"
+
+
+def test_time_zone_from_text_rejects_unknown_phrase() -> None:
+    with pytest.raises(StatementParseError, match="Unknown time zone 'Mars Time'"):
+        time_zone_from_text("Trade execution times are displayed in Mars Time.", source="x")
+
+
+def test_time_zone_from_text_rejects_missing_note() -> None:
+    with pytest.raises(StatementParseError, match="time-zone note in the notes"):
+        time_zone_from_text("nothing here", source="notes")
 
 
 # ---------------------------------------------------------------------------

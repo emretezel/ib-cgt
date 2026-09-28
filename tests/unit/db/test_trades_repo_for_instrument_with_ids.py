@@ -38,6 +38,7 @@ def _seed_accounts_and_statement(
         AccountRepo(db).upsert(Account(account_id=account_id))
     # Statement FK requires one of the seeded accounts; pick the first.
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path="/tmp/stmt.html",
         account_id=account_ids[0],

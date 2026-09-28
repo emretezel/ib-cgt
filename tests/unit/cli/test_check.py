@@ -61,6 +61,7 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
         apply_migrations(conn)
         AccountRepo(conn).upsert(Account(account_id="U1"))
         StatementRepo(conn).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="h",
             source_path="/tmp/x",
             account_id="U1",

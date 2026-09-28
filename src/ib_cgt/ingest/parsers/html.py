@@ -8,6 +8,9 @@ futures/24_25.htm):
 * The statement period in the `<title>` — `"U… Activity Statement
   April 7, 2025 - April 3, 2026 - …"` — the one place every vintage
   prints the range in a fixed shape.
+* The time-zone note in the Notes/Legal Notes section — `"Trade
+  execution times are displayed in Eastern Time."` — the one statement
+  of the zone the `Date/Time` cells are printed in.
 * One `<div id="tbl<Section>_<acct>Body">` per section, holding one or
   more `<table>`s (legacy 2017-2018 layouts split a section into one
   table per asset class; consolidated statements emit one div per
@@ -38,6 +41,7 @@ from ib_cgt.ingest.parsers.tables import (
     SectionKind,
     TableRow,
     period_from_text,
+    time_zone_from_text,
 )
 from ib_cgt.ingest.raw import StatementParseError
 
@@ -74,8 +78,9 @@ def parse_html(source_bytes: bytes) -> RawDocument:
         source_bytes: Raw bytes of the `.htm` file.
 
     Raises:
-        StatementParseError: No account id or no statement period can
-            be found — the file is not an IB activity statement.
+        StatementParseError: No account id, no statement period or no
+            time-zone note can be found — the file is not an IB
+            activity statement.
     """
     # `lxml` is ~5x faster than the stdlib parser on the largest sample
     # (~44k lines). BeautifulSoup would fall back to `html.parser` if
@@ -85,10 +90,15 @@ def parse_html(source_bytes: bytes) -> RawDocument:
     title = soup.title.get_text() if soup.title is not None else ""
     account_id = _extract_account_id(soup, title)
     period_start, period_end = period_from_text(title, source="<title>")
+    # The note sits in the `tblFootnotes_…Body` div, whose id carries an
+    # account suffix like every other section div; the sentence occurs
+    # exactly once per file, so the whole document's text is searched.
+    time_zone = time_zone_from_text(soup.get_text(" "), source="notes")
     return RawDocument(
         account_id=account_id,
         period_start=period_start,
         period_end=period_end,
+        time_zone=time_zone,
         tables=tuple(_tables(soup)),
     )
 

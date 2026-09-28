@@ -16,6 +16,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from ib_cgt.checks import CheckResult, Scope, Status, run_all
 from ib_cgt.db import StatementPositionRepo, StatementRepo, TradeRepo
@@ -62,6 +63,7 @@ def _add_trade(
     the account's latest statement for reconciliation purposes.
     """
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=f"older-{instrument.symbol}",
         source_path=f"/tmp/older-{instrument.symbol}.html",
         account_id=ACCOUNT,
@@ -187,6 +189,7 @@ def test_C7_quiet_for_a_holding_moved_to_the_other_account(
     db.execute("DELETE FROM statement_positions")
     db.commit()
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-b",
         source_path="/tmp/stmt-b.html",
         account_id="U10049818",

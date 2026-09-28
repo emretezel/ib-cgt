@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -88,6 +89,7 @@ def _statement(
     conn: sqlite3.Connection, *, account_id: str, statement_hash: str, period_end: date = PERIOD_END
 ) -> None:
     StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash=statement_hash,
         source_path=f"/tmp/{statement_hash}.htm",
         account_id=account_id,
@@ -246,6 +248,7 @@ def test_status_property_edge_cases() -> None:
         account_id="U1",
         imported_at="2025-01-01T00:00:00+00:00",
         trade_count=0,
+        time_zone=ZoneInfo("America/New_York"),
         period_start=date(2024, 4, 5),
         period_end=PERIOD_END,
     )

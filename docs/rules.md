@@ -63,6 +63,21 @@ acquisition, the one that can claim it under the same-day rule gets
 it before the 30-day rule kicks in. The same cross-disposal
 priority logic applies to rules 2, 3, and 4 in order.
 
+### Which date is a trade's date
+
+Every rule above compares **dates**, and a tax year runs from 6 April to
+5 April. A trade's date is the **UK-local (Europe/London) date of its
+execution instant**, not the date printed on the statement. IB prints its
+clock in the account's display zone — Eastern Time, declared in every
+statement's notes (see [`ingestion.md`](./ingestion.md#time-zones)) — so a
+fill at 21:41 Eastern on 5 April was made at 02:41 BST on 6 April and belongs
+to the new tax year. The contract is made at an instant; the UK calendar date
+of that instant is the date UK CGT works with, whatever zone the broker
+chose to display it in. Decided on 2026-09-28, when ingestion was corrected
+to read the statement's declared zone (405 of the 6,969 trades then on file
+moved one day later; one crossed a tax-year boundary). The domain enforces it
+(`Trade._check_datetime_fields`) and check A7 polices the stored rows.
+
 ### Worked example
 
 ```

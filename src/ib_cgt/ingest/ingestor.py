@@ -439,6 +439,7 @@ def ingest_parsed(
             trade_count=len(kept_trades),
             period_start=parsed.period_start,
             period_end=parsed.period_end,
+            time_zone=parsed.time_zone,
         )
         inserted = trade_repo.insert_indexed(kept_trades, source_statement_hash=statement_hash)
         dividends_inserted = dividend_repo.insert_indexed(

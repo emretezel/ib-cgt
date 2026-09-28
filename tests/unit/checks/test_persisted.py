@@ -16,6 +16,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -92,6 +93,7 @@ def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Conne
     # Trade identity is (statement, row index): the futures pair needs
     # its own, older statement so hash-a stays the account's latest.
     StatementRepo(db).record(
+        time_zone=ZoneInfo("America/New_York"),
         statement_hash="hash-es",
         source_path="/tmp/es.html",
         account_id=ACCOUNT,

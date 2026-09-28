@@ -21,6 +21,7 @@ import sqlite3
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -92,6 +93,7 @@ def _seed_full_trade(conn: sqlite3.Connection, *, currency: str, trade_date: dat
     hash_key = "h" * 64
     if not statements.exists(hash_key):
         statements.record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash=hash_key,
             source_path="/dev/null",
             account_id="U0001",
@@ -216,6 +218,7 @@ def test_fx_sync_detects_pair_quote_legs_and_cash_event_currencies(cli_env: Path
         )
         AccountRepo(conn).upsert(Account(account_id="U0001"))
         StatementRepo(conn).record(
+            time_zone=ZoneInfo("America/New_York"),
             statement_hash="c" * 64,
             source_path="/dev/null",
             account_id="U0001",

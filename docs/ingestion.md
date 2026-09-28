@@ -71,6 +71,31 @@ behind both:
   timestamp), except the Open Positions symbol cell of a bond, whose last line
   is the symbol and whose earlier lines are the description.
 
+### Time zones
+
+IB prints every `Date/Time` cell without an offset and declares the zone once
+per file, in the Notes/Legal Notes section: *"Trade execution times are
+displayed in Eastern Time."* Both adapters read that note
+(`tables.time_zone_from_text`; the PDF prints it on the last page) and the
+assembler carries it as `ParsedStatement.time_zone`. The zone is an account
+display setting, so it is one per statement, not one per exchange — a Eurex
+fill at 09:00 Frankfurt is printed as 03:00. A file without the note, or with
+a phrase the parser does not know, is rejected: the statement's own
+declaration is the only honest source, and nothing is assumed.
+
+The mappers attach the zone to the printed clock
+(`mapper.parse_statement_datetime`), which gives the execution instant;
+`trades.trade_datetime` stores it in UTC. A trade's date for CGT —
+`trades.trade_date` — is the **Europe/London date of that instant**
+(`Trade.uk_date_of`; see
+[`rules.md`](./rules.md#which-date-is-a-trades-date)). Eastern is four or five
+hours behind London, so a fill printed from 19:00 Eastern (20:00 in the weeks
+the US and UK clocks change on different dates) is dated the next day: the
+Globex evening session, Asian-hours futures and late FX fills. The zone is
+recorded on the statement row (`statements.time_zone`, migration 022), and
+`ib-cgt show trade` prints the time as the statement prints it, so a row can
+be found in the file by eye.
+
 ### The PDF grid
 
 IB draws its PDF statement as a grid, which is all the adapter reads:

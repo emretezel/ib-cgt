@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -46,6 +47,7 @@ def _parsed(
 ) -> ParsedStatement:
     """Wrap rows in a minimal `ParsedStatement` for the mapper."""
     return ParsedStatement(
+        time_zone=ZoneInfo("America/New_York"),
         account_id="U1",
         period_start=date(2024, 4, 6),
         period_end=date(2025, 4, 5),
