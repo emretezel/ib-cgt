@@ -18,13 +18,9 @@ import pytest
 
 from ib_cgt.domain import BondInstrument, FutureInstrument, StockInstrument
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import (
-    ParsedStatement,
-    RawInstrumentInfo,
-    RawOpenPositionRow,
-    parse_statement,
-)
+from ib_cgt.ingest.parsers import parse_statement
 from ib_cgt.ingest.positions import map_open_positions
+from ib_cgt.ingest.raw import ParsedStatement, RawInstrumentInfo, RawOpenPositionRow
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
 

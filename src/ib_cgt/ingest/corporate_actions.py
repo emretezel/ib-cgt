@@ -66,7 +66,7 @@ from ib_cgt.ingest.mapper import (
     _classify_bond_exempt,
     build_stock_instrument,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawCorporateActionRow
+from ib_cgt.ingest.raw import ParsedStatement, RawCorporateActionRow
 
 
 class FXConverter(Protocol):

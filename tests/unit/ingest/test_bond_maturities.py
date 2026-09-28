@@ -25,7 +25,7 @@ import pytest
 from ib_cgt.domain import BondInstrument, TradeAction
 from ib_cgt.ingest.corporate_actions import map_bond_maturities
 from ib_cgt.ingest.mapper import MappingError, _canonicalise_gilt_symbol
-from ib_cgt.ingest.parser import (
+from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawCorporateActionRow,
     RawInstrumentInfo,

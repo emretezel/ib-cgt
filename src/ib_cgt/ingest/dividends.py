@@ -22,9 +22,8 @@ Scope (intentionally narrow, mirrors `corporate_actions.py`):
   that section with no security tag — withholding on broker interest
   and its cancellation — are left to `ingest/cash_events.py`; the two
   mappers partition the section through `has_instrument_prefix`.
-* `tblChangeInDividend` rows are accrual *adjustments*, not
-  cashflows — they're filtered out here so the FX pool only sees
-  actual money movements.
+* IB's Change in Dividend Accruals section never reaches this module:
+  accrual adjustments move no cash, so the parsers do not read it.
 
 A dividend is **not resolved to an instrument** (migration 021). Only
 its cash leg feeds the calculator, so the `<SYMBOL>` is carried as an
@@ -50,7 +49,7 @@ from typing import Final
 
 from ib_cgt.domain import Dividend, DividendKind, Money
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawDividendRow
+from ib_cgt.ingest.raw import ParsedStatement, RawDividendRow
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,7 +75,6 @@ _DESCRIPTION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
 # `parser._DIVIDEND_SECTION_DIV_PREFIXES`.
 _SECTION_DIVIDENDS: Final = "dividends"
 _SECTION_WITHHOLDING: Final = "withholding_tax"
-_SECTION_ACCRUALS: Final = "change_in_dividend_accruals"
 
 # `rest` (description after `<symbol>(<secid>) `) prefixes that
 # discriminate cash dividends from payment-in-lieu rows inside the
@@ -103,8 +101,7 @@ def map_dividends(parsed: ParsedStatement) -> list[Dividend]:
     Returns:
         A list of `Dividend` objects in the order they appeared in
         the statement (cross-section ordering = the order the parser
-        emits them: dividends → withholding → accruals; accruals are
-        filtered out).
+        emits them: dividends, then withholding).
 
     Raises:
         MappingError: On any row that cannot be classified (unknown
@@ -115,9 +112,6 @@ def map_dividends(parsed: ParsedStatement) -> list[Dividend]:
     """
     out: list[Dividend] = []
     for raw in parsed.dividends:
-        if raw.section == _SECTION_ACCRUALS:
-            # Accrual *adjustments* don't move cash. Skip them.
-            continue
         kind = _classify(raw)
         if kind is None:
             continue
@@ -146,7 +140,7 @@ def _classify(raw: RawDividendRow) -> DividendKind | None:
         return DividendKind.WITHHOLDING_TAX if has_instrument_prefix(raw.description) else None
     if raw.section != _SECTION_DIVIDENDS:
         # Unknown section label — defensive. The parser only emits
-        # the three documented labels; reaching here would mean the
+        # the two documented labels; reaching here would mean the
         # mapper and parser drifted apart.
         raise MappingError(
             f"Unknown dividend section label {raw.section!r} (description: {raw.description!r})"

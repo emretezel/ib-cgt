@@ -19,7 +19,7 @@ import pytest
 from ib_cgt.domain import BondCoupon, Money
 from ib_cgt.ingest.bond_coupons import map_bond_coupons
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawInstrumentInfo
+from ib_cgt.ingest.raw import ParsedStatement, RawCashRow, RawInstrumentInfo
 
 
 def _gilt_info(

@@ -44,7 +44,7 @@ from ib_cgt.domain import CashEvent, CashEventKind, Money
 from ib_cgt.ingest.bond_coupons import is_coupon_description
 from ib_cgt.ingest.dividends import has_instrument_prefix
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawDividendRow
+from ib_cgt.ingest.raw import ParsedStatement, RawCashRow, RawDividendRow
 
 # Parser section labels → the domain kind. Keep in lockstep with
 # `parser._CASH_SECTION_DIV_PREFIXES` and, for the withholding label,

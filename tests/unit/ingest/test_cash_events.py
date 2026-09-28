@@ -19,7 +19,7 @@ import pytest
 from ib_cgt.domain import CashEventKind, Money
 from ib_cgt.ingest.cash_events import map_cash_events
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawCashRow, RawDividendRow
+from ib_cgt.ingest.raw import ParsedStatement, RawCashRow, RawDividendRow
 
 
 def _parsed(*rows: RawCashRow) -> ParsedStatement:

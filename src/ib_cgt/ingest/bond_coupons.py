@@ -46,7 +46,7 @@ from ib_cgt.ingest.mapper import (
     _canonicalise_gilt_symbol,
     resolve_bond_info,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawCashRow
+from ib_cgt.ingest.raw import ParsedStatement, RawCashRow
 
 # ---------------------------------------------------------------------------
 # Constants

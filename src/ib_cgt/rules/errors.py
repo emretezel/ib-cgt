@@ -1,7 +1,7 @@
 """Exception hierarchy for the rule-engine layer.
 
 The split mirrors the rest of the codebase (see `fx/errors.py`,
-`ingest/parser.py`):
+`ingest/parsers/`):
 
 * **Environmental errors** — situations the engine could not handle
   because the data it received was incomplete or contradictory. These

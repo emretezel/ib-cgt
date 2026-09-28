@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 
-from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo
+from ib_cgt.ingest.raw import ParsedStatement, RawInstrumentInfo
 
 
 class InstrumentInfoIndex:

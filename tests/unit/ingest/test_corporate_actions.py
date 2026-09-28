@@ -29,7 +29,7 @@ import pytest
 from ib_cgt.domain import Money, StockInstrument, TradeAction
 from ib_cgt.ingest.corporate_actions import map_corporate_actions
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import (
+from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawCorporateActionRow,
     RawInstrumentInfo,

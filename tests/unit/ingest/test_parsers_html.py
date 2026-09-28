@@ -1,4 +1,10 @@
-"""Tests for `ib_cgt.ingest.parser`."""
+"""Tests for the HTML statement adapter behind `ib_cgt.ingest.parsers.parse_statement`.
+
+Every assertion here describes the neutral-model round trip on an
+HTML fixture: adapter (`parsers/html.py`) plus assembler
+(`parsers/assemble.py`). The fixtures are hand-crafted minimal HTML,
+not copies of real IB output, so tests stay portable and PII-clean.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from ib_cgt.ingest.parser import (
-    StatementParseError,
-    parse_statement,
-)
+from ib_cgt.ingest.parsers import parse_statement
+from ib_cgt.ingest.raw import StatementParseError
 
 # Fixture files live next to the real statements folder — they are
 # hand-crafted minimal HTML, not copies of real IB output, so tests stay
@@ -401,11 +405,18 @@ def test_parse_open_positions_splits_bond_symbol_cell() -> None:
 
 
 def test_parse_open_positions_multiplier_is_optional() -> None:
-    """`Mult` is captured where present; the bonds sub-table has no such column."""
+    """`Mult` is captured where present; the bonds sub-table has no such column.
+
+    The bonds sub-table prints `Accrued Int` where `Mult` sits in the
+    stocks / futures header. Its own header row resets the column
+    map, so the bond row carries no multiplier rather than the
+    accrued-interest figure the first header's positions would give.
+    """
     parsed = parse_statement(_load("with_open_positions.htm"))
     rows = {row.symbol: row for row in parsed.open_positions}
     assert rows["6LK6"].multiplier_text == "100,000"
     assert rows["IEMI"].multiplier_text == "1"
+    assert rows["UKT 0 3/8 10/22/26"].multiplier_text is None
 
 
 def test_parse_open_positions_normalises_legacy_asset_label() -> None:

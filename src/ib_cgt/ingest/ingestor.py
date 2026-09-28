@@ -1,6 +1,6 @@
 """End-to-end ingestion orchestrator.
 
-Composes the two ingestion primitives (hash → parse + map) with the
+Composes the ingestion primitives (hash → parse via the format's strategy → map) with the
 existing persistence repositories to turn a path-on-disk into rows in
 the database. Everything inside `ingest_statement` runs in one SQLite
 transaction, so a failure mid-way leaves the DB exactly as it was at
@@ -48,8 +48,9 @@ from ib_cgt.ingest.corporate_actions import (
 from ib_cgt.ingest.dividends import map_dividends
 from ib_cgt.ingest.hashing import compute_statement_hash
 from ib_cgt.ingest.mapper import map_rows
-from ib_cgt.ingest.parser import RawOpenPositionRow, parse_statement
+from ib_cgt.ingest.parsers import StatementFormat, parser_for
 from ib_cgt.ingest.positions import map_open_positions
+from ib_cgt.ingest.raw import RawOpenPositionRow
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -138,7 +139,8 @@ def ingest_statement(
     """Parse the file at `path` and persist its trades via `conn`.
 
     Args:
-        path: Absolute or CWD-relative path to an IB HTML `.htm` file.
+        path: Absolute or CWD-relative path to an IB activity statement;
+            the file suffix selects the parser (see `ingest.parsers`).
         conn: An already-open, already-migrated SQLite connection
             (typically from `open_connection` + `apply_migrations`).
         replace: When True, a prior import of the same hash is
@@ -187,7 +189,10 @@ def ingest_statement(
             already_imported=True,
         )
 
-    parsed = parse_statement(source_bytes)
+    # The parser strategy is picked from the file's suffix (`.htm`,
+    # `.pdf`); every format yields the same `ParsedStatement`, so
+    # nothing below this line knows which one was used.
+    parsed = parser_for(StatementFormat.AUTO, path=path).parse(source_bytes)
     regular_trades = map_rows(parsed)
 
     # Synthesize SELL trades from cash-for-shares Corporate Actions rows

@@ -17,7 +17,7 @@ import pytest
 from ib_cgt.domain import DividendKind, Money
 from ib_cgt.ingest.dividends import has_instrument_prefix, map_dividends
 from ib_cgt.ingest.mapper import MappingError
-from ib_cgt.ingest.parser import ParsedStatement, RawDividendRow
+from ib_cgt.ingest.raw import ParsedStatement, RawDividendRow
 
 
 def _make_parsed(rows: list[RawDividendRow]) -> ParsedStatement:
@@ -111,25 +111,6 @@ def test_withholding_section_emits_wht_kind_with_absolute_amount() -> None:
     # Absolute value — direction is encoded in `kind`, not the sign of
     # the amount (mirrors `Trade.quantity > 0` with sign on `action`).
     assert div.amount.amount == Decimal("4.50")
-
-
-# ---------------------------------------------------------------------------
-# Accrual section is filtered out
-# ---------------------------------------------------------------------------
-
-
-def test_change_in_dividend_accruals_are_filtered_out() -> None:
-    """`tblChangeInDividend` rows are accrual adjustments, not cashflows."""
-    parsed = _make_parsed(
-        [
-            _div_row(section="change_in_dividend_accruals"),
-            _div_row(),
-        ]
-    )
-    out = map_dividends(parsed)
-    # Only the `dividends`-section row survives.
-    assert len(out) == 1
-    assert out[0].kind is DividendKind.CASH_DIVIDEND
 
 
 # ---------------------------------------------------------------------------

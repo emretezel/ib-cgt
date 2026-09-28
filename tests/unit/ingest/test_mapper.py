@@ -16,7 +16,7 @@ from ib_cgt.domain import (
     TradeAction,
 )
 from ib_cgt.ingest.mapper import DEFAULT_STATEMENT_TZ, MappingError, map_rows
-from ib_cgt.ingest.parser import (
+from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawInstrumentInfo,
     RawTradeRow,

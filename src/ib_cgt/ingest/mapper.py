@@ -79,7 +79,7 @@ from ib_cgt.domain import (
     TradeAction,
 )
 from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
-from ib_cgt.ingest.parser import ParsedStatement, RawInstrumentInfo, RawTradeRow
+from ib_cgt.ingest.raw import ParsedStatement, RawInstrumentInfo, RawTradeRow
 
 # ---------------------------------------------------------------------------
 # Exceptions

@@ -31,7 +31,7 @@ from ib_cgt.ingest.mapper import (
     build_future_instrument,
     build_stock_instrument,
 )
-from ib_cgt.ingest.parser import ParsedStatement, RawOpenPositionRow
+from ib_cgt.ingest.raw import ParsedStatement, RawOpenPositionRow
 
 # Section labels, post-normalisation, that the mapper handles. Mirrors
 # the trade mapper's label sets; anything else (options, which the
