@@ -552,6 +552,27 @@ The cashflow projection helpers live in
 [`src/ib_cgt/rules/fx_cashflow.py`](../src/ib_cgt/rules/fx_cashflow.py).
 Each is a pure function returning `Acquisition | Disposal | None`.
 
+### Sources the pools do not see yet
+
+Every description IB has printed in this taxpayer's 2011–2026 history
+falls into one of the eight sources above (checked after the full
+ingest: broker and margin interest, stock-lending income, accrued
+interest on gilt trades, external deposits and withdrawals, wire and
+market-data fees and their refunds, dividends, payments in lieu and
+their withholding). What the model does **not** carry, because nothing
+ingests it, is:
+
+| Missing source | Why it matters | Status |
+|---|---|---|
+| Option premiums, close-out payments, exercise / assignment cash | Every one is foreign currency arising on the trade date (CG78315) | Options are dropped at parse time; [`options.md`](./options.md) proposes the rules |
+| Corporate-action cash other than cash mergers and bond maturities (cash in lieu of fractional shares, return of capital, special cash distributions) | Cash arriving in the pool with no trade behind it | None in the history so far; the corporate-actions mapper ignores unknown shapes silently |
+| Position transfers in or out of IB with a cash component (ACATS, FOP) | Cash moving without a trade | None in the history (the 2022 move between the taxpayer's own accounts was positions only) |
+| IB's `Forex Balances` section (end-of-period cash per currency with IB's own GBP cost basis) | Not a cashflow, but the one independent figure the pool balances could be reconciled against | Not read; a natural next check |
+
+The residual warnings the calculator reports on the NOK, CHF and SEK
+pools after the full ingest are rounding dust (fractions of a cent) from
+IB's rate arithmetic, not missing sources.
+
 ### Per-currency pool model
 
 The CGT pool for a UK taxpayer is per single non-GBP currency vs

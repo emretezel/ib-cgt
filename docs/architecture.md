@@ -2,8 +2,8 @@
 
 ## Purpose
 
-`ib-cgt` computes UK Capital Gains Tax from Interactive Brokers HTML activity
-statements. This page is the evergreen map of the library: what the components
+`ib-cgt` computes UK Capital Gains Tax from Interactive Brokers activity
+statements, HTML or PDF. This page is the evergreen map of the library: what the components
 are, how they depend on each other, where the code lives, and the order in which
 they get built. Every future change that touches cross-component structure —
 a new module, a new dependency arrow, a reordering of steps — must update this
@@ -71,15 +71,23 @@ where noted.
    queries — trades for instrument X across accounts in tax year Y, FX rate
    for (ccy, date), statement-hash idempotency.
 
-3. **Statement ingestion** — `ib_cgt.ingest` — parses IB HTML statements
-   (BeautifulSoup / lxml) into canonical `Trade` / `CorporateAction` /
-   `Cashflow` records, handles format drift across 2017→2025 statements,
-   deduplicates using a composite business key (IB has no per-trade ID).
-   CLI-driven, idempotent. The parser intentionally drops rows in the
-   "Equity and Index Options" section (see
-   `parser._IGNORED_ASSET_CLASSES`): stock options are out of scope for
-   v1 and the OCC-formatted symbols would otherwise be ingested as
-   stocks. Bond `T. Price` is rescaled by 1/100 at the mapper boundary
+3. **Statement ingestion** — `ib_cgt.ingest` — parses IB activity
+   statements into canonical `Trade` / `CorporateAction` / `Cashflow`
+   records. The parser is a **strategy** (`ingest/parsers/`): one adapter
+   per file format — HTML (BeautifulSoup / lxml) and PDF (pdfplumber's
+   rectangle grid) — each producing the same neutral table model, and one
+   assembler that owns what the columns mean, so a PDF and an HTML
+   statement of the same period yield the same `ParsedStatement`. The
+   format is picked from the file suffix (`ib-cgt ingest --format`
+   overrides it). Overlapping statements are resolved by **coverage**: the
+   first statement ingested for an account owns every day of its period
+   and a later overlapping one contributes only the days it alone covers
+   (IB has no per-row ID and distinct fills can be byte-identical, so
+   content cannot be the key). See [`ingestion.md`](./ingestion.md).
+   The assembler drops rows in the "Equity and Index Options" section
+   (`assemble._IGNORED_ASSET_CLASSES`): options are out of scope until
+   the [options proposal](./options.md) is adopted, and the OCC-formatted
+   symbols would otherwise be ingested as stocks. Bond `T. Price` is rescaled by 1/100 at the mapper boundary
    so the unit invariant `price * quantity == settlement cash` holds —
    IB quotes bond prices as a percentage of par (`98.602` = 98.602% of
    face value) while every other asset class uses true per-unit prices.
@@ -294,9 +302,10 @@ ib-cgt/
 │   ├── index.md
 │   ├── architecture.md          ← this page
 │   ├── reporting.md             ← SA108 report: box mapping, conventions, formats
+│   ├── ingestion.md             ← parser strategy, PDF grid, coverage rule
+│   ├── options.md               ← options: proposed CGT treatment (not implemented)
 │   ├── cgt-rules.md             (planned)
-│   ├── ingestion.md             (planned)
-│   ├── fx.md                    (planned)
+│   ├── fx.md                    ← Frankfurter caching, business-day fallback
 │   └── cli.md                   (planned)
 ├── src/
 │   └── ib_cgt/
@@ -308,6 +317,12 @@ ib-cgt/
 │       │   ├── migrations/      ← `NNN_*.sql`, applied by `migrator.py`
 │       │   └── repos/           ← one repository class per table
 │       ├── ingest/
+│       │   ├── raw.py           ← format-neutral ParsedStatement + Raw*Row containers
+│       │   ├── parsers/         ← StatementParser strategy: tables (neutral model),
+│       │   │                       assemble (semantics), html, pdf, and the registry
+│       │   ├── coverage.py      ← the day-ownership rule between overlapping statements
+│       │   ├── ingestor.py      ← hash → parse → map → coverage filter → one transaction
+│       │   └── mapper.py, dividends.py, cash_events.py, bond_coupons.py, …
 │       ├── fx/
 │       ├── rules/
 │       ├── calculator/          ← engine runner (`runner.py`, `runs.py`)
@@ -360,8 +375,8 @@ items marked ⬜ are pending.
    with unit tests.
 4. ✅ **FX service** — Frankfurter client, cache, business-day fallback.
    See [`fx.md`](./fx.md).
-5. ✅ **Statement ingestion** — HTML parser, canonical mapping, dedup,
-   CLI `ingest`.
+5. ✅ **Statement ingestion** — HTML and PDF parsers behind one assembler,
+   canonical mapping, coverage-based overlap safety, CLI `ingest`.
 6. ✅ **Matching engine** — generic same-day / 30-day / S.104 /
    s.105(2) mechanics in isolation; FX-free; itemised pool
    residuals via pro-rata attribution. Consumed by `StockRuleEngine`
@@ -420,7 +435,7 @@ items marked ⬜ are pending.
 | 1 | Project skeleton | — (build / tooling) | ✅ Done |
 | 2 | Domain model | `ib_cgt.domain` | ✅ Done |
 | 3 | Persistence | `ib_cgt.db` | ✅ Done |
-| 4 | Ingestion | `ib_cgt.ingest` | ✅ Done |
+| 4 | Ingestion | `ib_cgt.ingest` | ✅ HTML + PDF adapters, coverage rule |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `FXRuleEngine` |
 | 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner, open-position reconciliation, `Calculator.compute` / `persist` / `load` |
@@ -428,7 +443,7 @@ items marked ⬜ are pending.
 | 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `show trade` / `show realisation` / `show match` / `check` / `compute` / `report` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |
 | 11 | Tests & fixtures | `tests/` | 🟡 Smoke + domain unit tests |
-| 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `fx.md`, `rules.md`, `db/` |
+| 11 | Documentation | `docs/` | 🟡 `index.md`, `architecture.md`, `ingestion.md`, `fx.md`, `rules.md`, `reporting.md`, `options.md`, `db/` |
 
 ## How to keep this in sync
 

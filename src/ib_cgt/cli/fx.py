@@ -29,8 +29,9 @@ def fx_sync(
             "-c",
             help=(
                 "Quote currency to fetch. Repeat the flag for multiple. "
-                "When omitted, every non-GBP currency present in the "
-                "instruments table is synced."
+                "When omitted, every non-GBP currency the pools can see is "
+                "synced: instrument currencies, both legs of every forex "
+                "pair, and the currencies of dividends, coupons and cash events."
             ),
         ),
     ] = None,
@@ -57,7 +58,7 @@ def fx_sync(
 
         if not currencies:
             console.print(
-                "[yellow]No non-GBP currencies observed in instruments[/] — nothing to sync."
+                "[yellow]No non-GBP currencies observed in the database[/] — nothing to sync."
             )
             return
 
@@ -76,20 +77,29 @@ def fx_sync(
 
 
 def _detect_all_currencies(conn: sqlite3.Connection) -> list[str]:
-    """Return every non-GBP currency referenced by any instrument.
+    """Return every non-GBP currency an FX pool can be built for.
 
-    Reads from the `v_instruments` view (parent + four asset-class
-    children) so this code does not have to know about the table split.
-    Each child's `ix_<class>_instruments_currency` index lets SQLite
-    walk the indexes rather than the table heap. The result cardinality
-    is small (a handful of currencies for a typical UK taxpayer's IB
-    portfolio), so the ordering is a stable sort that makes the
-    subsequent Rich table output deterministic.
+    The FX engine pools every currency that any cashflow source touches
+    (`calculator.runner.load_fx_inputs`), so the rate cache must cover
+    the same set: the currency of every instrument (through the
+    `v_instruments` view, so this code does not know about the table
+    split), the *quote* leg of every forex pair (`EUR.NOK` acquires
+    EUR and disposes of NOK — the instrument's currency is only EUR),
+    and the currencies of dividends, bond coupons and cash events (a
+    currency can exist purely as broker interest). Each source has an
+    index led by its currency column, so the UNION walks indexes rather
+    than heaps; the result is a handful of codes, sorted so the Rich
+    table output is deterministic.
     """
     rows = conn.execute(
-        "SELECT DISTINCT currency FROM v_instruments WHERE currency != 'GBP' ORDER BY currency"
+        "SELECT currency FROM v_instruments "
+        "UNION SELECT fx_quote FROM fx_instruments "
+        "UNION SELECT currency FROM dividends "
+        "UNION SELECT currency FROM bond_coupons "
+        "UNION SELECT currency FROM cash_events "
+        "ORDER BY 1"
     ).fetchall()
-    return [r["currency"] for r in rows]
+    return [str(r[0]) for r in rows if r[0] != "GBP"]
 
 
 def _render_fx_sync_result(

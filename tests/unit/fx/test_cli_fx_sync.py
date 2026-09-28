@@ -4,8 +4,9 @@ The command now takes no required arguments. Behaviour:
 
 * When `instruments` has no non-GBP rows → prints "nothing to sync"
   and exits 0.
-* Otherwise → every distinct non-GBP `instruments.currency` is synced
-  incrementally per (GBP, quote) pair.
+* Otherwise → every non-GBP currency a pool can be built for is synced
+  incrementally per (GBP, quote) pair: instrument currencies, the quote
+  leg of every forex pair, and dividend / coupon / cash-event currencies.
 * `--currency CODE` (repeatable) overrides the DB-derived set.
 
 We drive Typer's `CliRunner` against the real command functions,
@@ -30,6 +31,7 @@ from ib_cgt.cli import app
 from ib_cgt.config import DB_ENV_VAR, FX_URL_ENV_VAR
 from ib_cgt.db import (
     AccountRepo,
+    CashEventRepo,
     FXRateRepo,
     InstrumentRepo,
     StatementRepo,
@@ -39,6 +41,10 @@ from ib_cgt.db import (
 )
 from ib_cgt.domain import (
     Account,
+    CashEvent,
+    CashEventKind,
+    CurrencyPair,
+    FXInstrument,
     Money,
     StockInstrument,
     Trade,
@@ -192,6 +198,65 @@ def test_fx_sync_auto_detects_currencies_from_instruments(cli_env: Path) -> None
     assert result.exit_code == 0, result.output
     assert usd_route.called and eur_route.called
     assert "USD" in result.output and "EUR" in result.output
+
+
+@respx.mock
+def test_fx_sync_detects_pair_quote_legs_and_cash_event_currencies(cli_env: Path) -> None:
+    """A currency that exists only as a forex quote leg or as broker interest is synced.
+
+    `EUR.NOK` is stored as an EUR instrument, and AUD credit interest is
+    a cash event with no instrument at all; both currencies get a pool,
+    so both need rates.
+    """
+    conn = open_connection(cli_env)
+    try:
+        apply_migrations(conn)
+        InstrumentRepo(conn).upsert(
+            FXInstrument(symbol="EUR.NOK", currency="EUR", currency_pair=CurrencyPair("EUR", "NOK"))
+        )
+        AccountRepo(conn).upsert(Account(account_id="U0001"))
+        StatementRepo(conn).record(
+            statement_hash="c" * 64,
+            source_path="/dev/null",
+            account_id="U0001",
+            trade_count=0,
+            period_start=date(2012, 1, 1),
+            period_end=date(2012, 12, 31),
+        )
+        CashEventRepo(conn).insert_many(
+            [
+                CashEvent(
+                    account_id="U0001",
+                    kind=CashEventKind.INTEREST,
+                    value_date=date(2012, 3, 5),
+                    amount=Money.of("3.59", "AUD"),
+                    description="AUD Credit Interest for Feb-2012",
+                )
+            ],
+            source_statement_hash="c" * 64,
+        )
+    finally:
+        conn.close()
+
+    routes = {
+        ccy: respx.get(
+            url__regex=rf"{TEST_BASE_URL}/v1/1999-01-04\.\..*", params={"symbols": ccy}
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "base": "GBP",
+                    "start_date": "1999-01-04",
+                    "end_date": "1999-01-04",
+                    "rates": {"1999-01-04": {ccy: 1.0}},
+                },
+            )
+        )
+        for ccy in ("AUD", "EUR", "NOK")
+    }
+    result = CliRunner().invoke(app, ["fx", "sync"])
+    assert result.exit_code == 0, result.output
+    assert all(route.called for route in routes.values())
 
 
 @respx.mock

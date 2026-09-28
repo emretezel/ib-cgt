@@ -1,6 +1,7 @@
 # ib-cgt
 
-UK Capital Gains Tax calculator for Interactive Brokers HTML statements.
+UK Capital Gains Tax calculator for Interactive Brokers activity statements
+(HTML or PDF).
 
 This page is the entry point for project documentation. Per CLAUDE.md rule 18,
 documentation is split across focused pages rather than one large README; links
@@ -17,9 +18,12 @@ implementation status.
   implementation order, status table.
 - `cgt-rules.md` — UK CGT rules this tool implements (TCGA 1992 references).
   *(planned)*
-- `ingestion.md` — IB HTML format notes and known quirks. *(planned)*
+- [`ingestion.md`](./ingestion.md) — the parser strategy (HTML and PDF adapters,
+  one assembler), the coverage rule for overlapping statements, vintage quirks.
 - [`fx.md`](./fx.md) — Frankfurter caching and business-day fallback.
 - [`rules.md`](./rules.md) — UK matching engine + per-asset-class rule engines.
+- [`options.md`](./options.md) — proposal for the CGT treatment of traded
+  options (not implemented): why they are not "like futures".
 - [`reporting.md`](./reporting.md) — the SA108 report: box mapping, the
   disposal-grouping rule, the working-sheet conventions, output formats.
 - [`db/index.md`](./db/index.md) — database reference, one page per table,

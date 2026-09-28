@@ -2,7 +2,7 @@
 
 ## Purpose
 
-One row per imported IB HTML statement. The primary key is a
+One row per imported IB activity statement (HTML or PDF). The primary key is a
 deterministic SHA-256 hash of the statement's source bytes, which lets
 the ingestor answer "have I already processed this exact file?" in
 O(1). Every `trades`, `dividends`, `bond_coupons`, `cash_events` and
@@ -63,6 +63,21 @@ source_path)` with different hashes — a statement re-downloaded with
 new bytes and ingested without `--replace`; check **A10** warns about
 that state and `ingest --replace` resolves it.
 
+## Overlapping periods: coverage
+
+Two rows of one account may have overlapping periods. IB prints no
+per-row identifier and distinct fills can share every visible field,
+so the ingestor resolves an overlap by **date**: the statement
+ingested first owns every day of its period, and a later overlapping
+statement contributes only the facts dated on days it alone covers
+(`ingest/coverage.py`; the full rule, including why only genuinely
+overlapping periods take part, is in
+[`../ingestion.md`](../ingestion.md#overlapping-statements-the-coverage-rule)).
+`trade_count` therefore records the trades the statement *kept*, and a
+statement whose period was already fully covered has a row (with its
+open positions) but no dated facts. Check **A15** warns when a fact is
+dated more than a month outside its own statement's period.
+
 ## CHECK constraints
 
 - `period_start <= period_end`.
@@ -90,6 +105,14 @@ None.
   — one such row per account, ordered by account id. Drives
   `calculator.positions.reconcile_positions` and the tax-year
   coverage warnings.
+- [`StatementRepo.periods_for_account(account_id)`](../../src/ib_cgt/db/repos/statements.py)
+  — every `(period_start, period_end)` on file for the account, sorted;
+  the input to the ingestor's `Coverage`.
+- [`StatementRepo.overlapping(account_id, start, end)`](../../src/ib_cgt/db/repos/statements.py)
+  — the statements whose period overlaps a span; backs the `--replace`
+  notice about statements that overlapped a withdrawn version.
+- [`StatementRepo.list_by_path(account_id, source_path, except_hash=…)`](../../src/ib_cgt/db/repos/statements.py)
+  — a preview of what `delete_by_path` would withdraw.
 
 ## Write paths
 
@@ -112,14 +135,15 @@ the dependent tables through the cascades (precedent: migration 014
 for bonds). After applying it, re-ingest every statement:
 
 ```
-for f in statements/futures/*.htm statements/stocks/*.htm; do ib-cgt ingest "$f"; done
+ib-cgt ingest statements/older/*.pdf statements/futures/*.htm statements/stocks/*.htm
 ```
 
-Ingest is idempotent, so running the loop again is harmless.
+Ingest is idempotent, so running it again is harmless; several paths are
+persisted earliest period first.
 
 ## CLI commands that touch this table
 
-- `ib-cgt ingest PATH [--replace]` (entry point at
+- `ib-cgt ingest PATH... [--format auto|html|pdf] [--replace]` (entry point at
   [`src/ib_cgt/cli/ingest.py`](../../src/ib_cgt/cli/ingest.py)) — orchestrated by
   [`src/ib_cgt/ingest/ingestor.py`](../../src/ib_cgt/ingest/ingestor.py),
   which writes one statement row plus everything it produced inside a
