@@ -161,3 +161,13 @@ def test_non_bond_trade_raises_wrong_asset_class() -> None:
     )
     with pytest.raises(WrongAssetClassError):
         from_bond_trade(1, trade, "USD", _StubFx({}), make_pool_instrument("USD"))
+
+
+def test_bond_leg_is_posted_to_the_cent() -> None:
+    """333 x 0.98765 = 328.88745 USD leaves the account as 328.89."""
+    fx = _StubFx({("USD", ON): Decimal("0.80")})
+    pool = make_pool_instrument("USD")
+    trade = _bond_trade(action=TradeAction.BUY, qty="333", price="0.98765", fees="0")
+    event = from_bond_trade(1, trade, "USD", fx, pool)
+    assert isinstance(event, Disposal)
+    assert event.quantity == Decimal("328.89")

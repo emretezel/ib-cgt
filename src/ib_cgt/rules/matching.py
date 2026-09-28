@@ -92,6 +92,9 @@ buy's original cost-basis.
 UK CGT treats the pool as fungible; pro-rata is one valid presentation
 convention among several (FIFO would be another, but it does not
 reconcile to the aggregate when the pool draws at average cost).
+Pro-rata products carry 28-significant-digit residue, so a disposal
+that agrees with the pool to within `_RESIDUE` is taken to empty it
+exactly rather than leave a phantom 1e-28 either side.
 
 Author: Emre Tezel
 """
@@ -124,6 +127,12 @@ from ib_cgt.rules.errors import UnmatchedDisposalError
 # (which is covered by same-day). Centralised here so tests can reference
 # the same constant rather than literal-30 sprinkled around.
 _BED_AND_BREAKFAST_DAYS: Final = 30
+
+# Below this, a difference between two quantities is Decimal residue
+# (28 significant digits leave ~1e-27 after a pro-rata pool draw), not
+# a position: IB's smallest units are 1e-8 of a share and 0.01 of a
+# currency, ten orders of magnitude above it.
+_RESIDUE: Final = Decimal("1e-18")
 
 
 # ---------------------------------------------------------------------------
@@ -558,16 +567,34 @@ class MatchingEngine:
             # No pool to draw from — the walk moves on to s.105(2).
             return
 
+        # A pro-rata draw leaves each lot with 28-significant-digit
+        # residue, so a pool that has really been sold down to exactly
+        # this disposal's size can add up to a hair more or less than
+        # it. Nothing trades in quantities anywhere near `_RESIDUE`,
+        # so a difference below it is arithmetic, not cover: the pool
+        # is taken to hold exactly the disposal's residual, and the
+        # draw below empties it cleanly instead of leaving a phantom
+        # 1e-28 uncovered (or a 1e-28 lot in the audit list).
+        if abs(pool_qty - ds.quantity_remaining) < _RESIDUE:
+            pool_qty = ds.quantity_remaining
+
         # Take whatever the pool has, capped at the disposal's
         # residual. Partial coverage is allowed: any remainder is
         # left for the later-acquisition step.
         drawn_qty = min(ds.quantity_remaining, pool_qty)
         average_cost = pool_cost / pool_qty
-        cost_drawn = average_cost * drawn_qty
-        # Chunk's fee share scales by the same draw ratio — keeps
-        # `Σ matched_acquisition_fees == buy-side fees consumed`.
-        ratio = drawn_qty / pool_qty
-        fees_drawn = pool_fees * ratio
+        if drawn_qty == pool_qty:
+            # The pool is emptied: everything in it leaves with this
+            # chunk, exactly — no product rounding on the way out.
+            ratio = Decimal(1)
+            cost_drawn = pool_cost
+            fees_drawn = pool_fees
+        else:
+            ratio = drawn_qty / pool_qty
+            cost_drawn = average_cost * drawn_qty
+            # Chunk's fee share scales by the same draw ratio — keeps
+            # `Σ matched_acquisition_fees == buy-side fees consumed`.
+            fees_drawn = pool_fees * ratio
 
         snapshot = TaxLotSnapshot(
             quantity_before=pool_qty,
@@ -595,7 +622,9 @@ class MatchingEngine:
         # Pro-rata attribution: every pool lot loses the same
         # fraction of its quantity, cost, and fees. Preserves lot-
         # local cost-per-unit and fees-per-unit and keeps the
-        # residual sums equal to the post-draw pool aggregate.
+        # residual sums equal to the post-draw pool aggregate. When
+        # the draw empties the pool `ratio` is exactly 1, so every
+        # lot lands on exactly zero.
         for lot in pool_lots:
             qty_lost = lot.quantity_remaining * ratio
             cost_lost = lot.cost_remaining_amount * ratio

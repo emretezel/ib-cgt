@@ -620,9 +620,12 @@ ingests it, is:
 | Position transfers in or out of IB with a cash component (ACATS, FOP) | Cash moving without a trade | None in the history (the 2022 move between the taxpayer's own accounts was positions only) |
 | IB's `Forex Balances` section (end-of-period cash per currency with IB's own GBP cost basis) | Not a cashflow, but the one independent figure the pool balances could be reconciled against | Not read; a natural next check |
 
-The residual warnings the calculator reports on the NOK, CHF and SEK
-pools after the full ingest are rounding dust (fractions of a cent) from
-IB's rate arithmetic, not missing sources.
+Every amount a projector computes (a forex quote leg, a stock or bond
+principal, a futures realisation) is posted to the cent, as IB's own
+ledger posts it — the statement prints Proceeds 0.60 for 0.0657 ×
+9.08615 SEK. Until 2026-09-28 the pools summed full-precision products
+instead, and the sub-cent dust surfaced as phantom residual warnings on
+the DKK, NOK, CHF and SEK pools once their balances returned to zero.
 
 ### Per-currency pool model
 
@@ -659,7 +662,7 @@ The mapper (`ingest/mapper.py`) tags `Trade.price.currency` with
 the pair's *base* currency (the domain invariant), even though the
 printed amount represents quote-per-base. Multiplying
 `qty * price.amount` therefore always yields the quote-currency
-total.
+total, which is then posted to the cent as IB's ledger does.
 
 ### GBP conversion — independent per leg
 

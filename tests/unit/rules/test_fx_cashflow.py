@@ -29,13 +29,14 @@ from ib_cgt.domain import (
 )
 from ib_cgt.rules.errors import WrongAssetClassError
 from ib_cgt.rules.fx_cashflow import (
+    from_forex_trade,
     from_future_fee,
     from_future_realisation,
     from_stock_trade,
     make_pool_instrument,
 )
 
-from .conftest import aapl, es_future, future_trade, stock_trade
+from .conftest import aapl, es_future, future_trade, fx_pair, fx_trade, stock_trade
 
 # ---------------------------------------------------------------------------
 # Test stub — multi-currency keyed FX
@@ -305,3 +306,65 @@ def test_realisation_in_different_currency_returns_none() -> None:
     pool = make_pool_instrument("JPY")
     r = _realisation(gross_pnl_native="500")
     assert from_future_realisation(10**12, r, "U1", "JPY", fx, pool) is None
+
+
+# ---------------------------------------------------------------------------
+# Cash is posted to the cent, as IB's ledger does
+# ---------------------------------------------------------------------------
+
+
+def test_forex_quote_leg_is_posted_to_the_cent() -> None:
+    """0.04 GBP x 10.00075 is 0.400030145, but IB posts 0.40 DKK; so does the pool."""
+    on = date(2015, 4, 7)
+    pool = make_pool_instrument("DKK")
+    trade = fx_trade(
+        action=TradeAction.SELL,
+        on=on,
+        qty="0.04",
+        price="10.00075",
+        instrument=fx_pair("GBP", "DKK"),
+    )
+    event = from_forex_trade(1, trade, "DKK", _StubFx({}), pool)
+    assert isinstance(event, Acquisition)  # selling GBP acquires DKK
+    assert event.quantity == Decimal("0.40")
+    assert event.cost_gbp == Money.gbp("0.04")  # the GBP leg is exact
+
+
+def test_forex_quote_leg_rounds_half_up() -> None:
+    """0.0657 USD x 9.08615 = 0.5970 SEK: the statement prints 0.60."""
+    on = date(2018, 9, 4)
+    fx = _StubFx({("USD", on): Decimal("0.77")})
+    pool = make_pool_instrument("SEK")
+    trade = fx_trade(
+        action=TradeAction.SELL,
+        on=on,
+        qty="0.0657",
+        price="9.08615",
+        instrument=fx_pair("USD", "SEK"),
+    )
+    event = from_forex_trade(1, trade, "SEK", fx, pool)
+    assert isinstance(event, Acquisition)
+    assert event.quantity == Decimal("0.60")
+
+
+def test_stock_leg_is_posted_to_the_cent() -> None:
+    """7 x 12.3457 = 86.4199 USD leaves the account as 86.42."""
+    on = date(2024, 4, 5)
+    fx = _StubFx({("USD", on): Decimal("0.80")})
+    pool = make_pool_instrument("USD")
+    trade = stock_trade(action=TradeAction.BUY, on=on, qty=7, price="12.3457", instrument=aapl())
+    event = from_stock_trade(1, trade, "USD", fx, pool)
+    assert isinstance(event, Disposal)
+    assert event.quantity == Decimal("86.42")
+    assert event.proceeds_gbp == Money.gbp("69.1360")
+
+
+def test_realisation_is_posted_to_the_cent() -> None:
+    """A multiplier product with a third decimal is posted to the cent, half-up."""
+    fx = _StubFx({("USD", date(2024, 4, 10)): Decimal("0.80")})
+    pool = make_pool_instrument("USD")
+    event = from_future_realisation(
+        10**12, _realisation(gross_pnl_native="12.345"), "U1", "USD", fx, pool
+    )
+    assert isinstance(event, Acquisition)
+    assert event.quantity == Decimal("12.35")

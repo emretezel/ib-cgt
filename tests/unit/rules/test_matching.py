@@ -975,3 +975,41 @@ def test_an_acquisition_within_30_days_changes_only_the_last_disposal() -> None:
     assert [m.match_rule for m in by_disposal_before[7]] == [MatchRule.LATER_ACQUISITION]
     assert [m.match_rule for m in by_disposal_after[7]] == [MatchRule.BED_AND_BREAKFAST]
     assert by_disposal_after[7][0].basis == DirectAcquisition(acquisition_trade_id=30)
+
+
+# ---------------------------------------------------------------------------
+# Pool draws attribute exactly — no 1e-24 residue
+# ---------------------------------------------------------------------------
+
+
+def test_pool_draw_attribution_is_exact_so_the_pool_can_be_emptied() -> None:
+    """Three lots of 1, draw 2 (ratio 0.666…), then draw the remaining 1.
+
+    Each lot's share of the first draw is an inexact Decimal product;
+    what the three lots add up to afterwards is 0.9999…9, a hair short
+    of the 1 the second disposal needs. That difference is residue,
+    not cover: the second draw empties the pool exactly, with no
+    phantom uncovered residual and no 1e-28 lot left in the audit list.
+    """
+    engine = MatchingEngine()
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[
+            acq(trade_id=1, on=date(2024, 1, 1), qty=1, cost_gbp=10),
+            acq(trade_id=2, on=date(2024, 1, 2), qty=1, cost_gbp=11),
+            acq(trade_id=3, on=date(2024, 1, 3), qty=1, cost_gbp=12),
+        ],
+        disposals=[
+            disp(trade_id=4, on=date(2024, 3, 1), qty=2, proceeds_gbp=30),
+            disp(trade_id=5, on=date(2024, 4, 1), qty=1, proceeds_gbp=15),
+        ],
+        soft_residuals=True,
+    )
+    assert result.unmatched_disposals == ()
+    assert [m.matched_quantity for m in result.matched_disposals] == [Decimal(2), Decimal(1)]
+    assert result.final_pool.quantity == Decimal("0")
+    assert result.final_pool.total_cost_gbp == Money.gbp("0")
+    assert result.unmatched_acquisitions == ()
+    assert sum(
+        (m.matched_cost_gbp.amount for m in result.matched_disposals), Decimal(0)
+    ) == Decimal("33")

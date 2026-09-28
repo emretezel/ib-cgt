@@ -951,3 +951,45 @@ def test_compute_ignores_gbp_cash_events_and_gbp_bonds() -> None:
     )
     assert result.matched_disposals == ()
     assert result.final_pool.quantity == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# The pool reconciles to the cent, like IB's ledger
+# ---------------------------------------------------------------------------
+
+
+def test_pool_reconciles_to_the_cent_like_ibs_ledger() -> None:
+    """A 0.40 DKK credit spent on a GBP.DKK buy leaves nothing uncovered.
+
+    The buy's DKK leg is 0.04 x 10.00075 = 0.400030145 at full
+    precision, but IB debited 0.40. Before the projectors posted cash
+    to the cent, the extra 0.000030145 DKK surfaced as a phantom
+    uncovered residual (the DKK / NOK / CHF / SEK warnings in the live
+    history).
+    """
+    on = date(2015, 4, 7)
+    engine = FXRuleEngine(MultiCcyStubFXService({("DKK", on): Decimal("0.097")}))
+    credit = CashEvent(
+        account_id="U1",
+        kind=CashEventKind.INTEREST,
+        value_date=on,
+        amount=Money.of(Decimal("0.40"), "DKK"),
+        description="DKK Credit Interest for Mar-2015",
+    )
+    trades = [
+        (
+            1,
+            fx_trade(
+                action=TradeAction.BUY,
+                on=on,
+                qty="0.04",
+                price="10.00075",
+                instrument=fx_pair("GBP", "DKK"),
+            ),
+        ),
+    ]
+    result = engine.compute("DKK", trades, cash_events=[(4 * 10**12, credit)])
+    assert result.unmatched_disposals == ()
+    assert [m.match_rule for m in result.matched_disposals] == [MatchRule.SAME_DAY]
+    assert result.matched_disposals[0].matched_quantity == Decimal("0.40")
+    assert result.final_pool.quantity == Decimal("0")

@@ -32,13 +32,25 @@ close-trade ID on a multi-slice closeout, so a real ID isn't
 unique enough). The CLI orchestrator builds a side map from these
 IDs to human-readable source descriptions for the renderer.
 
+Every amount a projector *computes* — a forex trade's quote leg, a
+stock or bond trade's principal, a futures realisation's P&L — is
+posted to the cent (`_cash`), because that is what IB's cash ledger
+does: the statement prints Proceeds 0.60 for 0.0657 x 9.08615 SEK and
+92.75 for 71 x 1.30635 CHF, and JPY is kept to two decimals too.
+Summing full-precision products where IB summed cents leaves
+sub-cent dust in a pool, and once a currency's balance returns to
+zero that dust shows up as a phantom uncovered residual. Amounts
+read straight from a statement (dividends, coupons, cash events,
+futures fees) are already cents and pass through untouched.
+
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Final
 
 from ib_cgt.domain import (
     Acquisition,
@@ -59,6 +71,19 @@ from ib_cgt.domain import (
 )
 from ib_cgt.rules.errors import InconsistentTradeError, WrongAssetClassError
 from ib_cgt.rules.futures import FXConverter
+
+# IB posts every cash movement to two decimals, whatever the currency.
+_CENT: Final = Decimal("0.01")
+
+
+def _cash(amount: Decimal) -> Decimal:
+    """Round a computed amount to the cent IB's ledger actually posts.
+
+    Half-up, as the statements show (0.5970 SEK is printed as 0.60).
+    Applied only to products the projectors compute; amounts copied
+    from a statement are already cents.
+    """
+    return amount.quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
 def make_pool_instrument(currency: str) -> FXInstrument:
@@ -120,8 +145,9 @@ def from_forex_trade(
     quote = pair.quote
 
     # `qty * price.amount` is always the quote-currency amount —
-    # see the mapper docstring for the price-tagging caveat.
-    quote_amount = trade.quantity * trade.price.amount
+    # see the mapper docstring for the price-tagging caveat. IB posts
+    # it to the cent, so the pool sees the cents that moved.
+    quote_amount = _cash(trade.quantity * trade.price.amount)
     if currency == base:
         ccy_amount = trade.quantity
         other_amount = quote_amount
@@ -217,8 +243,9 @@ def from_stock_trade(
         return None
 
     if trade.action is TradeAction.BUY:
-        # Cash outflow = principal + fees (fees increase what we paid).
-        native_amount = trade.price.amount * trade.quantity + trade.fees.amount
+        # Cash outflow = principal + fees (fees increase what we paid),
+        # posted to the cent.
+        native_amount = _cash(trade.price.amount * trade.quantity + trade.fees.amount)
         gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
         return Disposal(
             trade_id=trade_id,
@@ -229,8 +256,9 @@ def from_stock_trade(
             proceeds_gbp=gbp_value,
             fees_gbp=Money.gbp(Decimal(0)),
         )
-    # SELL - cash inflow = principal - fees (fees reduce what we received).
-    native_amount = trade.price.amount * trade.quantity - trade.fees.amount
+    # SELL - cash inflow = principal - fees (fees reduce what we received),
+    # posted to the cent.
+    native_amount = _cash(trade.price.amount * trade.quantity - trade.fees.amount)
     gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
     return Acquisition(
         trade_id=trade_id,
@@ -338,7 +366,8 @@ def from_future_realisation(
     if gross_pnl_amount == 0:
         return None
 
-    abs_amount = abs(gross_pnl_amount)
+    # The multiplier product is posted to the cent like any other cash.
+    abs_amount = _cash(abs(gross_pnl_amount))
     gbp_value = _to_gbp(abs_amount, native_ccy, fx, realisation.close_date)
     if gross_pnl_amount > 0:
         return Acquisition(
@@ -562,8 +591,8 @@ def from_bond_trade(
     principal = trade.price.amount * trade.quantity
     accrued = trade.accrued_interest.amount if trade.accrued_interest is not None else Decimal(0)
     if trade.action is TradeAction.BUY:
-        # Cash outflow = principal + accrued + fees.
-        native_amount = principal + accrued + trade.fees.amount
+        # Cash outflow = principal + accrued + fees, posted to the cent.
+        native_amount = _cash(principal + accrued + trade.fees.amount)
         gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
         return Disposal(
             trade_id=trade_id,
@@ -574,8 +603,8 @@ def from_bond_trade(
             proceeds_gbp=gbp_value,
             fees_gbp=Money.gbp(Decimal(0)),
         )
-    # SELL — cash inflow = principal + accrued - fees.
-    native_amount = principal + accrued - trade.fees.amount
+    # SELL — cash inflow = principal + accrued - fees, posted to the cent.
+    native_amount = _cash(principal + accrued - trade.fees.amount)
     gbp_value = _to_gbp(native_amount, native_ccy, fx, trade.trade_date)
     return Acquisition(
         trade_id=trade_id,
