@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ib-cgt"
 version = "0.1.0"
-description = "Compute UK Capital Gains Tax from Interactive Brokers HTML statements."
+description = "Compute UK Capital Gains Tax from Interactive Brokers activity statements (HTML or PDF)."
 readme = "docs/index.md"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"

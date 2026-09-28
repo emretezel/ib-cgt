@@ -44,7 +44,7 @@ deployed.
 | `bond_instruments` | Asset-class child of `instruments` for bonds (ISIN-keyed, with CGT-exempt flag) | [`bond_instruments.md`](./bond_instruments.md) |
 | `future_instruments` | Asset-class child of `instruments` for futures (keyed by IB `conid`; multiplier, expiry) | [`future_instruments.md`](./future_instruments.md) |
 | `fx_instruments` | Asset-class child of `instruments` for FX pairs | [`fx_instruments.md`](./fx_instruments.md) |
-| `statements` | One row per imported IB HTML statement (idempotency, covered period) | [`statements.md`](./statements.md) |
+| `statements` | One row per imported IB statement, HTML or PDF (idempotency, covered period) | [`statements.md`](./statements.md) |
 | `statement_positions` | One row per instrument open on a statement's last day (the Open Positions section) | [`statement_positions.md`](./statement_positions.md) |
 | `trades` | One row per native-currency trade execution | [`trades.md`](./trades.md) |
 | `dividends` | One row per non-trade cash distribution (cash dividend, payment-in-lieu, withholding tax); instrument-less, the IB security tag is kept as text | [`dividends.md`](./dividends.md) |
