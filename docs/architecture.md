@@ -43,6 +43,11 @@ Locked in so component responsibilities are unambiguous:
      first. Covers a sell-short followed by a buy-to-cover more than
      30 days later, and any disposal that runs past an under-sized
      S.104 pool.
+  Same-day pairs are settled first (s.105(1) prevails); every other
+  rule is applied per disposal, in date order, each disposal in full
+  before the next (s.106A(4)) — so earlier years do not move when
+  later statements arrive, except through the 30-day rule. See
+  [`rules.md`](./rules.md#why-earlier-years-stay-put).
   Applies to stocks, non-exempt bonds, and — per the FX scope
   decision above — FX holdings per currency pair.
 - **GBP requirement**: every disposal's proceeds and cost must be in GBP,

@@ -21,9 +21,9 @@ The engine is **direction-agnostic**: every `BUY` becomes an
 whether the running balance is long or short. Short round-trips
 fall out of the four-rule order naturally:
 
-- Sell-short + buy-to-cover same day → Pass 1 (same-day).
-- Sell-short + buy-to-cover within 30 days → Pass 2 (B&B).
-- Sell-short + buy-to-cover **after** 30 days → Pass 4 (s.105(2)).
+- Sell-short + buy-to-cover same day → same-day (s.105(1)).
+- Sell-short + buy-to-cover within 30 days → 30-day (s.106A(5)).
+- Sell-short + buy-to-cover **after** 30 days → later acquisition (s.105(2)).
 - Sell-short with no buy-to-cover anywhere → `UnmatchedDisposalError`.
 
 S.104 pools span every account belonging to the taxpayer (per
@@ -103,7 +103,7 @@ class StockRuleEngine:
                 chronological order. The matcher sorts internally,
                 so input order is not required.
             soft_residuals: Forwarded to `MatchingEngine.match`. When
-                False (the default) a disposal the four passes cannot
+                False (the default) a disposal the four rules cannot
                 cover raises `UnmatchedDisposalError`. When True the
                 uncovered remainder is returned in
                 `MatchingResult.unmatched_disposals` instead — the
@@ -125,7 +125,7 @@ class StockRuleEngine:
                 malformed `Trade` objects too).
             UnmatchedDisposalError: Propagated from `MatchingEngine`
                 (strict mode only) when a disposal still carries
-                residual quantity after all four passes (typically a
+                residual quantity after every rule has had its turn (typically a
                 still-open short with no buy-to-cover anywhere in
                 the input).
         """

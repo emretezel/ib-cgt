@@ -232,6 +232,44 @@ def test_short_round_trip_after_30_days_is_later_acquisition() -> None:
     assert md.gain_gbp == Money.gbp("-100")
 
 
+def test_earlier_short_keeps_its_cover_when_a_later_sale_needs_the_pool() -> None:
+    """s.106A(4) through the stock engine: the 2012-vs-2026 shape in miniature.
+
+    Sell 10 short (day 1), buy 10 (day 100), sell 10 (day 200). The
+    first sale is identified first, with the buy under s.105(2); the
+    second sale finds nothing and is the residual.
+    """
+    fx = StubFXService({})
+    engine = StockRuleEngine(fx)
+    inst = _gbp_stock()
+    trades = [
+        (
+            1,
+            stock_trade(
+                action=TradeAction.SELL, on=date(2024, 1, 1), qty=10, price=90, instrument=inst
+            ),
+        ),
+        (
+            2,
+            stock_trade(
+                action=TradeAction.BUY, on=date(2024, 4, 10), qty=10, price=100, instrument=inst
+            ),
+        ),
+        (
+            3,
+            stock_trade(
+                action=TradeAction.SELL, on=date(2024, 7, 18), qty=10, price=120, instrument=inst
+            ),
+        ),
+    ]
+    result = engine.compute(inst, trades, soft_residuals=True)
+    assert [(m.disposal_trade_id, m.match_rule) for m in result.matched_disposals] == [
+        (1, MatchRule.LATER_ACQUISITION)
+    ]
+    assert result.matched_disposals[0].basis == DirectAcquisition(acquisition_trade_id=2)
+    assert [c.disposal_trade_id for c in result.unmatched_disposals] == [3]
+
+
 def test_open_short_at_end_of_input_raises() -> None:
     """Sell-short with no buy anywhere → UnmatchedDisposalError."""
     fx = StubFXService({})

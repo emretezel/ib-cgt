@@ -9,9 +9,10 @@ their own engine-specific FX path, then hand those records here.
 Algorithmic notes
 -----------------
 
-UK CGT applies four matching rules in a strict precedence order:
+UK CGT applies four matching rules to a disposal in a strict
+precedence order:
 
-    same-day (s.105(1)(b))  >  30-day forward / B&B (s.106A)
+    same-day (s.105(1)(b))  >  30-day forward / B&B (s.106A(5))
         >  pool (s.104)  >  later acquisition (s.105(2))
 
 The fourth rule — TCGA92/S105(2) — is the catch-all that matches a
@@ -20,8 +21,33 @@ window, taking the **earliest** such acquisition first. It is what
 covers a sell-short followed by a buy-to-cover more than 30 days
 later, and any disposal that runs past an under-sized S.104 pool.
 
-The precedence matters across disposals as well as within a single
-disposal. Consider:
+Across disposals the statute is explicit. TCGA92/S106A(4): "Securities
+disposed of on an earlier date shall be identified before securities
+disposed of on a later date; and, accordingly, securities disposed of
+by a later disposal shall not be identified with securities already
+identified as disposed of by an earlier disposal." The 30-day rule in
+s.106A(5) is expressly subject to that, and the whole section is
+subject to the same-day rule in s.105(1) (s.106A(9); HMRC CG51560:
+the 30-day rule "has priority over all other identification rules
+except the 'same day' rule").
+
+The implementation therefore has two steps:
+
+    Step 1: same-day pairing, day by day. Every disposal on a day is
+            identified with that day's acquisitions (FIFO) before
+            anything else, because s.105(1) prevails: an acquisition
+            that is same-day to one disposal and within 30 days of an
+            earlier one belongs to the same-day disposal.
+    Step 2: one chronological walk over the disposals. Each disposal
+            is identified in full before the next is looked at —
+            30-day acquisitions (earliest first), then the S.104 pool
+            of lots not yet identified (partial coverage allowed),
+            then the earliest not-yet-identified acquisitions after
+            the 30-day window. A lot identified with an earlier
+            disposal is never available to a later one, whatever rule
+            it was identified under.
+
+Step 1 is why this is not a pure per-disposal loop:
 
     Jan 15:  sell 10 of XYZ
     Jan 20:  buy 10 of XYZ        ← only enough acquisition for one disposal
@@ -29,25 +55,25 @@ disposal. Consider:
 
 The Jan-20 sell **must** match same-day against the Jan-20 buy, leaving
 the Jan-15 sell to fall through to the pool (or to a later
-acquisition under s.105(2)). A naive per-disposal-chronological
-algorithm would 30-day-match the Jan-15 sell against the Jan-20 buy
-first and starve the same-day match — the wrong outcome.
+acquisition). A loop that finished the Jan-15 sell first would
+30-day-match it against the Jan-20 buy and starve the same-day match.
 
-The implementation therefore runs in **four passes** over the data:
+Step 2 is why this is not a rule-by-rule sweep either. An earlier
+version ran every S.104 draw for every disposal before any
+later-acquisition match, so a sale many years later could draw from
+the pool a lot that an earlier, uncovered sale would identify under
+s.105(2) — and every new statement rewrote old tax years. With the
+walk, a disposal's chunks depend only on events up to 30 days after
+it (plus, if it is uncovered by everything on record, the first
+later acquisitions), so a later statement can change a disposal only
+through the 30-day rule or by covering a residual the engine already
+reports.
 
-    Pass 1: every same-day match (across all disposals).
-    Pass 2: every 30-day forward match (across remaining residuals).
-    Pass 3: every S.104 pool draw (across remaining residuals,
-            partial coverage allowed — the pool draws what it has
-            and Pass 4 picks up the rest).
-    Pass 4: every later-acquisition match — acquisitions strictly
-            after the 30-day window, earliest acquisition first.
+Within both steps, lots and disposals are visited in chronological
+order (date, then trade id) so the FIFO behaviour is deterministic.
 
-Within each pass, lots and disposals are visited in chronological order
-(date, then trade id) so the FIFO behaviour is deterministic.
-
-After all four passes, any disposal still carrying residual quantity
-is reported as `UnmatchedDisposalError` — the trade history is
+After the walk, any disposal still carrying residual quantity is
+reported as `UnmatchedDisposalError` — the trade history is
 incomplete and a partial match would silently distort the tax report.
 
 S.104 pool attribution
@@ -120,7 +146,7 @@ class MatchingResult:
         final_pool: Aggregate pool state at end of run. Always present
             (zero-quantity if the pool is empty).
         unmatched_disposals: One row per disposal still carrying
-            residual quantity after all four passes. Always empty
+            residual quantity after every rule has had its turn. Always empty
             under the default strict mode (the engine raises
             `UnmatchedDisposalError` instead). Populated only when
             the caller passes `soft_residuals=True` to `match()` —
@@ -186,9 +212,10 @@ class _DispState:
 class _Match:
     """A pending match decision queued during a pass.
 
-    We collect matches into this transient form because pass-1 and
-    pass-2 visit disposals in different orders than the final emit
-    order. Sorting at the end is cheaper than re-walking the data.
+    We collect matches into this transient form because the same-day
+    pairing visits disposals day by day, before the walk, so matches
+    do not arrive in the final emit order. Sorting at the end is
+    cheaper than re-walking the data.
     """
 
     disposal_index: int  # index into disp_state — used as the chronological key
@@ -253,8 +280,8 @@ class MatchingEngine:
                 required — the engine sorts internally.
             disposals: Every disposal to match. Order is not required.
             soft_residuals: When False (default), a disposal that
-                still has residual quantity after the four-rule sweep
-                raises `UnmatchedDisposalError`. When True, residuals
+                still has residual quantity after every rule has had
+                its turn raises `UnmatchedDisposalError`. When True, residuals
                 are collected into `MatchingResult.unmatched_disposals`
                 and the engine returns normally. The FX cashflow-
                 integration path opts in because pre-history opening
@@ -290,13 +317,13 @@ class MatchingEngine:
         lots = self._build_lots(acquisitions)
         disp_state = self._build_disp_state(disposals)
 
-        # Four-pass match. See module docstring for why ordering matters.
+        # Same-day pairing first (s.105(1) prevails over s.106A), then
+        # one chronological walk that identifies each disposal in full
+        # (s.106A(4)). See the module docstring for why this order.
         pending: list[_Match] = []
         emit_counter = [0]  # boxed so helper passes can mutate it
         self._pass_same_day(lots, disp_state, pending, emit_counter)
-        self._pass_30_day(lots, disp_state, pending, emit_counter)
-        self._pass_section_104(lots, disp_state, pending, emit_counter)
-        self._pass_later_acquisition(lots, disp_state, pending, emit_counter)
+        self._walk_disposals(lots, disp_state, pending, emit_counter)
         # Final residual check: any disposal still carrying residual
         # quantity after every rule has had its turn means the trade
         # history is incomplete (e.g. a still-open short with no
@@ -315,7 +342,7 @@ class MatchingEngine:
         matched = tuple(self._materialise(m, disp_state) for m in pending)
 
         # Build itemised residuals + aggregate pool from the lots that
-        # still have positive quantity after all three passes. The
+        # still have positive quantity once every disposal is identified. The
         # invariant "sum of UnmatchedAcquisitions == final_pool" holds
         # because every S.104 draw used pro-rata attribution.
         unmatched_acqs, final_pool = self._build_residuals(lots, instrument)
@@ -383,7 +410,7 @@ class MatchingEngine:
         return state
 
     # ------------------------------------------------------------------
-    # Pass 1 — same-day matches across all disposals
+    # Step 1 — same-day pairing, day by day (s.105(1))
     # ------------------------------------------------------------------
 
     def _pass_same_day(
@@ -396,9 +423,10 @@ class MatchingEngine:
         """Apply same-day rule (TCGA s.105) across every disposal date."""
         # Group disposals by date for a single sweep per day. Lots on
         # the same day are also batched so we never pay the day-filter
-        # cost twice.
-        # We iterate in date order so emit order within `pending` is
-        # already by date for same-day matches.
+        # cost twice. This runs for every day before the walk because
+        # s.105(1) prevails over s.106A: a same-day disposal keeps the
+        # day's acquisitions even against an earlier disposal's 30-day
+        # claim on them.
         same_day_dates = sorted({ds.disposal.disposal_date for ds in disp_state})
         for day in same_day_dates:
             day_disps = [ds for ds in disp_state if ds.disposal.disposal_date == day]
@@ -427,153 +455,168 @@ class MatchingEngine:
                     )
 
     # ------------------------------------------------------------------
-    # Pass 2 — 30-day forward (Bed & Breakfast)
+    # Step 2 — the chronological walk (s.106A(4))
     # ------------------------------------------------------------------
 
-    def _pass_30_day(
+    def _walk_disposals(
         self,
         lots: list[_Lot],
         disp_state: list[_DispState],
         pending: list[_Match],
         emit_counter: list[int],
     ) -> None:
-        """Apply 30-day forward rule (TCGA s.106A) for any residuals."""
-        for idx, ds in enumerate(disp_state):
-            if ds.quantity_remaining <= 0:
-                continue
-            window_end = ds.disposal.disposal_date + timedelta(days=_BED_AND_BREAKFAST_DAYS)
-            for lot in lots:
-                if ds.quantity_remaining <= 0:
-                    break
-                if lot.quantity_remaining <= 0:
-                    continue
-                # Strictly after the disposal day (same-day was pass 1)
-                # and within the 30-day window. Lots are pre-sorted by
-                # date so once we pass `window_end` we could `break`,
-                # but iterating to the end is O(A) and keeps the code
-                # straightforward.
-                if not (ds.disposal.disposal_date < lot.acquisition_date <= window_end):
-                    continue
-                self._consume(
-                    lot=lot,
-                    ds=ds,
-                    rule=MatchRule.BED_AND_BREAKFAST,
-                    disposal_index=idx,
-                    pending=pending,
-                    emit_counter=emit_counter,
-                )
+        """Identify each disposal in full, earliest first.
 
-    # ------------------------------------------------------------------
-    # Pass 3 — S.104 pool
-    # ------------------------------------------------------------------
-
-    def _pass_section_104(
-        self,
-        lots: list[_Lot],
-        disp_state: list[_DispState],
-        pending: list[_Match],
-        emit_counter: list[int],
-    ) -> None:
-        """Drain the S.104 pool for any disposals with remaining residuals.
-
-        The pool at time of disposal D = the set of lots whose
-        `acquisition_date < D.disposal_date` and that still have
-        `quantity_remaining > 0` after passes 1 and 2. The cost basis
-        used in the emitted `MatchedDisposal` is the pool's weighted
-        average at that moment; the draw is then attributed to lots
-        pro-rata so the pool aggregate and the itemised lot view stay
-        in lock-step.
-
-        The pool may not be large enough to cover the disposal — in
-        that case we draw whatever is available and let Pass 4
-        (s.105(2)) match the rest against later acquisitions. Pass 3
-        no longer raises `UnmatchedDisposalError`; the final residual
-        sweep after all four passes is the single source of that
-        error.
+        `disp_state` is already sorted by (date, trade id). For each
+        disposal still carrying residual after the same-day pairing:
+        30-day acquisitions, then the S.104 pool, then later
+        acquisitions — each step only if the previous left something
+        uncovered. Because a disposal is finished before the next is
+        looked at, a later disposal can never take, through the pool
+        or otherwise, a lot an earlier disposal has identified.
         """
         for idx, ds in enumerate(disp_state):
             if ds.quantity_remaining <= 0:
                 continue
-
-            pool_lots = [
-                lot
-                for lot in lots
-                if lot.acquisition_date < ds.disposal.disposal_date and lot.quantity_remaining > 0
-            ]
-            pool_qty = sum((lot.quantity_remaining for lot in pool_lots), start=Decimal(0))
-            pool_cost = sum((lot.cost_remaining_amount for lot in pool_lots), start=Decimal(0))
-            # Pool buy-side fees roll up the same way as pool cost; the
-            # snapshot carries this so an audit row can show how much
-            # of the average cost is principal vs. fees.
-            pool_fees = sum((lot.fees_remaining_amount for lot in pool_lots), start=Decimal(0))
-
-            if pool_qty <= 0:
-                # No pool to draw from — fall through to Pass 4.
+            self._take_30_day(lots, ds, idx, pending, emit_counter)
+            if ds.quantity_remaining <= 0:
                 continue
+            self._draw_pool(lots, ds, idx, pending, emit_counter)
+            if ds.quantity_remaining <= 0:
+                continue
+            self._take_later_acquisitions(lots, ds, idx, pending, emit_counter)
 
-            # Take whatever the pool has, capped at the disposal's
-            # residual. Partial coverage is allowed: any remainder is
-            # left for Pass 4 (s.105(2)).
-            drawn_qty = min(ds.quantity_remaining, pool_qty)
-            average_cost = pool_cost / pool_qty
-            cost_drawn = average_cost * drawn_qty
-            # Chunk's fee share scales by the same draw ratio — keeps
-            # `Σ matched_acquisition_fees == buy-side fees consumed`.
-            ratio = drawn_qty / pool_qty
-            fees_drawn = pool_fees * ratio
-
-            snapshot = TaxLotSnapshot(
-                quantity_before=pool_qty,
-                total_cost_gbp_before=Money.gbp(pool_cost),
-                average_cost_gbp=Money.gbp(average_cost),
-                total_fees_gbp_before=Money.gbp(pool_fees),
-            )
-
-            emit_counter[0] += 1
-            pending.append(
-                _Match(
-                    disposal_index=idx,
-                    rule=MatchRule.SECTION_104,
-                    matched_quantity=drawn_qty,
-                    matched_proceeds_amount=ds.proceeds_per_unit * drawn_qty,
-                    matched_cost_amount=cost_drawn,
-                    matched_acquisition_fees_amount=fees_drawn,
-                    matched_disposal_fees_amount=ds.disposal_fees_per_unit * drawn_qty,
-                    basis_acquisition_id=None,
-                    basis_snapshot=snapshot,
-                    emit_seq=emit_counter[0],
-                )
-            )
-
-            # Pro-rata attribution: every pool lot loses the same
-            # fraction of its quantity, cost, and fees. Preserves lot-
-            # local cost-per-unit and fees-per-unit and keeps the
-            # residual sums equal to the post-draw pool aggregate.
-            for lot in pool_lots:
-                qty_lost = lot.quantity_remaining * ratio
-                cost_lost = lot.cost_remaining_amount * ratio
-                fees_lost = lot.fees_remaining_amount * ratio
-                lot.quantity_remaining -= qty_lost
-                lot.cost_remaining_amount -= cost_lost
-                lot.fees_remaining_amount -= fees_lost
-
-            ds.quantity_remaining -= drawn_qty
-
-    # ------------------------------------------------------------------
-    # Pass 4 — later-acquisition matches (TCGA92/S105(2))
-    # ------------------------------------------------------------------
-
-    def _pass_later_acquisition(
+    def _take_30_day(
         self,
         lots: list[_Lot],
-        disp_state: list[_DispState],
+        ds: _DispState,
+        idx: int,
         pending: list[_Match],
         emit_counter: list[int],
     ) -> None:
-        """Apply TCGA92/S105(2): match disposals to later acquisitions.
+        """Apply the 30-day forward rule (TCGA s.106A(5)) to one disposal."""
+        window_end = ds.disposal.disposal_date + timedelta(days=_BED_AND_BREAKFAST_DAYS)
+        for lot in lots:
+            if ds.quantity_remaining <= 0:
+                break
+            if lot.quantity_remaining <= 0:
+                continue
+            # Strictly after the disposal day (same-day was step 1)
+            # and within the 30-day window. Lots are pre-sorted by
+            # date so once we pass `window_end` we could `break`,
+            # but iterating to the end is O(A) and keeps the code
+            # straightforward.
+            if not (ds.disposal.disposal_date < lot.acquisition_date <= window_end):
+                continue
+            self._consume(
+                lot=lot,
+                ds=ds,
+                rule=MatchRule.BED_AND_BREAKFAST,
+                disposal_index=idx,
+                pending=pending,
+                emit_counter=emit_counter,
+            )
 
-        For each disposal still carrying residual after passes 1-3,
-        walk the lots chronologically and drain any acquisition whose
+    @staticmethod
+    def _draw_pool(
+        lots: list[_Lot],
+        ds: _DispState,
+        idx: int,
+        pending: list[_Match],
+        emit_counter: list[int],
+    ) -> None:
+        """Draw one disposal's residual from the S.104 pool.
+
+        The pool at the time of disposal D = the set of lots whose
+        `acquisition_date < D.disposal_date` and that still have
+        `quantity_remaining > 0` — i.e. not identified with any
+        earlier disposal under any rule. The cost basis used in the
+        emitted `MatchedDisposal` is the pool's weighted average at
+        that moment; the draw is then attributed to lots pro-rata so
+        the pool aggregate and the itemised lot view stay in
+        lock-step.
+
+        The pool may not be large enough to cover the disposal — in
+        that case we draw whatever is available and the walk goes on
+        to later acquisitions (s.105(2)). Nothing is raised here; the
+        final residual sweep is the single source of
+        `UnmatchedDisposalError`.
+        """
+        pool_lots = [
+            lot
+            for lot in lots
+            if lot.acquisition_date < ds.disposal.disposal_date and lot.quantity_remaining > 0
+        ]
+        pool_qty = sum((lot.quantity_remaining for lot in pool_lots), start=Decimal(0))
+        pool_cost = sum((lot.cost_remaining_amount for lot in pool_lots), start=Decimal(0))
+        # Pool buy-side fees roll up the same way as pool cost; the
+        # snapshot carries this so an audit row can show how much
+        # of the average cost is principal vs. fees.
+        pool_fees = sum((lot.fees_remaining_amount for lot in pool_lots), start=Decimal(0))
+
+        if pool_qty <= 0:
+            # No pool to draw from — the walk moves on to s.105(2).
+            return
+
+        # Take whatever the pool has, capped at the disposal's
+        # residual. Partial coverage is allowed: any remainder is
+        # left for the later-acquisition step.
+        drawn_qty = min(ds.quantity_remaining, pool_qty)
+        average_cost = pool_cost / pool_qty
+        cost_drawn = average_cost * drawn_qty
+        # Chunk's fee share scales by the same draw ratio — keeps
+        # `Σ matched_acquisition_fees == buy-side fees consumed`.
+        ratio = drawn_qty / pool_qty
+        fees_drawn = pool_fees * ratio
+
+        snapshot = TaxLotSnapshot(
+            quantity_before=pool_qty,
+            total_cost_gbp_before=Money.gbp(pool_cost),
+            average_cost_gbp=Money.gbp(average_cost),
+            total_fees_gbp_before=Money.gbp(pool_fees),
+        )
+
+        emit_counter[0] += 1
+        pending.append(
+            _Match(
+                disposal_index=idx,
+                rule=MatchRule.SECTION_104,
+                matched_quantity=drawn_qty,
+                matched_proceeds_amount=ds.proceeds_per_unit * drawn_qty,
+                matched_cost_amount=cost_drawn,
+                matched_acquisition_fees_amount=fees_drawn,
+                matched_disposal_fees_amount=ds.disposal_fees_per_unit * drawn_qty,
+                basis_acquisition_id=None,
+                basis_snapshot=snapshot,
+                emit_seq=emit_counter[0],
+            )
+        )
+
+        # Pro-rata attribution: every pool lot loses the same
+        # fraction of its quantity, cost, and fees. Preserves lot-
+        # local cost-per-unit and fees-per-unit and keeps the
+        # residual sums equal to the post-draw pool aggregate.
+        for lot in pool_lots:
+            qty_lost = lot.quantity_remaining * ratio
+            cost_lost = lot.cost_remaining_amount * ratio
+            fees_lost = lot.fees_remaining_amount * ratio
+            lot.quantity_remaining -= qty_lost
+            lot.cost_remaining_amount -= cost_lost
+            lot.fees_remaining_amount -= fees_lost
+
+        ds.quantity_remaining -= drawn_qty
+
+    def _take_later_acquisitions(
+        self,
+        lots: list[_Lot],
+        ds: _DispState,
+        idx: int,
+        pending: list[_Match],
+        emit_counter: list[int],
+    ) -> None:
+        """Apply TCGA92/S105(2) to one disposal: match it to later acquisitions.
+
+        Walk the lots chronologically and drain any acquisition whose
         `acquisition_date` is **strictly after** `disposal_date + 30`
         (i.e. outside the 30-day Bed & Breakfast window — the
         statute says "and not already identified under stage 2
@@ -585,29 +628,26 @@ class MatchingEngine:
         buy-to-cover more than 30 days later. It also covers an
         ordinary disposal whose quantity outstrips the S.104 pool.
         """
-        for idx, ds in enumerate(disp_state):
+        window_end = ds.disposal.disposal_date + timedelta(days=_BED_AND_BREAKFAST_DAYS)
+        for lot in lots:
             if ds.quantity_remaining <= 0:
+                break
+            if lot.quantity_remaining <= 0:
                 continue
-            window_end = ds.disposal.disposal_date + timedelta(days=_BED_AND_BREAKFAST_DAYS)
-            for lot in lots:
-                if ds.quantity_remaining <= 0:
-                    break
-                if lot.quantity_remaining <= 0:
-                    continue
-                # Acquisitions in the 30-day window were eligible for
-                # Pass 2 — those are excluded from s.105(2) by the
-                # "not already identified under stage 2 above" clause,
-                # whether or not Pass 2 actually fully consumed them.
-                if lot.acquisition_date <= window_end:
-                    continue
-                self._consume(
-                    lot=lot,
-                    ds=ds,
-                    rule=MatchRule.LATER_ACQUISITION,
-                    disposal_index=idx,
-                    pending=pending,
-                    emit_counter=emit_counter,
-                )
+            # Acquisitions in the 30-day window were eligible for the
+            # 30-day step — those are excluded from s.105(2) by the
+            # "not already identified under stage 2 above" clause,
+            # whether or not that step actually fully consumed them.
+            if lot.acquisition_date <= window_end:
+                continue
+            self._consume(
+                lot=lot,
+                ds=ds,
+                rule=MatchRule.LATER_ACQUISITION,
+                disposal_index=idx,
+                pending=pending,
+                emit_counter=emit_counter,
+            )
 
     # ------------------------------------------------------------------
     # Final residual sweep — single source of UnmatchedDisposalError
@@ -617,8 +657,8 @@ class MatchingEngine:
     def _raise_if_residuals(disp_state: list[_DispState], instrument: AnyInstrument) -> None:
         """Raise `UnmatchedDisposalError` for any disposal still with residual.
 
-        After passes 1-4 every disposal that the engine could match
-        has been matched. Anything still carrying residual quantity
+        After the same-day pairing and the walk, every disposal the
+        engine could match has been matched. Anything still carrying residual quantity
         is genuinely uncovered — typically a still-open short that
         has no buy-to-cover anywhere in the input, or a long disposal
         without enough acquisitions in the input to cover it.
@@ -638,7 +678,7 @@ class MatchingEngine:
         """Soft-mode counterpart of `_raise_if_residuals`.
 
         Walks `disp_state` in the same chronological order the
-        passes used and emits one `UnmatchedDisposalChunk` per
+        walk used and emits one `UnmatchedDisposalChunk` per
         disposal that still has residual quantity. The chunk's
         `proceeds_remaining_gbp` is `proceeds_per_unit *
         quantity_remaining`, so the renderer can show the GBP value
@@ -721,10 +761,10 @@ class MatchingEngine:
         # Build the basis from the right side of the union — exactly
         # one of the two fields is set for each rule.
         if m.rule is MatchRule.SECTION_104:
-            assert m.basis_snapshot is not None  # guaranteed by pass 3
+            assert m.basis_snapshot is not None  # guaranteed by _draw_pool
             basis: DirectAcquisition | TaxLotSnapshot = m.basis_snapshot
         else:
-            assert m.basis_acquisition_id is not None  # guaranteed by passes 1 and 2
+            assert m.basis_acquisition_id is not None  # guaranteed by _consume
             basis = DirectAcquisition(acquisition_trade_id=m.basis_acquisition_id)
 
         return MatchedDisposal(

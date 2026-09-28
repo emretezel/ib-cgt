@@ -1,7 +1,7 @@
 """Tests for `MatchingEngine`'s opt-in soft-residual mode.
 
 The strict default raises `UnmatchedDisposalError` the moment any
-disposal still has residual after the four-pass sweep. Stocks,
+disposal still has residual after every rule has had its turn. Stocks,
 bonds, and futures all want that — their inputs are self-contained
 and a residual means the data is wrong.
 

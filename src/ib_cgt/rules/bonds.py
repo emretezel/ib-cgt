@@ -169,7 +169,7 @@ class BondRuleEngine:
                 malformed `Trade` objects too.
             UnmatchedDisposalError: Propagated from `MatchingEngine`
                 (strict mode only) when a non-exempt bond's disposal
-                still carries residual quantity after all four passes.
+                still carries residual quantity after every rule has had its turn.
         """
         if not isinstance(instrument, BondInstrument):
             raise WrongAssetClassError(

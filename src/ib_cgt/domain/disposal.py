@@ -215,7 +215,7 @@ class MatchedDisposal:
             `trades.trade_id`.
         instrument: The instrument being disposed.
         disposal_date: UK-local disposal date.
-        match_rule: Which of the three rules produced this match.
+        match_rule: Which of the four rules produced this match.
         matched_quantity: Units matched under this rule (subset of the
             disposal's total quantity).
         matched_proceeds_gbp: Proportional GBP proceeds for this chunk.
@@ -403,7 +403,7 @@ class UnmatchedAcquisition:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class UnmatchedDisposalChunk:
-    """A disposal portion left un-covered after all four matching passes.
+    """A disposal portion left un-covered after every matching rule has had its turn.
 
     `MatchingEngine` normally raises `UnmatchedDisposalError` when a
     disposal still has residual quantity after the four-rule sweep.

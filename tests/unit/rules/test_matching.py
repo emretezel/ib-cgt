@@ -357,8 +357,8 @@ def test_unmatched_acquisitions_pro_rata_attribution() -> None:
 def test_disposal_exceeds_coverage_raises() -> None:
     """Disposal quantity exceeds total available cover → loud error.
 
-    Under the four-rule model, Pass 3 partially drains the small
-    S.104 pool (10 units) and Pass 4 (s.105(2)) finds no later
+    Under the four-rule model, the pool draw partially drains the small
+    S.104 pool (10 units) and the later-acquisition step finds no later
     acquisitions to match the rest, so the final residual sweep
     raises with the post-pool residual (100 - 10 = 90).
     """
@@ -376,7 +376,7 @@ def test_disposal_exceeds_coverage_raises() -> None:
 def test_disposal_partial_30_day_then_pool_short_raises() -> None:
     """B&B + tiny pool + nothing later → reports the final residual.
 
-    With no acquisitions later than the 30-day window, Pass 4
+    With no acquisitions later than the 30-day window, s.105(2)
     contributes nothing and the residual sweep raises. 30 matched
     via B&B and 10 via S.104, leaving 60 unmatched.
     """
@@ -486,15 +486,15 @@ def test_chronological_disposal_order_in_output() -> None:
 
 
 # ---------------------------------------------------------------------------
-# S.105(2) — later-acquisition rule (Pass 4)
+# S.105(2) — later-acquisition rule
 # ---------------------------------------------------------------------------
 
 
 def test_short_round_trip_closed_after_30_days() -> None:
     """Sell-short, buy-to-cover >30 days later → single LATER_ACQUISITION match.
 
-    The buy is far enough out that Pass 2's 30-day window does not
-    cover it; with no S.104 pool, Pass 4 is the only thing that can
+    The buy is far enough out that the 30-day window does not cover
+    it; with no S.104 pool, s.105(2) is the only thing that can
     match this disposal. The basis is the buy trade and the cost is
     the buy's lot-local cost-per-unit.
     """
@@ -523,7 +523,7 @@ def test_short_round_trip_closed_after_30_days() -> None:
 
 
 def test_later_acquisition_takes_earliest_first() -> None:
-    """Two later buys: Pass 4 walks them earliest-first per s.105(2)."""
+    """Two later buys: s.105(2) walks them earliest-first."""
     engine = MatchingEngine()
     sell_date = date(2024, 5, 1)
     early_buy = sell_date + timedelta(days=45)
@@ -554,10 +554,10 @@ def test_later_acquisition_takes_earliest_first() -> None:
 
 
 def test_partial_pool_then_later_acquisition() -> None:
-    """Pool partially covers; Pass 4 picks up the rest from a later buy.
+    """Pool partially covers; s.105(2) picks up the rest from a later buy.
 
-    Demonstrates the new partial-coverage behaviour of Pass 3 and
-    the hand-off into Pass 4. Disposal is 100 units; pool has 30
+    Demonstrates the pool draw's partial coverage and the hand-off to
+    the later-acquisition step. Disposal is 100 units; pool has 30
     (acq 1, pre-disposal); a buy of 100 lands 60 days after the
     disposal. Expected: one SECTION_104 chunk for 30, one
     LATER_ACQUISITION chunk for 70.
@@ -592,7 +592,7 @@ def test_30_day_acquisition_not_picked_up_by_pass_4() -> None:
     """Acquisitions in the 30-day window are excluded from s.105(2).
 
     A buy 5 days after the disposal that fully covers it produces a
-    single BED_AND_BREAKFAST match. Pass 4 must NOT also see that
+    single BED_AND_BREAKFAST match. s.105(2) must NOT also see that
     buy's residual: even if it had residual, the statutory clause
     "and not already identified under stage 2 above" excludes it.
     """
@@ -607,7 +607,7 @@ def test_30_day_acquisition_not_picked_up_by_pass_4() -> None:
     )
     assert [m.match_rule for m in result.matched_disposals] == [MatchRule.BED_AND_BREAKFAST]
     # The remaining 80 units of acq 2 sit in the residual pool and
-    # are NOT consumed by Pass 4 for any second disposal we might add
+    # are NOT consumed under s.105(2) for any second disposal we might add
     # (we only have one disposal here, but the principle is the same).
     assert len(result.unmatched_acquisitions) == 1
     assert result.unmatched_acquisitions[0].trade_id == 2
@@ -755,7 +755,7 @@ def test_section_104_pro_rates_fees_across_lots() -> None:
 
 
 def test_later_acquisition_passes_fees_through() -> None:
-    """Pass 4 (s.105(2)) carries the late buy's fees onto the matched chunk."""
+    """s.105(2) carries the late buy's fees onto the matched chunk."""
     engine = MatchingEngine()
     sell_date = date(2024, 5, 1)
     buy_date = sell_date + timedelta(days=60)
@@ -800,3 +800,178 @@ def test_split_disposal_distributes_disposal_fees_across_chunks() -> None:
         start=result.matched_disposals[0].matched_disposal_fees_gbp,
     )
     assert total_disp_fees == Money.gbp("14")
+
+
+# ---------------------------------------------------------------------------
+# s.106A(4) — disposals are identified in date order, each one completely
+# ---------------------------------------------------------------------------
+
+
+def test_earlier_disposal_keeps_its_later_acquisition_over_a_later_pool_draw() -> None:
+    """A later disposal's pool draw must not take a lot an earlier disposal identifies.
+
+    D1 (day 1) is uncovered; the only acquisition A is on day 100; D2
+    sells on day 200. Per TCGA92/S106A(4) D1 is identified first — with
+    A under s.105(2) — and D2, finding nothing left, is the residual.
+    The old rule-by-rule passes gave A to D2's pool draw and left D1
+    uncovered.
+    """
+    engine = MatchingEngine()
+    d1, d2 = date(2024, 1, 1), date(2024, 7, 18)
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[acq(trade_id=5, on=date(2024, 4, 10), qty=10, cost_gbp=1000)],
+        disposals=[
+            disp(trade_id=1, on=d1, qty=10, proceeds_gbp=900),
+            disp(trade_id=2, on=d2, qty=10, proceeds_gbp=1200),
+        ],
+        soft_residuals=True,
+    )
+    assert [(m.disposal_trade_id, m.match_rule) for m in result.matched_disposals] == [
+        (1, MatchRule.LATER_ACQUISITION)
+    ]
+    assert result.matched_disposals[0].basis == DirectAcquisition(acquisition_trade_id=5)
+    assert result.matched_disposals[0].matched_cost_gbp == Money.gbp("1000")
+    assert [c.disposal_trade_id for c in result.unmatched_disposals] == [2]
+    assert result.unmatched_disposals[0].quantity_remaining == Decimal("10")
+    assert result.final_pool.quantity == Decimal("0")
+
+
+def test_strict_mode_names_the_later_disposal_as_the_uncovered_one() -> None:
+    """Same history as above under the strict default: the error is D2's, not D1's."""
+    engine = MatchingEngine()
+    with pytest.raises(UnmatchedDisposalError) as excinfo:
+        engine.match(
+            instrument=aapl(),
+            acquisitions=[acq(trade_id=5, on=date(2024, 4, 10), qty=10, cost_gbp=1000)],
+            disposals=[
+                disp(trade_id=1, on=date(2024, 1, 1), qty=10, proceeds_gbp=900),
+                disp(trade_id=2, on=date(2024, 7, 18), qty=10, proceeds_gbp=1200),
+            ],
+        )
+    assert excinfo.value.disposal_trade_id == 2
+
+
+def test_lot_identified_with_an_earlier_disposal_leaves_the_pool() -> None:
+    """Units an earlier disposal took under s.105(2) are not in a later disposal's pool.
+
+    A has 15 units. D1 (uncovered, day 1) takes 10 under s.105(2); when
+    D2 comes to the pool only the other 5 are there, so its S.104
+    snapshot shows `quantity_before == 5` and 5 units stay uncovered.
+    """
+    engine = MatchingEngine()
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[acq(trade_id=5, on=date(2024, 4, 10), qty=15, cost_gbp=1500)],
+        disposals=[
+            disp(trade_id=1, on=date(2024, 1, 1), qty=10, proceeds_gbp=900),
+            disp(trade_id=2, on=date(2024, 7, 18), qty=10, proceeds_gbp=1200),
+        ],
+        soft_residuals=True,
+    )
+    assert [(m.disposal_trade_id, m.match_rule) for m in result.matched_disposals] == [
+        (1, MatchRule.LATER_ACQUISITION),
+        (2, MatchRule.SECTION_104),
+    ]
+    pool_chunk = result.matched_disposals[1]
+    assert isinstance(pool_chunk.basis, TaxLotSnapshot)
+    assert pool_chunk.basis.quantity_before == Decimal("5")
+    assert pool_chunk.matched_quantity == Decimal("5")
+    assert pool_chunk.matched_cost_gbp == Money.gbp("500")
+    assert [(c.disposal_trade_id, c.quantity_remaining) for c in result.unmatched_disposals] == [
+        (2, Decimal("5"))
+    ]
+
+
+def test_earlier_disposal_is_identified_before_a_later_disposals_30_day_claim() -> None:
+    """s.106A(4): the earlier disposal is served first, even against a 30-day claim.
+
+    D1 (day 1) is uncovered, D2 sells on day 40, A is bought on day 45 —
+    inside D2's 30-day window but after D1's. D1 is identified first
+    and takes A under s.105(2); D2 has nothing left to match. The old
+    global 30-day pass gave A to D2.
+    """
+    engine = MatchingEngine()
+    d1 = date(2024, 1, 1)
+    result = engine.match(
+        instrument=aapl(),
+        acquisitions=[acq(trade_id=5, on=d1 + timedelta(days=45), qty=10, cost_gbp=1000)],
+        disposals=[
+            disp(trade_id=1, on=d1, qty=10, proceeds_gbp=900),
+            disp(trade_id=2, on=d1 + timedelta(days=40), qty=10, proceeds_gbp=1200),
+        ],
+        soft_residuals=True,
+    )
+    assert [(m.disposal_trade_id, m.match_rule) for m in result.matched_disposals] == [
+        (1, MatchRule.LATER_ACQUISITION)
+    ]
+    assert [c.disposal_trade_id for c in result.unmatched_disposals] == [2]
+
+
+def _covered_history() -> tuple[list, list]:  # type: ignore[type-arg]
+    """A history exercising every rule with nothing left uncovered.
+
+    Buy 100 (Jan 10). Sell 30 and sell 50 on Feb 1 with a buy of 20
+    that day: the first sale takes the 20 same-day, then 10 of the
+    Feb 20 buy (30-day); the second takes the other 30 of that buy
+    (30-day) and 20 from the pool. Sell 80 (Mar 15) drains the pool.
+    Sell 20 (May 1) with an empty pool → later acquisition: buy 20
+    (Jul 1).
+    """
+    acquisitions = [
+        acq(trade_id=1, on=date(2024, 1, 10), qty=100, cost_gbp=1000),
+        acq(trade_id=3, on=date(2024, 2, 1), qty=20, cost_gbp=260),
+        acq(trade_id=5, on=date(2024, 2, 20), qty=40, cost_gbp=600),
+        acq(trade_id=8, on=date(2024, 7, 1), qty=20, cost_gbp=360),
+    ]
+    disposals = [
+        disp(trade_id=2, on=date(2024, 2, 1), qty=30, proceeds_gbp=390),
+        disp(trade_id=4, on=date(2024, 2, 1), qty=50, proceeds_gbp=650),
+        disp(trade_id=6, on=date(2024, 3, 15), qty=80, proceeds_gbp=1200),
+        disp(trade_id=7, on=date(2024, 5, 1), qty=20, proceeds_gbp=320),
+    ]
+    return acquisitions, disposals
+
+
+def test_extending_the_history_does_not_change_earlier_disposals() -> None:
+    """Trades more than 30 days after the last disposal leave every earlier chunk as it was."""
+    engine = MatchingEngine()
+    acquisitions, disposals = _covered_history()
+    before = engine.match(instrument=aapl(), acquisitions=acquisitions, disposals=disposals)
+    assert before.unmatched_disposals == ()
+    assert {m.match_rule for m in before.matched_disposals} == set(MatchRule)
+
+    later_acqs = [acq(trade_id=20, on=date(2024, 9, 1), qty=50, cost_gbp=1000)]
+    later_disps = [disp(trade_id=21, on=date(2024, 10, 1), qty=50, proceeds_gbp=1100)]
+    after = engine.match(
+        instrument=aapl(),
+        acquisitions=acquisitions + later_acqs,
+        disposals=disposals + later_disps,
+    )
+    original_ids = {d.trade_id for d in disposals}
+    unchanged = tuple(m for m in after.matched_disposals if m.disposal_trade_id in original_ids)
+    assert unchanged == before.matched_disposals
+
+
+def test_an_acquisition_within_30_days_changes_only_the_last_disposal() -> None:
+    """The 30-day rule is the one way a later statement reaches back — and only 30 days."""
+    engine = MatchingEngine()
+    acquisitions, disposals = _covered_history()
+    before = engine.match(instrument=aapl(), acquisitions=acquisitions, disposals=disposals)
+
+    # Ten days after the last disposal (1 May): inside its window, outside every other.
+    within = [acq(trade_id=30, on=date(2024, 5, 11), qty=20, cost_gbp=380)]
+    after = engine.match(instrument=aapl(), acquisitions=acquisitions + within, disposals=disposals)
+    by_disposal_before = {
+        d: tuple(m for m in before.matched_disposals if m.disposal_trade_id == d)
+        for d in (2, 4, 6, 7)
+    }
+    by_disposal_after = {
+        d: tuple(m for m in after.matched_disposals if m.disposal_trade_id == d)
+        for d in (2, 4, 6, 7)
+    }
+    for d in (2, 4, 6):
+        assert by_disposal_after[d] == by_disposal_before[d], d
+    assert [m.match_rule for m in by_disposal_before[7]] == [MatchRule.LATER_ACQUISITION]
+    assert [m.match_rule for m in by_disposal_after[7]] == [MatchRule.BED_AND_BREAKFAST]
+    assert by_disposal_after[7][0].basis == DirectAcquisition(acquisition_trade_id=30)

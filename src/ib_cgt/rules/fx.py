@@ -195,7 +195,7 @@ class FXRuleEngine:
             synthesised `FXInstrument(<currency> vs GBP)` — distinct
             from the per-pair `FXInstrument` records persisted in
             `fx_instruments`. `unmatched_disposals` carries any
-            residual after all four passes (soft-residual mode).
+            residual after every rule has had its turn (soft-residual mode).
 
         Raises:
             ValueError: `currency` is empty, malformed, or ``"GBP"``.

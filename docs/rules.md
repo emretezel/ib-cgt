@@ -57,11 +57,20 @@ When matching a disposal `D` of N units of an instrument:
    buy-to-cover date), and any disposal that runs past an
    under-sized S.104 pool.
 
-Same-day takes priority **across disposals**, not just within one
-disposal: if two disposals on different dates both want the same
-acquisition, the one that can claim it under the same-day rule gets
-it before the 30-day rule kicks in. The same cross-disposal
-priority logic applies to rules 2, 3, and 4 in order.
+Across disposals the statute decides the order. TCGA92/S106A(4):
+"Securities disposed of on an earlier date shall be identified before
+securities disposed of on a later date; and, accordingly, securities
+disposed of by a later disposal shall not be identified with
+securities already identified as disposed of by an earlier disposal."
+So each disposal is identified in full, earliest first, and a lot an
+earlier disposal took — under whichever rule — is never available to
+a later one. The one exception is the same-day rule: s.106A is subject
+to s.105(1) (s.106A(9); HMRC [CG51560](https://www.gov.uk/hmrc-internal-manuals/capital-gains-manual/cg51560):
+the 30-day rule "has priority over all other identification rules
+except the 'same day' rule"), so an acquisition that is same-day to
+one disposal and within 30 days of an earlier one belongs to the
+same-day disposal. Statute text:
+[legislation.gov.uk, s.106A](https://www.legislation.gov.uk/ukpga/1992/12/section/106A).
 
 ### Which date is a trade's date
 
@@ -134,41 +143,68 @@ those fields are display or ingest-time data.
 | `matched_disposals`      | `tuple[MatchedDisposal, ...]`| One row per disposal-chunk-rule triple.                        |
 | `unmatched_acquisitions` | `tuple[UnmatchedAcquisition, ...]` | Itemised pool residuals at end of run.                |
 | `final_pool`             | `TaxLot`                     | Aggregate pool state at end of run.                            |
+| `unmatched_disposals`    | `tuple[UnmatchedDisposalChunk, ...]` | Disposal residuals nothing could cover; only populated in soft-residual mode. |
 
 Matched disposals are emitted in **(disposal-chronological,
 rule-priority)** order: for each disposal, SAME_DAY chunks first,
-then BED_AND_BREAKFAST, then SECTION_104. This matches the order an
-audit report wants and the order the `matched_disposals` table's
-`seq` column persists.
+then BED_AND_BREAKFAST, then SECTION_104, then LATER_ACQUISITION.
+This matches the order an audit report wants and the order the
+`matched_disposals` table's `seq` column persists.
 
 ### Algorithm
 
-The engine runs in four passes over the data:
+The engine has two steps:
 
-1. **Pass 1 — same-day, across all disposals.** This pass is what makes
-   "same-day takes priority across disposals" work. If we processed
-   disposals chronologically and applied all rules per disposal, an
-   earlier disposal would 30-day-match an acquisition before a
-   later disposal could same-day-match it.
-2. **Pass 2 — 30-day forward, across all remaining residuals.**
-3. **Pass 3 — S.104 pool draws, across remaining residuals.**
-   Partial coverage is allowed: if the pool has fewer units than
-   the disposal needs, the pool is fully drained for that disposal
-   and Pass 4 is responsible for the rest.
-4. **Pass 4 — later-acquisition (s.105(2)) matches.** For each
-   remaining residual, walk acquisitions strictly after the 30-day
-   window, earliest first. Acquisitions inside the window are
-   excluded from this pass even if Pass 2 only partially consumed
-   them — that's the statutory "not already identified under stage
-   2 above" clause.
+1. **Same-day pairing, day by day (s.105(1)).** Every disposal on a
+   day is identified with that day's acquisitions, FIFO, before
+   anything else. This is what makes the same-day rule prevail
+   across disposals: a loop that finished an earlier disposal first
+   would 30-day-match an acquisition that a disposal on the
+   acquisition's own day is entitled to.
+2. **One chronological walk (s.106A(4)).** Disposals are visited in
+   (date, trade id) order and each is identified in full before the
+   next is looked at:
+   - **30-day forward** — acquisitions strictly after the disposal
+     day and within 30 days, earliest first (s.106A(5)).
+   - **S.104 pool draw** — the pool is every lot dated before the
+     disposal that no earlier disposal has identified, drawn at
+     weighted-average cost with pro-rata attribution. Partial
+     coverage is allowed.
+   - **Later acquisitions (s.105(2))** — for any remainder, the
+     earliest not-yet-identified acquisitions strictly after the
+     30-day window. Acquisitions inside the window are excluded even
+     if the 30-day step only partially consumed them — the statutory
+     "not already identified under stage 2 above" clause.
 
-Within each pass, lots and disposals are visited in chronological
+Within both steps, lots and disposals are visited in chronological
 order (date, then trade id) so FIFO behaviour is deterministic.
 
-After all four passes, any disposal still carrying residual
-quantity is reported as `UnmatchedDisposalError` — the trade
-history is genuinely incomplete (typically a still-open short with
-no buy-to-cover anywhere in the input).
+After the walk, any disposal still carrying residual quantity is
+reported as `UnmatchedDisposalError` — the trade history is
+genuinely incomplete (typically a still-open short with no
+buy-to-cover anywhere in the input).
+
+### Why earlier years stay put
+
+Because a disposal is finished before the next one is looked at, its
+chunks depend only on: acquisitions on its own day; acquisitions in
+the 30 days after it that no same-day disposal or earlier disposal
+took; the pool of unidentified lots before it, which is fixed by
+earlier events; and, only if it is still uncovered, the earliest
+unidentified acquisitions after the window. A statement ingested
+later can therefore change a disposal in exactly two cases: it lies
+within 30 days before the new period (the 30-day rule reaching
+forward), or it was left uncovered by everything on record and the
+first new acquisition now covers it — a short or missing-history
+residual the engine already reports (`unmatched_disposals`, the
+`OPEN_SHORT_POSITION` and `FX_RESIDUAL` warnings).
+
+This replaced a rule-by-rule sweep on 2026-09-28. That sweep ran every
+pool draw in the history before any later-acquisition match, so
+ingesting the 2026/27 statements let 2026 EUR sales draw from the pool
+the 2014 purchase that the uncovered EUR.CAD sale of 20 Feb 2012 had
+identified under s.105(2), and rewrote 2011/12 by £146. Check **D1**
+(stored runs equal a fresh recompute) is what surfaces such a rewrite.
 
 ### Coverage shortfall
 
@@ -177,9 +213,9 @@ rules — typically because the user loaded an incomplete trade
 history (e.g. a still-open short with no buy-to-cover anywhere in
 the input) — the engine raises `UnmatchedDisposalError`. The error
 carries the disposal's trade id, the instrument's symbol, and the
-final residual quantity. The four passes always emit whatever
-matches they can; the residual sweep is a single check after
-Pass 4 that surfaces what could not be covered.
+final residual quantity. The two steps always emit whatever
+matches they can; the residual sweep is a single check after the
+walk that surfaces what could not be covered.
 
 The intent is for the calculator to fail loudly: a half-matched
 disposal would silently distort the tax report.
