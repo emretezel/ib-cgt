@@ -21,6 +21,7 @@ from ib_cgt.report import CloseOutBasis, DirectBasis, PoolBasis
 from ib_cgt.report.labels import (
     asset_class_label,
     cash_label,
+    corporate_action_label,
     coupon_label,
     dividend_label,
     instrument_identifier,
@@ -44,6 +45,7 @@ def test_event_labels_match_the_audit_conventions() -> None:
     assert dividend_label(DividendKind.WITHHOLDING_TAX, 3) == "WHT #3"
     assert coupon_label(2) == "Cpn #2"
     assert cash_label(4) == "Cash #4"
+    assert corporate_action_label(7) == "CA #7"
 
 
 def test_trade_description_names_class_action_quantity_and_price() -> None:

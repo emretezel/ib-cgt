@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from typer.testing import CliRunner
 from ib_cgt.cli import app
 from ib_cgt.db import (
     AccountRepo,
+    CorporateActionRepo,
     FXRateRepo,
     StatementRepo,
     TradeRepo,
@@ -36,6 +37,8 @@ from ib_cgt.db import (
 from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import (
     Account,
+    CorporateAction,
+    CorporateActionKind,
     Money,
     StockInstrument,
     Trade,
@@ -401,3 +404,86 @@ def test_match_stocks_unmatched_disposal_lands_in_unmatched_block(
     block = result.stdout[unmatched_idx:summary_idx]
     assert "BBBY" in block
     assert "100.00" in block
+
+
+# ---------------------------------------------------------------------------
+# Disposals by corporate action carry their `CA #N` label
+# ---------------------------------------------------------------------------
+
+
+def _seed_merger(conn: sqlite3.Connection) -> None:
+    """824 IEMI bought in GBP and cashed out for USD — the user's real shape."""
+    AccountRepo(conn).upsert(Account(account_id="U10049818"))
+    StatementRepo(conn).record(
+        time_zone=ZoneInfo("America/New_York"),
+        statement_hash="hash-merger",
+        source_path="/tmp/merger.html",
+        account_id="U10049818",
+        trade_count=0,
+        period_start=date(2025, 4, 7),
+        period_end=date(2026, 4, 3),
+    )
+    iemi = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+    TradeRepo(conn).insert_many(
+        [
+            Trade(
+                account_id="U10049818",
+                instrument=iemi,
+                action=TradeAction.BUY,
+                trade_datetime=datetime(2025, 4, 8, 14, 0, tzinfo=_UK),
+                trade_date=date(2025, 4, 8),
+                settlement_date=date(2025, 4, 8),
+                quantity=Decimal("824"),
+                price=Money.of(Decimal("12.52"), "GBP"),
+                fees=Money.of(Decimal("6"), "GBP"),
+            )
+        ],
+        source_statement_hash="hash-merger",
+    )
+    CorporateActionRepo(conn).insert_many(
+        [
+            CorporateAction(
+                account_id="U10049818",
+                kind=CorporateActionKind.CASH_DISPOSAL,
+                instrument=iemi,
+                effective_datetime=datetime(2025, 4, 16, 0, 25, tzinfo=UTC),
+                effective_date=date(2025, 4, 16),
+                report_date=date(2025, 4, 22),
+                quantity=Decimal("-824"),
+                cash=Money.of("14425.52", "USD"),
+                description="IEMI(IE00B2NPL135) Merged(Acquisition) for USD 17.506705 per Share",
+            )
+        ],
+        source_statement_hash="hash-merger",
+    )
+
+
+@pytest.fixture
+def merger_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A DB holding only the IEMI merger, with the USD rate its proceeds need."""
+    db_path = tmp_path / "merger.sqlite"
+    monkeypatch.setenv("IB_CGT_DB", str(db_path))
+    conn = open_connection(db_path)
+    try:
+        apply_migrations(conn)
+        _seed_fx_rates(conn)
+        _seed_merger(conn)
+    finally:
+        conn.close()
+    yield db_path
+
+
+def test_match_stocks_labels_a_corporate_action_disposal(
+    runner: CliRunner, merger_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disposal a cash merger constituted is cited as `CA #1`, never as a 13-digit id."""
+    monkeypatch.setenv("COLUMNS", "260")
+    result = runner.invoke(app, ["match", "stocks"])
+    assert result.exit_code == 0, result.stdout
+    assert "IEMI" in result.stdout
+    assert "CA #1" in result.stdout
+    assert "5000000000001" not in result.stdout
+    assert "section_104" in result.stdout
+    # 14,425.52 USD at 1.27 = 11,358.68 GBP of proceeds against 10,322.48 GBP of cost.
+    assert "11,358.68" in result.stdout
+    assert "10,322.48" in result.stdout

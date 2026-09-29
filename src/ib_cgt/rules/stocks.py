@@ -51,17 +51,31 @@ The grant fee (writer) and the option's commissions (holder) ride
 along as incidental costs, so the fee fields keep their subset
 semantics and the report's working sheet can show them under B / E.
 
+Disposals by corporate action
+-----------------------------
+
+A cash merger or a fund termination takes the whole holding away for
+cash — a disposal under TCGA 1992 s.28 on the date the event takes
+effect, not a trade. The runner hands such events in as
+`CorporateAction` rows (`cash_disposal` kind); this engine projects
+each into a `Disposal` of the units for the cash, converted to GBP
+at the effective date, with no fees. The cash itself, in whatever
+currency the issuer paid, reaches the FX pool under the same
+synthetic event id through `fx_cashflow.from_corporate_action`.
+
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 
 from ib_cgt.domain import (
     Acquisition,
     AnyInstrument,
     AssetClass,
+    CorporateAction,
     Disposal,
     Money,
     OptionExerciseTransfer,
@@ -109,8 +123,9 @@ class StockRuleEngine:
         *,
         soft_residuals: bool = False,
         transfers: Sequence[OptionExerciseTransfer] = (),
+        corporate_actions: Sequence[tuple[int, CorporateAction]] = (),
     ) -> MatchingResult:
-        """Project trades into GBP and run the four-rule matcher.
+        """Project trades and corporate actions into GBP and run the four-rule matcher.
 
         Args:
             instrument: The instrument these trades refer to. Must be
@@ -136,6 +151,11 @@ class StockRuleEngine:
                 from the option engine. Every transfer must name a
                 trade in `trades` with the action its option implies;
                 the runner passes the transfers for this stock only.
+            corporate_actions: `(event_id, action)` pairs on this stock.
+                Each `cash_disposal` row becomes a `Disposal` of its
+                units for its cash at the effective date under the
+                given event id; other kinds are skipped (their tax
+                treatment is unmodelled and check A16 reports them).
 
         Returns:
             `MatchingResult` with matched chunks (in (chronological,
@@ -204,6 +224,11 @@ class StockRuleEngine:
                     "among this stock's trades"
                 ),
             )
+        for event_id, action in corporate_actions:
+            if action.is_cash_disposal:
+                disposals.append(
+                    self._build_corporate_action_disposal(event_id, action, instrument)
+                )
 
         return self._matcher.match(
             instrument, acquisitions, disposals, soft_residuals=soft_residuals
@@ -315,6 +340,37 @@ class StockRuleEngine:
             quantity=trade.quantity,
             proceeds_gbp=proceeds_gbp,
             fees_gbp=fees_gbp,
+        )
+
+    def _build_corporate_action_disposal(
+        self,
+        event_id: int,
+        action: CorporateAction,
+        instrument: StockInstrument,
+    ) -> Disposal:
+        """Project a `cash_disposal` corporate action into a GBP `Disposal`.
+
+        The consideration is the cash the issuer paid, in its own
+        currency, converted to GBP at the effective date (TCGA 1992
+        s.28: the date of the event). IB charges no commission on a
+        corporate action, so the fees are zero. `event_id` is the
+        row-derived synthetic id the FX engine also uses for the cash
+        leg, so the disposal and the pool acquisition cite one event.
+        """
+        cash = action.cash
+        # The domain guarantees a cash_disposal carries positive cash.
+        assert cash is not None
+        proceeds_gbp, _rate = self._fx.convert_with_rate(
+            cash, target="GBP", on=action.effective_date
+        )
+        return Disposal(
+            trade_id=event_id,
+            account_id=action.account_id,
+            instrument=instrument,
+            disposal_date=action.effective_date,
+            quantity=action.disposed_quantity,
+            proceeds_gbp=proceeds_gbp,
+            fees_gbp=Money.gbp(Decimal(0)),
         )
 
 

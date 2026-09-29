@@ -24,13 +24,14 @@ from ib_cgt.cli.common import (
     parse_iso_date,
 )
 from ib_cgt.cli.matching_render import (
+    corporate_action_labels,
     matched_disposal_to_cells,
     render_instrument_unmatched_disposals,
     trade_dates,
 )
 from ib_cgt.config import resolve_db_path
 from ib_cgt.db import apply_migrations, open_connection
-from ib_cgt.domain import BondInstrument, Money, TaxLot, Trade, UnmatchedAcquisition
+from ib_cgt.domain import BondInstrument, Money, TaxLot, UnmatchedAcquisition
 from ib_cgt.rules import ExemptBondResult, MatchingResult
 
 
@@ -176,10 +177,10 @@ def _render_match_bonds_exempt(runs: Sequence[BondEngineRun]) -> None:
 
 def _matching_bond_runs(
     runs: Sequence[BondEngineRun],
-) -> list[tuple[BondInstrument, MatchingResult, tuple[tuple[int, Trade], ...]]]:
+) -> list[tuple[BondEngineRun, MatchingResult]]:
     """Narrow a bond pass to the non-exempt runs that produced a `MatchingResult`."""
     return [
-        (run.instrument, run.result, run.trades)
+        (run, run.result)
         for run in runs
         if run.error is None and isinstance(run.result, MatchingResult)
     ]
@@ -197,13 +198,14 @@ def _render_match_bonds_disposals(runs: Sequence[BondEngineRun]) -> None:
         return
 
     console.print("\n[bold]Bond matched disposals (dry-run)[/]")
-    for instrument, result, trades in matching_rows:
-        divider = _bond_divider(instrument)
+    for run, result in matching_rows:
+        divider = _bond_divider(run.instrument)
         console.print(f"\n[bold cyan]{divider}[/]")
         if not result.matched_disposals:
             console.print("  [dim](no matched disposals)[/]")
             continue
-        date_map = trade_dates(trades)
+        date_map = trade_dates(run.trades)
+        id_labels = corporate_action_labels(run.corporate_actions)
         table = Table(header_style="bold", show_lines=False)
         table.add_column("Disp ID", justify="right")
         table.add_column("Disp Date")
@@ -217,26 +219,30 @@ def _render_match_bonds_disposals(runs: Sequence[BondEngineRun]) -> None:
         table.add_column("Acq Fees (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
         for md in result.matched_disposals:
-            table.add_row(*matched_disposal_to_cells(md, date_map))
+            table.add_row(*matched_disposal_to_cells(md, date_map, id_labels))
         console.print(table)
 
 
 def _render_match_bonds_unmatched_disposals(runs: Sequence[BondEngineRun]) -> None:
     """Yellow block of every soft-residual unmatched disposal across non-exempt bonds."""
+    id_labels: dict[int, str] = {}
+    for run, _result in _matching_bond_runs(runs):
+        id_labels.update(corporate_action_labels(run.corporate_actions))
     render_instrument_unmatched_disposals(
         [
-            (instrument, chunk)
-            for instrument, result, _trades in _matching_bond_runs(runs)
+            (run.instrument, chunk)
+            for run, result in _matching_bond_runs(runs)
             for chunk in result.unmatched_disposals
-        ]
+        ],
+        id_labels,
     )
 
 
 def _render_match_bonds_residuals(runs: Sequence[BondEngineRun]) -> None:
     """One flat table of every UnmatchedAcquisition across non-exempt bonds."""
     residuals: list[tuple[BondInstrument, UnmatchedAcquisition]] = [
-        (instrument, ua)
-        for instrument, result, _trades in _matching_bond_runs(runs)
+        (run.instrument, ua)
+        for run, result in _matching_bond_runs(runs)
         for ua in result.unmatched_acquisitions
     ]
     if not residuals:
@@ -268,8 +274,8 @@ def _render_match_bonds_residuals(runs: Sequence[BondEngineRun]) -> None:
 def _render_match_bonds_final_pools(runs: Sequence[BondEngineRun]) -> None:
     """Per-non-exempt-bond final-pool aggregate — one flat table."""
     pools: list[tuple[BondInstrument, TaxLot]] = [
-        (instrument, result.final_pool)
-        for instrument, result, _trades in _matching_bond_runs(runs)
+        (run.instrument, result.final_pool)
+        for run, result in _matching_bond_runs(runs)
         if result.final_pool.quantity > 0
     ]
     if not pools:
@@ -304,9 +310,9 @@ def _render_match_bonds_summary(runs: Sequence[BondEngineRun], db_path: Path) ->
     matching_rows = _matching_bond_runs(runs)
     matched_count = len(matching_rows)
     error_count = sum(1 for run in runs if run.error is not None)
-    md_count = sum(len(result.matched_disposals) for _instrument, result, _trades in matching_rows)
+    md_count = sum(len(result.matched_disposals) for _run, result in matching_rows)
     total_gain = Money.gbp(Decimal("0"))
-    for _instrument, result, _trades in matching_rows:
+    for _run, result in matching_rows:
         for md in result.matched_disposals:
             total_gain = total_gain + md.gain_gbp
 

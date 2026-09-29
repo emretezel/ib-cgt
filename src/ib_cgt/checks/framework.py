@@ -39,12 +39,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ib_cgt.calculator.cash_balances import CashBalanceReconciliation
     from ib_cgt.calculator.positions import PositionReconciliation
     from ib_cgt.calculator.runs import (
         BondEngineRun,
         EngineOutputs,
         FutureEngineRun,
         FXEngineRun,
+        FXInputs,
         OptionEngineRun,
         StockEngineRun,
     )
@@ -178,8 +180,10 @@ class CheckContext:
     _bond_runs: list[BondEngineRun] | None = field(default=None, repr=False)
     _future_runs: list[FutureEngineRun] | None = field(default=None, repr=False)
     _option_runs: list[OptionEngineRun] | None = field(default=None, repr=False)
+    _fx_inputs: FXInputs | None = field(default=None, repr=False)
     _fx_runs: list[FXEngineRun] | None = field(default=None, repr=False)
     _position_recs: tuple[PositionReconciliation, ...] | None = field(default=None, repr=False)
+    _cash_recs: tuple[CashBalanceReconciliation, ...] | None = field(default=None, repr=False)
 
     @property
     def is_narrowed(self) -> bool:
@@ -251,27 +255,40 @@ class CheckContext:
             )
         return self._future_runs
 
+    def fx_inputs(self) -> FXInputs:
+        """Return the cached FX input bundle, loading it on first call.
+
+        FX pools are global, so a `--symbol` filter must not narrow the
+        futures realisations that feed them: when a symbol is set a
+        complete futures pass is run here; otherwise the cached
+        (complete) futures runs are shared to avoid a second pass. The
+        bundle is shared by `fx_runs` and `cash_reconciliations` so
+        both read the same events.
+        """
+        if self._fx_inputs is None:
+            from ib_cgt.calculator.runner import load_fx_inputs, run_future_engine
+
+            if self.symbol is not None:
+                future_runs: Sequence[FutureEngineRun] = run_future_engine(
+                    self.conn, self.fx, since=self.since, until=self.until
+                )
+            else:
+                future_runs = self.future_runs()
+            self._fx_inputs = load_fx_inputs(
+                self.conn, future_runs=future_runs, since=self.since, until=self.until
+            )
+        return self._fx_inputs
+
     def fx_runs(self) -> list[FXEngineRun]:
         """Return the cached FX-engine runs, building them on first call.
 
-        FX pools are global, so a `--symbol` filter must not narrow the
-        futures realisations that feed them: when a symbol is set the
-        runner performs its own complete futures pass; otherwise the
-        cached (complete) futures runs are shared to avoid a second pass.
+        Every pool is matched from the one bundle `fx_inputs` holds.
         """
         if self._fx_runs is None:
-            from ib_cgt.calculator.runner import run_fx_engine
+            from ib_cgt.calculator.runner import run_fx_pools
 
-            future_runs = None if self.symbol is not None else self.future_runs()
-            self._fx_runs = list(
-                run_fx_engine(
-                    self.conn,
-                    self.fx,
-                    future_runs=future_runs,
-                    since=self.since,
-                    until=self.until,
-                )
-            )
+            inputs = self.fx_inputs()
+            self._fx_runs = list(run_fx_pools(self.fx, inputs, inputs.currencies))
         return self._fx_runs
 
     def position_reconciliations(self) -> tuple[PositionReconciliation, ...]:
@@ -286,6 +303,27 @@ class CheckContext:
 
             self._position_recs = reconcile_positions(self.conn)
         return self._position_recs
+
+    def cash_reconciliations(self) -> tuple[CashBalanceReconciliation, ...]:
+        """Return the cached pool-vs-Cash-Report reconciliation.
+
+        Whole-history by nature (it compares each account's earliest
+        and latest statements), so a date filter must not clip the
+        events it sums: a date-narrowed context loads a complete bundle
+        of its own; otherwise the cached bundle is shared.
+        """
+        if self._cash_recs is None:
+            from ib_cgt.calculator.cash_balances import reconcile_cash_balances
+            from ib_cgt.calculator.runner import load_fx_inputs, run_future_engine
+
+            if self.since is not None or self.until is not None:
+                inputs = load_fx_inputs(
+                    self.conn, future_runs=run_future_engine(self.conn, self.fx)
+                )
+            else:
+                inputs = self.fx_inputs()
+            self._cash_recs = reconcile_cash_balances(self.conn, self.fx, fx_inputs=inputs)
+        return self._cash_recs
 
     def engine_outputs(self) -> EngineOutputs:
         """Bundle the five cached runs into the calculator's `EngineOutputs`.

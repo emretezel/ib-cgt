@@ -173,8 +173,10 @@ prints both tables.
 
 Every event is cited in the notation of [`audit.md`](./audit.md) —
 `#N` for a trade, `Div #N` / `WHT #N` / `Cpn #N` / `Cash #N` for the
-cashflows a currency pool consumes, `P&L #A→#B` for a futures
-close-out — resolved from the run's own `fx_event_sources` rows, so
+cashflows a currency pool consumes, `CA #N` for a corporate action
+(the disposal of the units and the cash it brought in cite the same
+id), `P&L #A→#B` for a futures close-out — resolved from the run's
+own `event_sources` rows, so
 `ib-cgt show trade N` takes the reader from any line back to the IB
 statement. A row whose statement was withdrawn after the run is
 printed as `unresolved` rather than invented; re-run `compute` to

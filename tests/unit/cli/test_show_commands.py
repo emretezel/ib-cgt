@@ -315,7 +315,24 @@ def test_show_match_unknown_id_errors(
     _db_path, _ids = populated_db
     result = runner.invoke(app, ["show", "match", "--disposal", "999999"])
     assert result.exit_code == 1
-    assert "No trade found" in result.output
+    assert "No trade or corporate action found" in result.output
+
+
+def test_show_match_requires_exactly_one_selector(
+    runner: CliRunner, populated_db: tuple[Path, dict[str, int]]
+) -> None:
+    """`--disposal` and `--corporate-action` name the same thing two ways; pick one."""
+    _db_path, ids = populated_db
+    neither = runner.invoke(app, ["show", "match"])
+    assert neither.exit_code == 2
+    assert "exactly one" in neither.output
+    both = runner.invoke(
+        app, ["show", "match", "--disposal", str(ids["forex_buy"]), "--corporate-action", "1"]
+    )
+    assert both.exit_code == 2
+    unknown_action = runner.invoke(app, ["show", "match", "--corporate-action", "77"])
+    assert unknown_action.exit_code == 1
+    assert "No trade or corporate action found" in unknown_action.output
 
 
 def test_show_match_gbp_stock_skips_pool_resolution(

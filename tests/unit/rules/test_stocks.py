@@ -16,12 +16,14 @@ this module focuses on the projection and delegation glue.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from ib_cgt.domain import (
+    CorporateAction,
+    CorporateActionKind,
     DirectAcquisition,
     FutureInstrument,
     MatchRule,
@@ -477,3 +479,64 @@ def test_open_short_with_soft_residuals_reports_chunk_instead_of_raising() -> No
     assert chunk.disposal_trade_id == 1
     assert chunk.quantity_remaining == Decimal("10")
     assert chunk.disposal_date == date(2024, 5, 1)
+
+
+# ---------------------------------------------------------------------------
+# Disposals by corporate action
+# ---------------------------------------------------------------------------
+
+IEMI = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+MERGER_ON = date(2025, 8, 16)
+MERGER_EVENT_ID = 5 * 10**12 + 1
+MERGER_CASH = Money.of("14425.52", "USD")
+
+
+def _merger(
+    *,
+    kind: CorporateActionKind = CorporateActionKind.CASH_DISPOSAL,
+    quantity: str = "-824",
+    cash: Money | None = MERGER_CASH,
+) -> CorporateAction:
+    return CorporateAction(
+        account_id="U1",
+        kind=kind,
+        instrument=IEMI,
+        effective_datetime=datetime(2025, 8, 16, 0, 25, tzinfo=UTC),
+        effective_date=MERGER_ON,
+        report_date=date(2025, 8, 22),
+        quantity=Decimal(quantity),
+        cash=cash,
+        description="IEMI(IE00B2NPL135) Merged(Acquisition) for USD 17.506705 per Share",
+    )
+
+
+def test_corporate_action_disposal_is_matched_like_a_sell() -> None:
+    """The IEMI merger: 824 shares bought in GBP, cashed out for USD, one S.104 disposal."""
+    fx = StubFXService({MERGER_ON: Decimal("0.7377")})  # 1 USD = 0.7377 GBP on the day
+    engine = StockRuleEngine(fx)
+    buy = stock_trade(
+        action=TradeAction.BUY, on=date(2021, 2, 4), qty=824, price="12.52", fees=6, instrument=IEMI
+    )
+    result = engine.compute(IEMI, [(319, buy)], corporate_actions=[(MERGER_EVENT_ID, _merger())])
+    [md] = result.matched_disposals
+    assert md.disposal_trade_id == MERGER_EVENT_ID
+    assert md.disposal_date == MERGER_ON
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_quantity == Decimal("824")
+    assert md.matched_proceeds_gbp == Money.gbp(Decimal("14425.52") * Decimal("0.7377"))
+    assert md.matched_disposal_fees_gbp == Money.gbp("0")
+    assert md.matched_cost_gbp == Money.gbp("10322.48")  # 824 * 12.52 + 6
+    assert result.final_pool.quantity == Decimal("0")
+
+
+def test_unsupported_corporate_action_projects_nothing() -> None:
+    """A split leg on the holding is not a disposal; the pool is untouched."""
+    fx = StubFXService({})
+    engine = StockRuleEngine(fx)
+    buy = stock_trade(
+        action=TradeAction.BUY, on=date(2021, 2, 4), qty=824, price="12.52", instrument=IEMI
+    )
+    split = _merger(kind=CorporateActionKind.UNSUPPORTED, quantity="824", cash=None)
+    result = engine.compute(IEMI, [(319, buy)], corporate_actions=[(MERGER_EVENT_ID, split)])
+    assert result.matched_disposals == ()
+    assert result.final_pool.quantity == Decimal("824")

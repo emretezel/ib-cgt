@@ -104,7 +104,12 @@ def _positions(
 ) -> None:
     StatementPositionRepo(conn).insert_many(
         [
-            StatementPosition(account_id=account_id, instrument=inst, quantity=Decimal(qty))
+            StatementPosition(
+                account_id=account_id,
+                instrument=inst,
+                quantity=Decimal(qty),
+                close_price=Decimal("1"),
+            )
             for inst, qty in rows
         ],
         source_statement_hash=statement_hash,

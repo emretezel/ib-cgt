@@ -118,7 +118,7 @@ def _report(
     report = TaxYearReport.build(Y2025, [], [], grants, transfers)
     persisted = PersistedRun(
         run=TaxRun(run_id=7, tax_year=Y2025, computed_at=COMPUTED_AT, net_gbp=report.net_gbp),
-        computation=TaxYearComputation(report=report, issues=(), fx_event_sources={}),
+        computation=TaxYearComputation(report=report, issues=(), event_sources={}),
     )
     refs = {
         1: ref(1, on=MAY_1, description="option XAUUSD 21DEC12 1920.0 C open_short 1 @ 7.7 USD"),

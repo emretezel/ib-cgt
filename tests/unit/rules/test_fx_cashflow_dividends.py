@@ -99,16 +99,45 @@ def test_payment_in_lieu_emits_acquisition_same_as_cash_dividend() -> None:
 
 
 def test_withholding_tax_emits_disposal_at_pay_date_rate() -> None:
-    """A USD WHT row → USD pool disposal GBP-converted at pay_date."""
+    """A USD WHT row (negative, as printed) → USD pool disposal of the magnitude."""
     fx = _StubFx({("USD", date(2024, 5, 15)): Decimal("0.80")})
     pool = make_pool_instrument("USD")
-    div = _div(kind=DividendKind.WITHHOLDING_TAX, amount="15")
+    div = _div(kind=DividendKind.WITHHOLDING_TAX, amount="-15")
     event = from_dividend(99, div, "USD", fx, pool)
     assert isinstance(event, Disposal)
     assert event.quantity == Decimal("15")
     assert event.proceeds_gbp == Money.gbp("12")  # 15 * 0.80
     assert event.fees_gbp == Money.gbp("0")
     assert event.disposal_date == date(2024, 5, 15)
+
+
+# ---------------------------------------------------------------------------
+# Direction is the sign, never the kind
+# ---------------------------------------------------------------------------
+
+
+def test_negative_payment_in_lieu_is_a_disposal() -> None:
+    """A payment in lieu owed on a short (TUR, 2019) is cash leaving the pool."""
+    fx = _StubFx({("USD", date(2024, 5, 15)): Decimal("0.80")})
+    pool = make_pool_instrument("USD")
+    div = _div(kind=DividendKind.PAYMENT_IN_LIEU, amount="-887.72")
+    event = from_dividend(7, div, "USD", fx, pool)
+    assert isinstance(event, Disposal)
+    assert event.quantity == Decimal("887.72")
+    assert event.proceeds_gbp == Money.gbp("710.176")  # 887.72 * 0.80
+    assert event.trade_id == 7
+
+
+def test_positive_withholding_reversal_is_an_acquisition() -> None:
+    """A withholding refund (the January 2017 re-bookings) is cash arriving."""
+    fx = _StubFx({("USD", date(2024, 5, 15)): Decimal("0.80")})
+    pool = make_pool_instrument("USD")
+    div = _div(kind=DividendKind.WITHHOLDING_TAX, amount="206.10")
+    event = from_dividend(8, div, "USD", fx, pool)
+    assert isinstance(event, Acquisition)
+    assert event.quantity == Decimal("206.10")
+    assert event.cost_gbp == Money.gbp("164.880")  # 206.10 * 0.80
+    assert event.fees_gbp == Money.gbp("0")
 
 
 # ---------------------------------------------------------------------------

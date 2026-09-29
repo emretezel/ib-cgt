@@ -24,11 +24,14 @@ from ib_cgt.calculator import (
     TaxYearComputation,
 )
 from ib_cgt.calculator import calculator as calculator_module
+from ib_cgt.calculator.cash_balances import CashBalanceReconciliation, reconcile_cash_balances
 from ib_cgt.calculator.positions import reconcile_positions
-from ib_cgt.calculator.runner import run_engines
+from ib_cgt.calculator.runner import load_fx_inputs, run_engines, run_future_engine
+from ib_cgt.calculator.runs import FXInputs
 from ib_cgt.db import (
     CashEventRepo,
     FXRateRepo,
+    StatementCashBalanceRepo,
     StatementPositionRepo,
     StatementRepo,
     TradeRepo,
@@ -41,6 +44,7 @@ from ib_cgt.domain import (
     IssueSeverity,
     Money,
     RunIssueKind,
+    StatementCashBalance,
     StatementPosition,
     StockInstrument,
     TaxYear,
@@ -48,6 +52,7 @@ from ib_cgt.domain import (
 )
 from ib_cgt.fx import FXService
 from ib_cgt.rules import FXConverter
+from ib_cgt.rules.fx_cashflow import make_pool_instrument
 
 from .conftest import AAPL, CL, CORP_USD, ES, GILT, STATEMENT_HASH, trade
 
@@ -72,11 +77,27 @@ def seed_statements_and_positions(conn: sqlite3.Connection) -> None:
     """
     StatementPositionRepo(conn).insert_many(
         [
-            StatementPosition(account_id="U1", instrument=AAPL, quantity=Decimal("10")),
-            StatementPosition(account_id="U1", instrument=CORP_USD, quantity=Decimal("100")),
-            StatementPosition(account_id="U1", instrument=ES, quantity=Decimal("2")),
-            StatementPosition(account_id="U1", instrument=CL, quantity=Decimal("5")),
-            StatementPosition(account_id="U1", instrument=GILT, quantity=Decimal("10000")),
+            StatementPosition(
+                account_id="U1", instrument=AAPL, quantity=Decimal("10"), close_price=Decimal("1")
+            ),
+            StatementPosition(
+                account_id="U1",
+                instrument=CORP_USD,
+                quantity=Decimal("100"),
+                close_price=Decimal("1"),
+            ),
+            StatementPosition(
+                account_id="U1", instrument=ES, quantity=Decimal("2"), close_price=Decimal("1")
+            ),
+            StatementPosition(
+                account_id="U1", instrument=CL, quantity=Decimal("5"), close_price=Decimal("1")
+            ),
+            StatementPosition(
+                account_id="U1",
+                instrument=GILT,
+                quantity=Decimal("10000"),
+                close_price=Decimal("1"),
+            ),
         ],
         source_statement_hash=STATEMENT_HASH,
     )
@@ -117,9 +138,15 @@ def seed_statements_and_positions(conn: sqlite3.Connection) -> None:
     )
     StatementPositionRepo(conn).insert_many(
         [
-            StatementPosition(account_id="U2", instrument=AAPL, quantity=Decimal("10")),
-            StatementPosition(account_id="U2", instrument=MSFT, quantity=Decimal("-5")),
-            StatementPosition(account_id="U2", instrument=NVDA, quantity=Decimal("-3")),
+            StatementPosition(
+                account_id="U2", instrument=AAPL, quantity=Decimal("10"), close_price=Decimal("1")
+            ),
+            StatementPosition(
+                account_id="U2", instrument=MSFT, quantity=Decimal("-5"), close_price=Decimal("1")
+            ),
+            StatementPosition(
+                account_id="U2", instrument=NVDA, quantity=Decimal("-3"), close_price=Decimal("1")
+            ),
         ],
         source_statement_hash=U2_HASH,
     )
@@ -230,6 +257,62 @@ def test_confirmed_open_short_is_a_warning(
     assert "deferred" in issue.message
 
 
+def _seed_cash_report(conn: sqlite3.Connection, fx_service: FXService) -> None:
+    """Give U1's statement a Cash Report that agrees with the pools, currency by currency.
+
+    Seeding a zero USD row first makes the account reconcilable; the
+    reconciliation then says what the engine holds of every currency
+    and the statement is rewritten to agree with it.
+    """
+    repo = StatementCashBalanceRepo(conn)
+    repo.insert_many(
+        [StatementCashBalance(currency="USD", starting_cash=Decimal(0), ending_cash=Decimal(0))],
+        statement_hash=STATEMENT_HASH,
+    )
+    inputs = load_fx_inputs(conn, future_runs=run_future_engine(conn, fx_service))
+    recs = reconcile_cash_balances(conn, fx_service, fx_inputs=inputs)
+    conn.execute("DELETE FROM statement_cash_balances WHERE statement_hash = ?", (STATEMENT_HASH,))
+    repo.insert_many(
+        [
+            StatementCashBalance(
+                currency=rec.currency, starting_cash=Decimal(0), ending_cash=rec.engine_total
+            )
+            for rec in recs
+        ],
+        statement_hash=STATEMENT_HASH,
+    )
+    conn.commit()
+
+
+def test_reconciling_cash_report_raises_no_issue(
+    calc_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    _seed_cash_report(calc_db, fx_service)
+    computation = Calculator(calc_db, fx_service).compute(Y2024)
+    assert computation.errors == ()
+    assert RunIssueKind.CASH_BALANCE_MISMATCH not in _kinds(computation)
+
+
+def test_cash_balance_mismatch_is_an_error(
+    calc_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """IB says U1 holds 14,425.52 USD more than the pools can explain (the IEMI shape)."""
+    _seed_cash_report(calc_db, fx_service)
+    calc_db.execute(
+        "UPDATE statement_cash_balances SET ending_cash = CAST(CAST(ending_cash AS REAL) "
+        "+ 14425.52 AS TEXT) WHERE statement_hash = ? AND currency = 'USD'",
+        (STATEMENT_HASH,),
+    )
+    calc_db.commit()
+    computation = Calculator(calc_db, fx_service).compute(Y2024)
+    (issue,) = [i for i in computation.issues if i.kind is RunIssueKind.CASH_BALANCE_MISMATCH]
+    assert issue.severity is IssueSeverity.ERROR
+    assert issue in computation.errors
+    assert issue.instrument == make_pool_instrument("USD")
+    assert issue.message.startswith("U1 USD at 2025-04-05: IB 0.00 -> ")
+    assert issue.message.endswith("difference 14,425.52")
+
+
 def test_reconciled_open_futures_contracts_raise_no_issue(
     calc_db: sqlite3.Connection, fx_service: FXService
 ) -> None:
@@ -271,7 +354,11 @@ def test_statement_holding_with_no_trades_is_an_error(
         period_end=date(2025, 4, 30),
     )
     StatementPositionRepo(calc_db).insert_many(
-        [StatementPosition(account_id="U2", instrument=IEAA, quantity=Decimal("100"))],
+        [
+            StatementPosition(
+                account_id="U2", instrument=IEAA, quantity=Decimal("100"), close_price=Decimal("1")
+            )
+        ],
         source_statement_hash="hash-u2-newer",
     )
     computation = Calculator(calc_db, fx_service).compute(Y2024)
@@ -350,11 +437,12 @@ def test_weekday_rule_treats_a_friday_statement_as_covering_a_sunday_year_end(
 def test_engines_and_reconciliation_run_once_per_instance(
     calc_db: sqlite3.Connection, fx_service: FXService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls = {"engines": 0, "positions": 0}
+    calls = {"engines": 0, "positions": 0, "cash": 0}
     # Bind the originals from their defining modules; `calculator.py`
     # only imports these names, it does not re-export them.
     real_run = run_engines
     real_reconcile = reconcile_positions
+    real_reconcile_cash = reconcile_cash_balances
 
     def counting_run(conn: sqlite3.Connection, fx: FXConverter) -> EngineOutputs:
         calls["engines"] += 1
@@ -364,9 +452,16 @@ def test_engines_and_reconciliation_run_once_per_instance(
         calls["positions"] += 1
         return real_reconcile(conn)
 
+    def counting_reconcile_cash(
+        conn: sqlite3.Connection, fx: FXConverter, *, fx_inputs: FXInputs
+    ) -> tuple[CashBalanceReconciliation, ...]:
+        calls["cash"] += 1
+        return real_reconcile_cash(conn, fx, fx_inputs=fx_inputs)
+
     monkeypatch.setattr(calculator_module, "run_engines", counting_run)
     monkeypatch.setattr(calculator_module, "reconcile_positions", counting_reconcile)
+    monkeypatch.setattr(calculator_module, "reconcile_cash_balances", counting_reconcile_cash)
     calc = Calculator(calc_db, fx_service)
     calc.compute(Y2024)
     calc.compute(Y2025)
-    assert calls == {"engines": 1, "positions": 1}
+    assert calls == {"engines": 1, "positions": 1, "cash": 1}

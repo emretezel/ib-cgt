@@ -130,49 +130,47 @@ where noted.
      `Description` is the canonical name.
    * **FX pairs** get no conid from IB and stay keyed by the pair.
    The parser also walks `tblCorporateActions_*Body` divs;
-   `ingest/corporate_actions.py` materialises two CGT-relevant shapes
-   into synthesized `SELL` trades that the rule engines treat as
-   ordinary disposals:
-   * **Cash-for-shares mergers** (Stocks):
-     `Merged(Acquisition) for <CCY> <PRICE> per Share` — cross-currency
-     proceeds FX-converted to the stock's listing currency at the
-     disposal-date spot rate.
-   * **Bond maturities** (Bonds):
-     `(<ISIN>) Bond Maturity FOR <CCY> <PRICE> PER BOND
-     (<symbol>, <long_desc>, <isin>)` — redemption at par on the
-     maturity date, in the bond's own currency. The gilt classifier
-     re-runs against the synthesised instrument so an exempt UKT
-     bond still routes through `ExemptBondResult` rather than the
-     S.104 path.
-
-     IB renders the same gilt under multiple trade-side aliases
-     (`UKT 0 1/4 01/31/25 5.26994388%` for one yield lot,
-     `… 9.87150193%` for another, `UKT 2 3/4 09/07/24 FH45` for the
-     maturity-row form). With ISIN as the bond's natural key
-     (migration 014) every alias collapses to one
-     `bond_instruments` row, so trade BUYs and maturity SELLs
-     reconcile naturally without any orchestrator-side filtering.
-     A defensive `_filter_maturities_with_known_instruments`
-     remains as a backstop for degenerate cases where a maturity
-     row appears for a bond that has no prior BUY in the corpus.
-   Dividends-as-corporate-action, splits, spin-offs, share-for-share
-   mergers, and tendered-to-other-stock rows are silently ignored.
+   `ingest/corporate_actions.py` stores every event in its own table,
+   [`corporate_actions`](db/corporate_actions.md), as up to three
+   legs — units out, units in, cash — classified by the legs it has,
+   never by IB's wording. A group of rows (same `Date/Time` and
+   description) with exactly one negative quantity and one positive
+   cash amount, and nothing else, is a `cash_disposal`: a
+   cash-for-shares merger (`Merged(Acquisition) for USD 17.506705 per
+   Share`, whose cash may be in a currency other than the listing's —
+   IEMI trades in GBP and paid USD), a bond redemption
+   (`(<ISIN>) Bond Maturity FOR GBP 1.00 PER BOND`, resolved by the
+   ISIN so every trade-side alias of a gilt collapses to the one
+   `bond_instruments` row), a tender for cash. Every other shape —
+   splits, spin-offs, share-for-share mergers, returns of capital,
+   or a disposal whose security cannot be resolved — is stored line
+   by line as `unsupported` and reported by check A16; ingest never
+   fails on a corporate action, and nothing is synthesised into
+   `trades`. The stock and bond engines build the disposal from the
+   row and the FX engine books the cash, all under one event id
+   (`CA #N`).
 
    Beyond trades, every ingest records (all inside one transaction,
    all cascading from the `statements` row):
    * the **statement period** from the page `<title>` — the only
      place every vintage prints the range in a fixed shape;
    * the **Open Positions** section as `statement_positions` — the
-     broker's own end-of-period view, resolved to the same
-     instruments the trades use (a held-over stock or futures
-     contract with no instrument-information row, hence no conid, is
-     resolved by symbol against instruments already in the DB, and
-     reported if that fails);
+     broker's own end-of-period view with each holding's close
+     price, resolved to the same instruments the trades use (a
+     held-over stock or futures contract with no
+     instrument-information row, hence no conid, is resolved by
+     symbol against instruments already in the DB, and reported if
+     that fails);
+   * the **Cash Report** section as `statement_cash_balances` — the
+     broker's starting and ending cash per currency, the yardstick
+     the FX pools are reconciled against (check C11);
    * **dividends and withholding tax** under IB's real
      `tblWithholdingTax_` div id (an earlier prefix mismatch silently
      dropped every withholding row). Dividend rows are
      instrument-less: only their cash leg feeds the FX pools, the IB
-     security tag is kept as text, and the payment currency is
+     security tag is kept as text, the amount is stored signed as
+     printed (a payment in lieu paid on a short is negative, a
+     withholding refund positive), and the payment currency is
      whatever the section says (IEMI trades in GBP but pays USD);
    * the **cash-shaped sections** — Interest (minus the bond coupons
      `bond_coupons` owns), Deposits & Withdrawals (minus transfers
@@ -192,14 +190,15 @@ where noted.
    - `StockRuleEngine` — four-rule UK matching (same-day / 30-day /
      S.104 / s.105(2)) via the shared matching engine; direction-
      agnostic so short round-trips fall through to s.105(2) when
-     their cover buy is more than 30 days later.
+     their cover buy is more than 30 days later. Consumes the
+     stock's `cash_disposal` corporate actions as disposals at the
+     cash received, converted on the effective date (`CA #N`).
    - `BondRuleEngine` — four-rule matching; skips QCB/gilt-exempt
      instruments; attaches purchase/sale accrued interest to
-     cost/proceeds. Sees bond maturities as ordinary SELL trades
-     (the synthesis is upstream in `ingest/corporate_actions.py`),
-     so an exempt gilt's maturity rolls into `ExemptBondResult`
-     and a non-exempt bond's maturity triggers a real S.104
-     disposal at par.
+     cost/proceeds. Consumes the bond's `cash_disposal` corporate
+     actions (redemptions), so an exempt gilt's maturity rolls into
+     `ExemptBondResult` and a non-exempt bond's is a real S.104
+     disposal at the redemption cash.
    - `FutureRuleEngine` — per-contract realised-gain on close-out; no
      pooling. Emits a separate `FutureRealisation` shape because UK
      share-matching rules (s.104 / s.105 / s.106A) do not apply to
@@ -214,7 +213,8 @@ where noted.
      (`OptionGrant`). Emits `OptionExerciseTransfer` records that
      `StockRuleEngine` folds into the share trades (s.144(2)–(3)).
    - `FXRuleEngine` — four-rule matching per currency pair vs GBP,
-     over nine cashflow sources including option premiums.
+     over ten cashflow sources including option premiums and
+     corporate-action cash.
    A shared `MatchingEngine` implements the generic same-day /
    30-day / S.104 / s.105(2) algorithm reused by Stock, Bond,
    Option (holder side) and FX engines. See [`rules.md`](./rules.md)
@@ -433,7 +433,7 @@ items marked ⬜ are pending.
     pool (one EUR-vs-GBP pool, one USD-vs-GBP pool, …), reusing the
     shared matching engine. A cross-currency trade (e.g. `EUR.USD`)
     feeds two pools at once with independent per-leg GBP conversion.
-    The engine consumes **nine cashflow sources** per HMRC CG78315
+    The engine consumes **ten cashflow sources** per HMRC CG78315
     ("foreign currency arising from any source"): forex trades,
     non-GBP stock trades' settlement cash, non-GBP dividends (cash
     dividends, payment-in-lieu, withholding tax — see the
@@ -443,8 +443,11 @@ items marked ⬜ are pending.
     always inflows), non-GBP **bond trades'** settlement cash,
     non-GBP **cash events** (broker interest, external deposits
     booked at spot, fees — see
-    [`docs/db/cash_events.md`](db/cash_events.md)), and non-GBP
-    **option trades'** premiums, commissions and settlements.
+    [`docs/db/cash_events.md`](db/cash_events.md)), non-GBP
+    **option trades'** premiums, commissions and settlements, and
+    the cash leg of **corporate actions** (a cash-out in a currency
+    other than the listing's — see
+    [`docs/db/corporate_actions.md`](db/corporate_actions.md)).
     Soft-residual mode surfaces any leftover shortfall (e.g. opening
     balance pre-dating the IB history) as a yellow warning rather
     than blanking the pool. Per-currency CLI:
@@ -453,10 +456,12 @@ items marked ⬜ are pending.
     (`ib_cgt.calculator.runner`) is the single loader every `match`
     command and `check` tier runs on; open positions reconcile against
     the latest statements per taxpayer (`ib_cgt.calculator.positions`,
-    check C7); `Calculator` computes one tax year over the whole
-    history, records issues and persists the run tables; CLI
-    `compute --year [--dry-run]`; Tier D checks D1–D7 verify the
-    persisted runs.
+    check C7) and the FX pools against the statements' Cash Report
+    per account, with open futures marked at the statement's close
+    (`ib_cgt.calculator.cash_balances`, check C11); `Calculator`
+    computes one tax year over the whole history, records issues and
+    persists the run tables; CLI `compute --year [--dry-run]`; Tier D
+    checks D1–D7 verify the persisted runs.
 12. ✅ **Reporting** — `ib-cgt report --year`: SA108 box figures per
     form section with a per-class split, one computation per HMRC
     disposal in the working-sheet layout, console / Markdown / JSON /
@@ -480,7 +485,7 @@ items marked ⬜ are pending.
 | 4 | Ingestion | `ib_cgt.ingest` | ✅ HTML + PDF adapters, coverage rule, five asset classes, option exercise links |
 | 5 | FX service | `ib_cgt.fx` | ✅ Done |
 | 6 | Rule engines | `ib_cgt.rules` | ✅ `MatchingEngine` (four-rule) + `FutureRuleEngine` + `StockRuleEngine` + `BondRuleEngine` + `OptionRuleEngine` + `FXRuleEngine` |
-| 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner (five engines), open-position reconciliation, `Calculator.compute` / `persist` / `load` incl. option grants and exercise transfers |
+| 7 | Calculator | `ib_cgt.calculator` | ✅ engine runner (five engines), open-position and cash-balance reconciliations, `Calculator.compute` / `persist` / `load` incl. option grants and exercise transfers |
 | 8 | Reporting | `ib_cgt.report` | ✅ SA108 model + builder (share, futures and option-grant lines), console / Markdown / JSON / CSV renderers |
 | 9 | CLI | `ib_cgt.cli` | 🟡 `db init` / `db reset` / `ingest` / `trades` / `fx sync` / `bonds list` / `match futures` / `match stocks` / `match fx` / `match bonds` / `match options` / `show trade` / `show realisation` / `show match` / `check` (incl. `check options`) / `compute` / `report` |
 | 10 | Configuration | `ib_cgt.config` | ⬜ Pending |

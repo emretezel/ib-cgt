@@ -44,9 +44,10 @@ def _instrument(conn: sqlite3.Connection, symbol: str = "AAPL") -> int:
 
 
 def _insert(conn: sqlite3.Connection, *, row_index: int, instrument_id: int, qty: str) -> None:
+    # `close_price` arrived with 024; the shape 016 introduced is otherwise unchanged.
     conn.execute(
         "INSERT INTO statement_positions (statement_hash, statement_row_index, instrument_id, "
-        "quantity) VALUES ('h', ?, ?, ?)",
+        "quantity, close_price) VALUES ('h', ?, ?, ?, '1')",
         (row_index, instrument_id, qty),
     )
 
@@ -85,7 +86,7 @@ def test_016_rejects_unknown_instrument_and_statement() -> None:
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO statement_positions (statement_hash, statement_row_index, "
-            "instrument_id, quantity) VALUES ('nope', 0, ?, '1')",
+            "instrument_id, quantity, close_price) VALUES ('nope', 0, ?, '1', '1')",
             (_instrument(conn),),
         )
 

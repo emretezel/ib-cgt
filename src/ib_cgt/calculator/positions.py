@@ -2,10 +2,13 @@
 
 The ingested trades imply a signed holding for every instrument:
 buys and long opens add, sells and long closes subtract, short opens
-subtract, short closes add. The broker states its own view at the
-end of every statement — the Open Positions section. The two must
-agree as of each account's *latest* statement, or the trade history
-is incomplete:
+subtract, short closes add. Corporate actions move holdings too — a
+cash merger or a maturity takes the whole position out, a split or a
+spin-off (unmodelled, stored as `unsupported`) changes it — so their
+signed quantities are added on the same side. The broker states its
+own view at the end of every statement — the Open Positions section.
+The two must agree as of each account's *latest* statement, or the
+history is incomplete:
 
 * trades net to a holding no statement lists — a sale was never
   ingested, or an over-sold stock;
@@ -32,9 +35,8 @@ confirms the short is still open, so its gain is simply deferred.
 The tax-year calculator turns every non-`MATCH` outcome into a run
 issue and check C7 reports the same reconciliation standalone.
 
-FX is deliberately outside this module: currency balances are
-never reconciled (the earliest statement is the origin of every
-pool, and pre-history balances are unknowable by design).
+FX is outside this module: currency balances are reconciled against
+the statements' Cash Report by `calculator/cash_balances.py`.
 
 Author: Emre Tezel
 """
@@ -48,6 +50,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from ib_cgt.db import (
+    CorporateActionRepo,
     InstrumentRepo,
     StatementPositionRepo,
     StatementRepo,
@@ -84,7 +87,8 @@ class AccountPosition:
         statement: The account's latest statement — the comparison
             is as of its `period_end`.
         trade_quantity: Signed holding implied by the account's
-            trades up to that `period_end` (zero when there are none).
+            trades and corporate actions up to that `period_end`
+            (zero when there are none).
         statement_quantity: The statement's signed quantity, or
             `None` when the statement lists no row.
     """
@@ -156,9 +160,9 @@ def reconcile_positions(conn: sqlite3.Connection) -> tuple[PositionReconciliatio
     """Compare the taxpayer's trade-derived holdings with the latest statements.
 
     Accounts with no statement are skipped — there is nothing to
-    reconcile against. For each account with one, the trades are
-    netted up to and including the statement's `period_end` and
-    joined with the statement's Open Positions rows. The per-account
+    reconcile against. For each account with one, the trades and the
+    corporate actions are netted up to and including the statement's
+    `period_end` and joined with the statement's Open Positions rows. The per-account
     sides are then grouped by instrument, so every instrument present
     on either side in any account yields exactly one row whose totals
     decide the status. FX pairs are excluded (they cannot appear on a
@@ -171,14 +175,20 @@ def reconcile_positions(conn: sqlite3.Connection) -> tuple[PositionReconciliatio
     statement_repo = StatementRepo(conn)
     position_repo = StatementPositionRepo(conn)
     trade_repo = TradeRepo(conn)
+    action_repo = CorporateActionRepo(conn)
     instrument_repo = InstrumentRepo(conn)
 
     sides: dict[int, list[AccountPosition]] = {}
     # `latest_per_account` is ordered by account id, so each
     # instrument's account tuple comes out in account order for free.
     for statement in statement_repo.latest_per_account():
-        traded = trade_repo.signed_quantity_by_instrument(
-            statement.account_id, up_to=statement.period_end
+        traded = _net_quantities(
+            trade_repo.signed_quantity_by_instrument(
+                statement.account_id, up_to=statement.period_end
+            ),
+            action_repo.signed_quantity_by_instrument(
+                statement.account_id, up_to=statement.period_end
+            ),
         )
         stated = {
             instrument_id: position.quantity
@@ -207,6 +217,15 @@ def reconcile_positions(conn: sqlite3.Connection) -> tuple[PositionReconciliatio
             )
         )
     return tuple(out)
+
+
+def _net_quantities(*sides: dict[int, Decimal]) -> dict[int, Decimal]:
+    """Sum signed quantities per instrument across sources, dropping those that net to zero."""
+    totals: dict[int, Decimal] = {}
+    for side in sides:
+        for instrument_id, quantity in side.items():
+            totals[instrument_id] = totals.get(instrument_id, Decimal(0)) + quantity
+    return {iid: qty for iid, qty in totals.items() if qty != 0}
 
 
 def instrument_reconciles(

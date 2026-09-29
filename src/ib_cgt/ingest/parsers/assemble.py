@@ -29,6 +29,7 @@ from typing import Final
 from ib_cgt.ingest.parsers.tables import RawDocument, RawTable, RowKind, SectionKind, TableRow
 from ib_cgt.ingest.raw import (
     ParsedStatement,
+    RawCashReportRow,
     RawCashRow,
     RawCorporateActionRow,
     RawDividendRow,
@@ -153,12 +154,34 @@ _DATED_SPEC: Final = _SectionSpec(
 
 _POSITION_SPEC: Final = _SectionSpec(
     # `Mult` is optional: the bonds sub-table prints `Accrued Int` in
-    # that slot instead.
-    aliases={"Symbol": "symbol", "Quantity": "quantity", "Mult": "multiplier"},
-    required=frozenset({"symbol", "quantity"}),
+    # that slot instead. `Close Price` is on every vintage's table —
+    # the cash-balance reconciliation values open futures at it.
+    aliases={
+        "Symbol": "symbol",
+        "Quantity": "quantity",
+        "Mult": "multiplier",
+        "Close Price": "close_price",
+    },
+    required=frozenset({"symbol", "quantity", "close_price"}),
     needs_asset_class=True,
     needs_currency=True,
     marker="quantity",
+)
+
+# The Cash Report: a label column with no header (the empty-string
+# alias is deliberate — `_resolve_columns` compares header cells with
+# their whitespace collapsed, so the blank header cell resolves it)
+# and one numeric column per account segment, of which only the sum,
+# `Total`, is read. Its sub-headers are the currency blocks plus the
+# `Base Currency Summary` block and, on newer vintages, `Cash Detail`
+# / `Collateral Value Detail` / `Net Cash Detail` bands; neither
+# sub-header is required — the mapper keeps the real currencies.
+_CASH_REPORT_SPEC: Final = _SectionSpec(
+    aliases={"": "label", "Total": "total"},
+    required=frozenset({"label", "total"}),
+    needs_asset_class=False,
+    needs_currency=False,
+    marker="label",
 )
 
 _SPECS: Final[Mapping[SectionKind, _SectionSpec]] = {
@@ -171,6 +194,7 @@ _SPECS: Final[Mapping[SectionKind, _SectionSpec]] = {
     SectionKind.DEPOSITS_WITHDRAWALS: _DATED_SPEC,
     SectionKind.FEES: _DATED_SPEC,
     SectionKind.OPEN_POSITIONS: _POSITION_SPEC,
+    SectionKind.CASH_REPORT: _CASH_REPORT_SPEC,
 }
 
 # The dividend-shaped and cash-shaped sections, in the order their rows
@@ -219,6 +243,7 @@ def assemble(document: RawDocument) -> ParsedStatement:
         dividends=tuple(_emit(document, _DIVIDEND_SECTIONS, _dividend_row)),
         cash_rows=tuple(_emit(document, _CASH_SECTIONS, _cash_row)),
         open_positions=tuple(_emit(document, (SectionKind.OPEN_POSITIONS,), _position_row)),
+        cash_report=tuple(_emit(document, (SectionKind.CASH_REPORT,), _cash_report_row)),
     )
 
 
@@ -354,7 +379,9 @@ def _resolve_columns(
     """Map logical field names to cell indices for one header row.
 
     Labels are compared with their whitespace collapsed — IB prints
-    `Comm in GBP` with a non-breaking space (U+00A0) in the HTML layout.
+    `Comm in GBP` with a non-breaking space (U+00A0) in the HTML layout
+    — so a spec may alias the empty string to name a column whose
+    header cell is blank (the Cash Report's label column).
     A one-cell header row is a banner, not a header, and yields
     `None` so the caller keeps its current map. A multi-cell header
     that does not carry every required label is a column set this
@@ -474,7 +501,17 @@ def _position_row(row: _DataRow) -> RawOpenPositionRow | None:
         symbol=lines[-1].strip(),
         description=" ".join(line.strip() for line in lines[:-1]),
         quantity_text=row.text("quantity"),
+        close_price_text=row.text("close_price"),
         multiplier_text=row.optional("multiplier"),
+    )
+
+
+def _cash_report_row(row: _DataRow) -> RawCashReportRow:
+    """One Cash Report line: the sub-header it sat under, its label and its `Total`."""
+    return RawCashReportRow(
+        currency=row.currency,
+        label=row.text("label"),
+        total_text=row.text("total"),
     )
 
 

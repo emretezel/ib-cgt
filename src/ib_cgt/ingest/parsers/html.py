@@ -62,6 +62,7 @@ _SECTION_DIV_PREFIXES: Final[tuple[tuple[str, SectionKind], ...]] = (
     ("tblCombDepWith_", SectionKind.DEPOSITS_WITHDRAWALS),
     ("tblCombFees_", SectionKind.FEES),
     ("tblOpenPositions_", SectionKind.OPEN_POSITIONS),
+    ("tblCashReport_", SectionKind.CASH_REPORT),
 )
 
 # CSS classes IB puts on the single colspan'd cell of a sub-header row

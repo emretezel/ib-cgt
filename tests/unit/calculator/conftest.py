@@ -55,6 +55,8 @@ from ib_cgt.domain import (
     AnyInstrument,
     BondCoupon,
     BondInstrument,
+    CorporateAction,
+    CorporateActionKind,
     CurrencyPair,
     Dividend,
     DividendKind,
@@ -168,6 +170,34 @@ def dividend(
     )
 
 
+def corporate_action(
+    instrument: AnyInstrument,
+    on: date,
+    qty: str,
+    cash: Money | None,
+    *,
+    kind: CorporateActionKind = CorporateActionKind.CASH_DISPOSAL,
+    account_id: str = "U1",
+) -> CorporateAction:
+    """A corporate action effective at 12:00 UTC on `on`.
+
+    `qty` is signed as the statement prints it (negative = units out);
+    `cash` is the consideration in whatever currency the issuer paid,
+    or `None` for an event with no cash leg.
+    """
+    return CorporateAction(
+        account_id=account_id,
+        kind=kind,
+        instrument=instrument,
+        effective_datetime=datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC),
+        effective_date=on,
+        report_date=on,
+        quantity=Decimal(qty),
+        cash=cash,
+        description=f"{instrument.symbol} corporate action",
+    )
+
+
 def coupon(
     instrument: BondInstrument, on: date, amount: str, *, account_id: str = "U1"
 ) -> BondCoupon:
@@ -250,7 +280,7 @@ def seed_baseline(conn: sqlite3.Connection) -> None:
     DividendRepo(conn).insert_many(
         [
             dividend(AAPL, DividendKind.CASH_DIVIDEND, date(2025, 4, 15), "50"),
-            dividend(AAPL, DividendKind.WITHHOLDING_TAX, date(2025, 4, 15), "7.50"),
+            dividend(AAPL, DividendKind.WITHHOLDING_TAX, date(2025, 4, 15), "-7.50"),
             dividend(ASML, DividendKind.CASH_DIVIDEND, date(2025, 4, 22), "12"),
         ],
         source_statement_hash=STATEMENT_HASH,

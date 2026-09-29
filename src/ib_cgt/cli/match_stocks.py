@@ -23,6 +23,7 @@ from ib_cgt.cli.common import (
     parse_iso_date,
 )
 from ib_cgt.cli.matching_render import (
+    corporate_action_labels,
     matched_disposal_to_cells,
     render_instrument_unmatched_disposals,
     trade_dates,
@@ -146,6 +147,7 @@ def _render_match_stocks_disposals(runs: Sequence[StockEngineRun]) -> None:
             console.print("  [dim](no matched disposals)[/]")
             continue
         date_map = trade_dates(run.trades)
+        id_labels = corporate_action_labels(run.corporate_actions)
         table = Table(header_style="bold", show_lines=False)
         table.add_column("Disp ID", justify="right")
         table.add_column("Disp Date")
@@ -159,19 +161,23 @@ def _render_match_stocks_disposals(runs: Sequence[StockEngineRun]) -> None:
         table.add_column("Acq Fees (GBP)", justify="right")
         table.add_column("Gain (GBP)", justify="right")
         for md in result.matched_disposals:
-            table.add_row(*matched_disposal_to_cells(md, date_map))
+            table.add_row(*matched_disposal_to_cells(md, date_map, id_labels))
         console.print(table)
 
 
 def _render_match_stocks_unmatched_disposals(runs: Sequence[StockEngineRun]) -> None:
     """Yellow block of every soft-residual unmatched disposal across stocks."""
+    id_labels: dict[int, str] = {}
+    for run in runs:
+        id_labels.update(corporate_action_labels(run.corporate_actions))
     render_instrument_unmatched_disposals(
         [
             (run.instrument, chunk)
             for run in runs
             if run.error is None and run.result is not None
             for chunk in run.result.unmatched_disposals
-        ]
+        ],
+        id_labels,
     )
 
 

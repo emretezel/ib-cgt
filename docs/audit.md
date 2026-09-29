@@ -34,6 +34,12 @@ In `match fx` output:
   cited by its `cash_events.cash_event_id`. The description column
   prints `<kind>: <IB description>`, e.g.
   `transfer: Electronic Fund Transfer`.
+- `CA #N` — a corporate action, cited by its
+  `corporate_actions.corporate_action_id`. The same label appears in
+  `match stocks` / `match bonds` as the disposal of the units and in
+  `match fx` as the acquisition of the cash (`corporate action IEMI
+  cash_disposal`): one event, one id (`5·10**12 + N` internally),
+  cited by every engine it touches.
 
 The synthetic integer ids the FX engine works with internally are
 never printed; the runner's provenance map
@@ -108,12 +114,14 @@ with a stock trade of the underlying at the strike for contracts ×
 multiplier at the same instant, in the right direction) and D7 (the
 persisted option run tables' trade ids resolve).
 
-## `ib-cgt show match --disposal <disposal_trade_id>`
+## `ib-cgt show match --disposal <disposal_trade_id>` / `--corporate-action <N>`
 
 Per-disposal chunk audit. Determines which currency pool(s) the
 disposal touches, re-runs the FX engine for those pools, and
 prints every matched chunk attached to the disposal in match
-order with running residual:
+order with running residual. `--corporate-action N` is the same
+audit for a corporate action's cash leg (`CA #N`; `--disposal` with
+the synthetic event id `5000000000000 + N` reaches the same rows):
 
 ```
 Disposal #5685 — forex GBP.CHF buy on 2018-02-21
@@ -156,7 +164,7 @@ every grant in `option_grants` can be found in `match stocks` /
 `match bonds` / `match fx` / `match futures` / `match options` output
 with the same ids and the same labels — the
 `Cpn #N` / `Cash #N` / `P&L #A→#B` notation is resolved for a
-persisted run through `fx_event_sources`. The command prints the
+persisted run through `event_sources`. The command prints the
 per-class summary, the warnings and (in red) the errors, then either
 `Persisted run #N …` or `Dry run — nothing persisted`, and exits 1
 iff an error-severity issue exists. The issues themselves are in
@@ -177,7 +185,7 @@ re-run `compute` for the year.
 The SA108 view of a persisted run — see [`reporting.md`](./reporting.md)
 for the box mapping and the working-sheet conventions. Every line of
 every computation cites its events in the notation above, resolved
-from the run's `fx_event_sources` rows rather than a live engine pass:
+from the run's `event_sources` rows rather than a live engine pass:
 `#N` for a trade (`show trade N`), `Div #N` / `WHT #N` / `Cpn #N` /
 `Cash #N` for the non-trade cashflows, and `P&L #A→#B` for a futures
 close-out (`show realisation --close B`). A written option's line

@@ -16,7 +16,13 @@ Author: Emre Tezel
 from __future__ import annotations
 
 from ib_cgt.domain.bond_coupons import BondCoupon, InvalidBondCouponError
+from ib_cgt.domain.cash_balances import InvalidStatementCashBalanceError, StatementCashBalance
 from ib_cgt.domain.cash_events import CashEvent, CashEventKind, InvalidCashEventError
+from ib_cgt.domain.corporate_actions import (
+    CorporateAction,
+    CorporateActionKind,
+    InvalidCorporateActionError,
+)
 from ib_cgt.domain.disposal import (
     Acquisition,
     DirectAcquisition,
@@ -37,12 +43,13 @@ from ib_cgt.domain.disposal import (
 )
 from ib_cgt.domain.dividends import Dividend, DividendKind, InvalidDividendError
 from ib_cgt.domain.enums import AssetClass, MatchRule, OptionCloseKind, OptionRight, TradeAction
-from ib_cgt.domain.fx_events import (
+from ib_cgt.domain.event_sources import (
     BondCouponRef,
     CashEventRef,
+    CorporateActionRef,
     DividendRef,
+    EventSource,
     FutureRealisationRef,
-    FXEventSource,
 )
 from ib_cgt.domain.money import (
     CurrencyMismatchError,
@@ -85,6 +92,9 @@ __all__ = [
     "CashEvent",
     "CashEventKind",
     "CashEventRef",
+    "CorporateAction",
+    "CorporateActionKind",
+    "CorporateActionRef",
     "CurrencyMismatchError",
     "CurrencyPair",
     "DirectAcquisition",
@@ -92,7 +102,7 @@ __all__ = [
     "Dividend",
     "DividendKind",
     "DividendRef",
-    "FXEventSource",
+    "EventSource",
     "FXInstrument",
     "FutureInstrument",
     "FutureRealisation",
@@ -100,9 +110,11 @@ __all__ = [
     "Instrument",
     "InvalidBondCouponError",
     "InvalidCashEventError",
+    "InvalidCorporateActionError",
     "InvalidDividendError",
     "InvalidInstrumentError",
     "InvalidRunIssueError",
+    "InvalidStatementCashBalanceError",
     "InvalidStatementPositionError",
     "InvalidTaxYearError",
     "InvalidTradeError",
@@ -121,6 +133,7 @@ __all__ = [
     "OptionRight",
     "RunIssue",
     "RunIssueKind",
+    "StatementCashBalance",
     "StatementPosition",
     "StockInstrument",
     "TaxLot",

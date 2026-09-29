@@ -64,7 +64,7 @@ keeps their order.
 
 - `UNIQUE (run_id, open_trade_id, close_trade_id)` — one open slice
   is drained at most once per close trade, so the pair identifies a
-  realisation within a run. It is also the key `fx_event_sources`
+  realisation within a run. It is also the key `event_sources`
   uses to point a synthetic FX event id back at a realisation.
 
 ## CHECK constraints

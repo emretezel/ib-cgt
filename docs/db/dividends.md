@@ -34,9 +34,25 @@ survives, no quantity of shares is transacted, and there is no
 per-unit price being negotiated. Reusing `trades` would mean
 loosening `Trade._check_action_vs_instrument` invariants and forcing
 every BUY/SELL consumer to filter out a non-trade action — an
-AGENTS.md rule 3 violation. Cash-for-shares mergers go into `trades`
-because they *are* forced sales (the instrument vanishes); dividends
-do not.
+AGENTS.md rule 3 violation. Cash-for-shares mergers go into
+[`corporate_actions`](./corporate_actions.md) because they *are*
+forced disposals (the instrument vanishes); dividends do not.
+
+## The signed-amount convention
+
+Since migration `024` `amount_native` is **signed as printed**, like
+[`cash_events.amount_native`](./cash_events.md). Direction is the
+sign: positive means currency arrived in the balance (an FX-pool
+**acquisition**), negative means it left (a **disposal** of the
+absolute amount). A cash dividend or a payment in lieu is normally
+positive and withholding tax normally negative — but a payment in
+lieu *paid* on a short position is negative (TUR, −887.72 USD on
+2019-06-21) and a withholding refund is positive (four reversals in
+January 2017), and the old mapper's `abs()` booked each of those the
+wrong way round, leaving the USD pool 516.35 USD out against IB's
+Cash Report. `kind` therefore records the row's **nature** and is
+never consulted for direction. A zero row is rejected by the domain
+object and by the schema.
 
 ## Columns
 
@@ -47,7 +63,7 @@ do not.
 | `symbol` | `TEXT` | No | The IB security tag printed on the row (`AAPL` from `AAPL(US0378331005) Cash Dividend …`). An audit label, not a reference: nothing joins it to `stock_instruments`. CHECK-constrained non-empty. |
 | `kind` | `TEXT` | No | One of `cash_dividend`, `withholding_tax`, `payment_in_lieu` (CHECK-constrained). |
 | `pay_date` | `TEXT` | No | `YYYY-MM-DD` payment date — when the cash hits the foreign-currency balance. The FX rate at this date is what the projector applies for GBP conversion. |
-| `amount_native` | `TEXT` | No | Decimal string, **strictly positive**. Direction of cash movement is encoded in `kind`, never via a sign on the amount (mirrors the `Trade.quantity > 0` / sign-on-`action` convention). |
+| `amount_native` | `TEXT` | No | **Signed** Decimal string, never zero (see above). Positive = an FX-pool acquisition on `pay_date`, negative = a disposal of the absolute amount. |
 | `currency` | `TEXT` | No | ISO-4217 currency of `amount_native` — the payment currency, which may differ from the currency the stock trades in. |
 | `description` | `TEXT` | No | Raw IB description string verbatim (e.g. `"AAPL(US0378331005) Cash Dividend USD 0.24 per Share (Mixed Income)"`). The forensic anchor that lets a future `show dividend <id>` audit command reconcile a stored row to its source HTML row. |
 | `statement_row_index` | `INTEGER` | No | Zero-based offset within the dividend section of the source statement; assigned at ingest from `enumerate(map_dividends(...))`. Independent of the `trades.statement_row_index` space — each table owns its own row-index counter. |
@@ -88,6 +104,8 @@ every dividend that pointed at it.
   — the documented row variants. A future variant (e.g. dividend
   reclassified as return-of-capital) requires a migration that
   expands the CHECK list.
+- `CAST(amount_native AS REAL) <> 0` (migration `024`) — a row that
+  moves nothing is a parse error; check **A13** repeats the test.
 - `statement_row_index >= 0` — sanity guard.
 - `length(symbol) > 0` — the security tag is never blank.
 
@@ -126,61 +144,65 @@ every dividend that pointed at it.
 - `ib-cgt match fx` — primary consumer. Cash-dividend events show
   up in the Disp ID / Acq ID column as `Div #N`, withholding-tax
   events as `WHT #N`, where `N` is the real `dividend_id`.
+- `ib-cgt check data` — check **A13** (referential integrity, date,
+  non-zero amount).
 
 ## Sample (first 5 rows)
 
-Captured after migration `021` with
+Captured after the migration `024` re-ingest with
 `SELECT dividend_id, account_id, symbol, kind, pay_date, amount_native, currency, description, statement_row_index FROM dividends LIMIT 5;`
-from the live DB, rendered as `column = value` blocks.
+from the live DB, rendered as `column = value` blocks. The first rows
+are the 2013 PDF statement's; its withholding rows (ids 7–9) carry
+negative amounts (`-13.73`, `-29.74`, `-20.93` USD).
 
 ```
         dividend_id = 1
          account_id = U1004320
-             symbol = RGR
+             symbol = AAPL
                kind = cash_dividend
-           pay_date = 2017-11-30
-      amount_native = 33.60
+           pay_date = 2013-05-16
+      amount_native = 91.51
            currency = USD
-        description = RGR(US8641591081) Cash Dividend 0.21000000 USD per Share (Ordinary Dividend)
+        description = AAPL Dividend 3.05 USD per Share (Ordinary Dividend)
 statement_row_index = 0
 
         dividend_id = 2
          account_id = U1004320
-             symbol = MOV
+             symbol = AAPL
                kind = cash_dividend
-           pay_date = 2017-12-15
-      amount_native = 39.00
+           pay_date = 2013-08-15
+      amount_native = 198.25
            currency = USD
-        description = MOV(US6245801062) Cash Dividend 0.13000000 USD per Share (Ordinary Dividend)
+        description = AAPL Dividend 3.05 USD per Share (Ordinary Dividend)
 statement_row_index = 1
 
         dividend_id = 3
          account_id = U1004320
-             symbol = BIG
+             symbol = INTC
                kind = cash_dividend
-           pay_date = 2017-12-29
-      amount_native = 37.51
+           pay_date = 2013-09-01
+      amount_native = 139.51
            currency = USD
-        description = BIG(US0893021032) Cash Dividend 0.25000000 USD per Share (Ordinary Dividend)
+        description = INTC Dividend .225 USD per Share (Ordinary Dividend)
 statement_row_index = 2
 
         dividend_id = 4
          account_id = U1004320
-             symbol = BBBY
+             symbol = AAPL
                kind = cash_dividend
-           pay_date = 2018-01-16
-      amount_native = 30.00
+           pay_date = 2013-11-14
+      amount_native = 198.25
            currency = USD
-        description = BBBY(US0758961009) Cash Dividend 0.15000000 USD per Share (Ordinary Dividend)
+        description = AAPL Dividend 3.05 USD per Share (Ordinary Dividend)
 statement_row_index = 3
 
         dividend_id = 5
          account_id = U1004320
-             symbol = BKE
-               kind = cash_dividend
-           pay_date = 2018-01-26
-      amount_native = 100.00
+             symbol = INTC
+               kind = payment_in_lieu
+           pay_date = 2013-12-01
+      amount_native = 8.10
            currency = USD
-        description = BKE(US1184401065) Cash Dividend 0.25000000 USD per Share (Ordinary Dividend)
+        description = INTC Payment in Lieu of Dividend (Ordinary Dividend)
 statement_row_index = 4
 ```

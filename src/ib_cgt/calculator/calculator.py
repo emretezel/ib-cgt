@@ -31,17 +31,29 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 
+from ib_cgt.calculator.cash_balances import (
+    CashBalanceReconciliation,
+    CashBalanceStatus,
+    reconcile_cash_balances,
+)
 from ib_cgt.calculator.positions import (
     PositionReconciliation,
     PositionStatus,
     instrument_reconciles,
     reconcile_positions,
 )
-from ib_cgt.calculator.runner import run_engines
-from ib_cgt.calculator.runs import EngineFailure, EngineOutputs, FXEngineRun, OptionEngineRun
+from ib_cgt.calculator.runner import corporate_action_id_of, load_fx_inputs, run_engines
+from ib_cgt.calculator.runs import (
+    BondEngineRun,
+    EngineFailure,
+    EngineOutputs,
+    FXEngineRun,
+    OptionEngineRun,
+    StockEngineRun,
+)
 from ib_cgt.db import (
+    EventSourceRepo,
     FutureRealisationRepo,
-    FXEventSourceRepo,
     MatchedDisposalRepo,
     OptionExerciseTransferRepo,
     OptionGrantRepo,
@@ -53,8 +65,9 @@ from ib_cgt.db import (
 )
 from ib_cgt.domain import (
     AnyInstrument,
+    CorporateActionRef,
+    EventSource,
     FutureRealisation,
-    FXEventSource,
     IssueSeverity,
     MatchedDisposal,
     OptionCloseKind,
@@ -82,14 +95,14 @@ class TaxYearComputation:
     Attributes:
         report: The year's chunks, realisations and per-class totals.
         issues: Errors and warnings, errors first, in derivation order.
-        fx_event_sources: The synthetic-id provenance the persisted
+        event_sources: The synthetic-id provenance the persisted
             chunks reference — the subset of the runner's map that a
             row in `report.matched_disposals` actually cites.
     """
 
     report: TaxYearReport
     issues: tuple[RunIssue, ...]
-    fx_event_sources: Mapping[int, FXEventSource]
+    event_sources: Mapping[int, EventSource]
 
     @property
     def errors(self) -> tuple[RunIssue, ...]:
@@ -145,7 +158,7 @@ def load_persisted_run(conn: sqlite3.Connection, tax_year: TaxYear) -> Persisted
     computation = TaxYearComputation(
         report=report,
         issues=tuple(TaxRunIssueRepo(conn).for_run(run.run_id)),
-        fx_event_sources=FXEventSourceRepo(conn).for_run(run.run_id),
+        event_sources=EventSourceRepo(conn).for_run(run.run_id),
     )
     return PersistedRun(run=run, computation=computation)
 
@@ -197,20 +210,29 @@ def build_report(outputs: EngineOutputs, tax_year: TaxYear) -> TaxYearReport:
     return TaxYearReport.build(tax_year, chunks, realisations, grants, transfers)
 
 
-def referenced_fx_sources(
+def referenced_event_sources(
     outputs: EngineOutputs, report: TaxYearReport
-) -> dict[int, FXEventSource]:
+) -> dict[int, EventSource]:
     """The synthetic ids the report's chunks cite, mapped to their provenance.
 
     Only ids that appear on a persisted row are kept, so the stored
     map is exactly what a reader of `matched_disposals` needs and no
     more. Every FX run shares one `FXInputs`, so the first successful
-    run's map is the map.
+    run's map is the map; the corporate actions the stock and bond
+    runs carry are added from those runs directly, because a history
+    with no non-GBP pool has no FX run at all and a GBP-cash disposal
+    is cited by a stock or bond chunk regardless.
     """
-    sources: Mapping[int, FXEventSource] = {}
+    sources: dict[int, EventSource] = {}
     for fx_run in outputs.fx:
-        sources = fx_run.inputs.sources
+        sources.update(fx_run.inputs.sources)
         break
+    action_runs: list[StockEngineRun | BondEngineRun] = [*outputs.stocks, *outputs.bonds]
+    for run in action_runs:
+        for event_id, _action in run.corporate_actions:
+            action_id = corporate_action_id_of(event_id)
+            if action_id is not None:
+                sources[event_id] = CorporateActionRef(corporate_action_id=action_id)
     cited: set[int] = set()
     for chunk in report.matched_disposals:
         cited.add(chunk.disposal_trade_id)
@@ -244,9 +266,9 @@ def _matching_results(outputs: EngineOutputs) -> Iterable[MatchingResult]:
 class Calculator:
     """Compute, persist and load one tax year's CGT figures.
 
-    One instance memoises the whole-history engine pass and the
-    position reconciliation, so computing several years on the same
-    connection runs the engines once.
+    One instance memoises the whole-history engine pass, the position
+    reconciliation and the cash-balance reconciliation, so computing
+    several years on the same connection runs each of them once.
     """
 
     def __init__(self, conn: sqlite3.Connection, fx: FXConverter) -> None:
@@ -255,6 +277,7 @@ class Calculator:
         self._fx = fx
         self._outputs: EngineOutputs | None = None
         self._reconciliations: tuple[PositionReconciliation, ...] | None = None
+        self._cash_reconciliations_cache: tuple[CashBalanceReconciliation, ...] | None = None
 
     # ------------------------------------------------------------------
     # Compute
@@ -268,7 +291,7 @@ class Calculator:
         return TaxYearComputation(
             report=report,
             issues=tuple(issues),
-            fx_event_sources=referenced_fx_sources(outputs, report),
+            event_sources=referenced_event_sources(outputs, report),
         )
 
     def _engine_outputs(self) -> EngineOutputs:
@@ -283,6 +306,26 @@ class Calculator:
             self._reconciliations = reconcile_positions(self._conn)
         return self._reconciliations
 
+    def _cash_reconciliations(self) -> tuple[CashBalanceReconciliation, ...]:
+        """The memoised pool-vs-Cash-Report reconciliation.
+
+        Reads the FX input bundle the pools were matched from — every
+        FX run shares one — so the two views of a balance can never
+        drift apart. A history with no non-GBP pool has no FX run;
+        the bundle is then loaded directly (it still carries the
+        currencies IB's balances may name).
+        """
+        if self._cash_reconciliations_cache is None:
+            outputs = self._engine_outputs()
+            if outputs.fx:
+                inputs = outputs.fx[0].inputs
+            else:
+                inputs = load_fx_inputs(self._conn, future_runs=outputs.futures)
+            self._cash_reconciliations_cache = reconcile_cash_balances(
+                self._conn, self._fx, fx_inputs=inputs
+            )
+        return self._cash_reconciliations_cache
+
     def _derive_issues(
         self, outputs: EngineOutputs, report: TaxYearReport, tax_year: TaxYear
     ) -> list[RunIssue]:
@@ -291,16 +334,18 @@ class Calculator:
         1. one issue per captured engine failure;
         2. one `position_mismatch` per instrument whose trades and
            latest statements disagree;
-        3. one `open_short_position` per residual stock / bond / option
+        3. one `cash_balance_mismatch` per account and currency whose
+           projected pool events disagree with the Cash Report;
+        4. one `open_short_position` per residual stock / bond / option
            chunk whose instrument *does* reconcile (the statement
            confirms the short) — dated inside the year;
-        4. one `fx_residual` per FX pool with in-year residual chunks;
-        5. one `option_grant_restated` per in-year close of a grant
+        5. one `fx_residual` per FX pool with in-year residual chunks;
+        6. one `option_grant_restated` per in-year close of a grant
            charged in an earlier year, and one
            `option_exercise_unlinked` per in-year exercise treated as
            cash-settled;
-        6. per account with a statement, the history-coverage warning;
-        7. `empty_year` when the year has no rows at all.
+        7. per account with a statement, the history-coverage warning;
+        8. `empty_year` when the year has no rows at all.
         """
         errors: list[RunIssue] = []
         warnings: list[RunIssue] = []
@@ -321,6 +366,21 @@ class Calculator:
                         f"statements list {_fmt_stated(rec.statement_quantity)} "
                         f"({rec.describe_accounts()})"
                     ),
+                )
+            )
+
+        # The pools and IB's Cash Report must agree on every account's
+        # holding of every currency; a gap means a source is missing and
+        # every later disposal of that currency is matched on a wrong
+        # cost, so it fails the run like a position mismatch does.
+        for cash_rec in self._cash_reconciliations():
+            if cash_rec.status is CashBalanceStatus.MATCH:
+                continue
+            errors.append(
+                RunIssue(
+                    kind=RunIssueKind.CASH_BALANCE_MISMATCH,
+                    instrument=make_pool_instrument(cash_rec.currency),
+                    message=cash_rec.describe(),
                 )
             )
 
@@ -380,7 +440,7 @@ class Calculator:
             OptionExerciseTransferRepo(self._conn).insert_many(
                 run_id, report.option_exercise_transfers
             )
-            FXEventSourceRepo(self._conn).insert_many(run_id, computation.fx_event_sources)
+            EventSourceRepo(self._conn).insert_many(run_id, computation.event_sources)
             TaxRunIssueRepo(self._conn).insert_many(run_id, computation.issues)
         return run_id
 
@@ -570,5 +630,5 @@ __all__ = [
     "TaxYearComputation",
     "build_report",
     "load_persisted_run",
-    "referenced_fx_sources",
+    "referenced_event_sources",
 ]

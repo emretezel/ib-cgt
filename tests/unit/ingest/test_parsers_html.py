@@ -444,6 +444,10 @@ def test_parse_open_positions_rows() -> None:
     assert rows[("Stocks", "IEMI")].currency == "USD"
     assert rows[("Futures", "6LK6")].currency == "USD"
     assert rows[("Equity and Index Options", "TUR 17MAY26 22.0 P")].multiplier_text == "100"
+    # The Close Price column is on every vintage's table and travels verbatim.
+    assert rows[("Stocks", "IEAA")].close_price_text == "5.3350"
+    assert rows[("Futures", "6LK6")].close_price_text == "0.1923"
+    assert rows[("Bonds", "UKT 0 3/8 10/22/26")].close_price_text == "98.1240"
 
 
 def test_parse_open_positions_keeps_thousand_separators_and_sign() -> None:
@@ -547,3 +551,35 @@ def test_parse_cash_rows_skip_asset_header_subtotal_and_total() -> None:
     descriptions = [row.description for row in parsed.cash_rows]
     assert "Other Fees" not in descriptions
     assert not any(text.startswith("Total") for text in descriptions)
+
+
+# ---------------------------------------------------------------------------
+# Cash Report section
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cash_report_rows_per_currency() -> None:
+    """Every line of the Cash Report is emitted under the sub-header it sat beneath."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    rows = [(r.currency, r.label, r.total_text) for r in parsed.cash_report]
+    assert ("Base Currency Summary", "Starting Cash", "10,293.40") in rows
+    assert ("EUR", "Internal Transfers", "1,000.00") in rows
+    assert ("JPY", "Ending Cash", "-15") in rows
+    assert ("USD", "Starting Cash", "212.10") in rows
+    assert ("USD", "Ending Cash", "1,127.55") in rows
+    # Only the Total column is read.
+    assert all(len(r.total_text) > 0 for r in parsed.cash_report)
+
+
+def test_parse_cash_report_skips_the_sub_block_bands() -> None:
+    """`Cash Detail` and `Collateral Value Detail` are one-cell rows, not lines."""
+    parsed = parse_statement(_load("with_open_positions.htm"))
+    labels = {r.label for r in parsed.cash_report}
+    assert "Cash Detail" not in labels
+    assert "Collateral Value Detail" not in labels
+    assert "Starting Collateral Value" in labels
+
+
+def test_parse_cash_report_absent_section_yields_empty_tuple() -> None:
+    parsed = parse_statement(_load("mixed_tiny.htm"))
+    assert parsed.cash_report == ()

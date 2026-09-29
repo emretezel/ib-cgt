@@ -92,6 +92,7 @@ def map_open_positions(
                 account_id=parsed.account_id,
                 instrument=instrument,
                 quantity=quantity,
+                close_price=parse_close_price(raw),
             )
         )
     return positions, leftovers
@@ -120,4 +121,20 @@ def _parse_quantity(raw: RawOpenPositionRow) -> Decimal:
         ) from exc
 
 
-__all__ = ["map_open_positions"]
+def parse_close_price(raw: RawOpenPositionRow) -> Decimal:
+    """Parse the comma-formatted Close Price cell as printed.
+
+    Public so the ingestor can build the positions it resolves against
+    the database (held-over contracts with no instrument-information
+    row) the same way.
+    """
+    cleaned = raw.close_price_text.replace(",", "").strip()
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise MappingError(
+            f"Unparseable open-position close price {raw.close_price_text!r} for {raw.symbol!r}"
+        ) from exc
+
+
+__all__ = ["map_open_positions", "parse_close_price"]

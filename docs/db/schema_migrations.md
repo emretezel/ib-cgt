@@ -12,7 +12,7 @@ prefix on the migration filename (e.g. `001_initial.sql` → `1`).
 
 One file per version in
 [`src/ib_cgt/db/migrations/`](../../src/ib_cgt/db/migrations); the live
-database is at version `23`.
+database is at version `24`.
 
 | Version | File | Kind |
 |---|---|---|
@@ -39,24 +39,30 @@ database is at version `23`.
 | 21 | `021_instrument_conid_identity.sql` | schema, wipe-and-rebuild |
 | 22 | `022_statement_time_zone.sql` | schema, wipe-and-rebuild |
 | 23 | `023_options.sql` | schema, wipe-and-rebuild |
+| 24 | `024_corporate_actions_and_cash_report.sql` | schema, wipe-and-rebuild |
 
 A **wipe-and-rebuild** migration deletes every statement-derived row
 and every run, because the change alters how statements are read and
 therefore the trade ids every persisted run cites; `accounts`,
 `fx_rates` and this table are untouched, and the user re-ingests after
-`ib-cgt db init`. `023_options.sql` is the latest: it `DELETE`s
-`tax_runs`, `statements` and `instruments` (children cascade), rebuilds
-`instruments` with the discriminator CHECK widened to `'option'`
-(create new → drop → rename, since SQLite cannot alter a CHECK),
-recreates `v_instruments` with the option arm, creates the five option
-tables ([`option_instruments`](./option_instruments.md),
-[`option_exercise_links`](./option_exercise_links.md),
-[`option_grants`](./option_grants.md),
-[`option_grant_closes`](./option_grant_closes.md),
-[`option_exercise_transfers`](./option_exercise_transfers.md)) and
-drops and recreates [`tax_run_issues`](./tax_run_issues.md) with the
-two new kinds in its CHECK. The full rationale is in the file's header
-comment.
+`ib-cgt db init`. `024_corporate_actions_and_cash_report.sql` is the
+latest: it `DELETE`s `tax_runs` and `statements` (children cascade;
+`instruments`, `accounts` and `fx_rates` survive), creates
+[`corporate_actions`](./corporate_actions.md) and
+[`statement_cash_balances`](./statement_cash_balances.md), rebuilds
+[`statement_positions`](./statement_positions.md) with `close_price`
+(create new → drop → rename, since SQLite cannot add a `NOT NULL`
+column without a default), recreates
+[`dividends`](./dividends.md) with the non-zero CHECK so the amount
+can be stored signed, replaces `fx_event_sources` with
+[`event_sources`](./event_sources.md) (the fifth kind,
+`CORPORATE_ACTION`), and recreates
+[`tax_run_issues`](./tax_run_issues.md) with `cash_balance_mismatch`
+in its CHECK. The wipe is needed because dividend signs, corporate-
+action legs, close prices and cash balances exist only in the
+statement files. The full rationale is in the file's header comment.
+`023_options.sql` before it widened `instruments` to options and
+created the five option tables.
 
 ## Columns
 

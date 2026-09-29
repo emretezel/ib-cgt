@@ -97,8 +97,8 @@ def test_payment_in_lieu_row_maps_to_payment_in_lieu_kind() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_withholding_section_emits_wht_kind_with_absolute_amount() -> None:
-    """A WHT-section row → WITHHOLDING_TAX with `abs(amount)`."""
+def test_withholding_section_emits_wht_kind_and_keeps_the_printed_sign() -> None:
+    """A WHT-section row → WITHHOLDING_TAX with the amount signed as printed."""
     parsed = _make_parsed(
         [
             _div_row(
@@ -110,9 +110,51 @@ def test_withholding_section_emits_wht_kind_with_absolute_amount() -> None:
     )
     [div] = map_dividends(parsed)
     assert div.kind is DividendKind.WITHHOLDING_TAX
-    # Absolute value — direction is encoded in `kind`, not the sign of
-    # the amount (mirrors `Trade.quantity > 0` with sign on `action`).
-    assert div.amount.amount == Decimal("4.50")
+    # The sign is the direction: tax debited at source is cash leaving.
+    assert div.amount.amount == Decimal("-4.50")
+    assert div.is_inflow is False
+
+
+def test_positive_withholding_row_is_a_reversal_and_stays_positive() -> None:
+    """IB re-books withholding as a negative charge plus a positive reversal.
+
+    January 2017: FF's 2.29 USD dividend printed -206.10, +206.10,
+    -412.20, +412.20, -206.10 under `- US Tax`. The positive rows are
+    refunds — cash arriving — and must not be flipped into charges.
+    """
+    parsed = _make_parsed(
+        [
+            _div_row(
+                section="withholding_tax",
+                description="FF(US36116M1062) Cash Dividend 2.29000000 USD per Share - US Tax",
+                amount_text="206.10",
+            ),
+        ]
+    )
+    [div] = map_dividends(parsed)
+    assert div.kind is DividendKind.WITHHOLDING_TAX
+    assert div.amount.amount == Decimal("206.10")
+    assert div.is_inflow is True
+
+
+def test_negative_payment_in_lieu_is_cash_paid_and_stays_negative() -> None:
+    """A payment in lieu owed on a short is printed negative and stays negative.
+
+    TUR, 2019-06-21: the account was short 1,500 shares over the
+    record date and paid -887.72 USD in lieu of the dividend.
+    """
+    parsed = _make_parsed(
+        [
+            _div_row(
+                description="TUR(US4642867158) Payment in Lieu of Dividend (Ordinary Dividend)",
+                amount_text="-887.72",
+            ),
+        ]
+    )
+    [div] = map_dividends(parsed)
+    assert div.kind is DividendKind.PAYMENT_IN_LIEU
+    assert div.amount.amount == Decimal("-887.72")
+    assert div.is_inflow is False
 
 
 # ---------------------------------------------------------------------------

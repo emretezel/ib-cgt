@@ -85,11 +85,12 @@ def _detect_all_currencies(conn: sqlite3.Connection) -> list[str]:
     `v_instruments` view, so this code does not know about the table
     split), the *quote* leg of every forex pair (`EUR.NOK` acquires
     EUR and disposes of NOK — the instrument's currency is only EUR),
-    and the currencies of dividends, bond coupons and cash events (a
-    currency can exist purely as broker interest). Each source has an
-    index led by its currency column, so the UNION walks indexes rather
-    than heaps; the result is a handful of codes, sorted so the Rich
-    table output is deterministic.
+    the currencies of dividends, bond coupons and cash events (a
+    currency can exist purely as broker interest), and the cash
+    currency of every corporate action (a GBP-listed fund paid out in
+    USD). Each source has an index led by its currency column, so the
+    UNION walks indexes rather than heaps; the result is a handful of
+    codes, sorted so the Rich table output is deterministic.
     """
     rows = conn.execute(
         "SELECT currency FROM v_instruments "
@@ -97,6 +98,7 @@ def _detect_all_currencies(conn: sqlite3.Connection) -> list[str]:
         "UNION SELECT currency FROM dividends "
         "UNION SELECT currency FROM bond_coupons "
         "UNION SELECT currency FROM cash_events "
+        "UNION SELECT cash_currency FROM corporate_actions WHERE cash_currency IS NOT NULL "
         "ORDER BY 1"
     ).fetchall()
     return [str(r[0]) for r in rows if r[0] != "GBP"]

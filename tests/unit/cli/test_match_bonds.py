@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,6 +24,7 @@ from typer.testing import CliRunner
 from ib_cgt.cli import app
 from ib_cgt.db import (
     AccountRepo,
+    CorporateActionRepo,
     FXRateRepo,
     StatementRepo,
     TradeRepo,
@@ -34,6 +35,8 @@ from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import (
     Account,
     BondInstrument,
+    CorporateAction,
+    CorporateActionKind,
     Money,
     Trade,
     TradeAction,
@@ -468,12 +471,12 @@ def test_match_bonds_summary_shows_realised_gain_for_non_exempt_only(
 
 
 def _seed_gilt_with_maturity(conn: sqlite3.Connection) -> None:
-    """Buy + synthesised maturity SELL on one gilt — the user's real shape.
+    """Buy + the maturity on one gilt — the user's real shape.
 
-    The maturity SELL in production is built by
-    `ingest.corporate_actions.map_bond_maturities`. From the engine's
-    point of view it is an ordinary SELL, so the test seeds it via
-    `TradeRepo.insert_many` exactly like any other trade.
+    The maturity is a corporate action (`cash_disposal` of the face
+    value for the redemption cash at par), stored through
+    `CorporateActionRepo` exactly as ingest stores it; the bond engine
+    counts it as a sell in the exempt summary.
     """
     _record_statement(conn, "hash-gilt-maturity")
     bond = _gilt_a()
@@ -487,17 +490,25 @@ def _seed_gilt_with_maturity(conn: sqlite3.Connection) -> None:
             price=Decimal("0.98602"),
             fees=Decimal("0"),
         ),
-        _bond_trade(
-            instrument=bond,
-            action=TradeAction.SELL,
-            day=20,
-            qty=Decimal("250000"),
-            # Maturity at par (cash-per-bond = 1.00).
-            price=Decimal("1.00"),
-            fees=Decimal("0"),
-        ),
     ]
     TradeRepo(conn).insert_many(trades, source_statement_hash="hash-gilt-maturity")
+    CorporateActionRepo(conn).insert_many(
+        [
+            CorporateAction(
+                account_id="U1",
+                kind=CorporateActionKind.CASH_DISPOSAL,
+                instrument=bond,
+                effective_datetime=datetime(2025, 4, 20, 1, 25, tzinfo=UTC),
+                effective_date=date(2025, 4, 20),
+                report_date=date(2025, 4, 20),
+                quantity=Decimal("-250000"),
+                # Maturity at par: the redemption cash equals the face value.
+                cash=Money.of("250000", "GBP"),
+                description=f"({bond.isin})  Bond Maturity FOR GBP 1.00 PER BOND",
+            )
+        ],
+        source_statement_hash="hash-gilt-maturity",
+    )
     conn.execute(
         "UPDATE bond_instruments SET is_cgt_exempt = 1 WHERE symbol = ?",
         (bond.symbol,),
@@ -522,14 +533,11 @@ def gilt_with_maturity_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> It
 def test_match_bonds_exempt_table_shows_maturity_as_sell(
     runner: CliRunner, gilt_with_maturity_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A bond-maturity SELL on an exempt gilt surfaces as Sells=1.
+    """A maturity on an exempt gilt surfaces as Sells=1.
 
-    Pre-fix the user's `match bonds` showed `Sells: 0` for every gilt
-    because maturity Corporate Actions rows were silently dropped at
-    ingest. With the new `map_bond_maturities` synthesiser the SELL
-    flows through normal trade ingestion and the engine sees it as
-    an ordinary disposal — even though the gilt's CGT-exempt status
-    means the totals are reported, not matched.
+    The maturity is a corporate action the bond engine counts as a
+    sell in the exempt summary — the gilt's CGT-exempt status means
+    the totals are reported, not matched.
     """
     monkeypatch.setenv("COLUMNS", "260")
     result = runner.invoke(app, ["match", "bonds"])

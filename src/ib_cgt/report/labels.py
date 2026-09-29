@@ -3,7 +3,8 @@
 The audit commands (`match fx`, `show match`, …) print every event
 under a citeable label — `#N` for a trade, `Div #N` / `WHT #N` for a
 dividend row, `Cpn #N` for a coupon, `Cash #N` for a cash movement,
-`P&L #a→#b` for a futures close-out — documented in `docs/audit.md`.
+`CA #N` for a corporate action, `P&L #a→#b` for a futures close-out —
+documented in `docs/audit.md`.
 The report uses the same vocabulary so a line in the computations can
 be followed back through `ib-cgt show trade N` to the IB statement.
 These are pure string functions; resolving an id to the row behind it
@@ -27,6 +28,7 @@ from ib_cgt.domain import (
     BondCoupon,
     BondInstrument,
     CashEvent,
+    CorporateAction,
     Dividend,
     DividendKind,
     FutureInstrument,
@@ -70,6 +72,16 @@ def coupon_label(bond_coupon_id: int) -> str:
 def cash_label(cash_event_id: int) -> str:
     """`Cash #N` — an instrument-less cash movement, by its `cash_events.cash_event_id`."""
     return f"Cash #{cash_event_id}"
+
+
+def corporate_action_label(corporate_action_id: int) -> str:
+    """`CA #N` — a corporate action, by its `corporate_actions.corporate_action_id`.
+
+    The same label names the event wherever it is cited: the stock or
+    bond disposal it constituted and the cash it put into a currency
+    pool share one synthetic id.
+    """
+    return f"CA #{corporate_action_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +130,19 @@ def coupon_description(coupon: BondCoupon) -> str:
 def cash_description(event: CashEvent) -> str:
     """`interest: USD Credit Interest for Mar-2025` — the kind, then IB's own words."""
     return f"{event.kind.value}: {event.description}"
+
+
+def corporate_action_description(action: CorporateAction) -> str:
+    """`corporate action IEMI cash_disposal` — the security and what the engines made of it.
+
+    An unsupported row whose security could not be resolved has no
+    symbol; the first word of IB's description stands in.
+    """
+    if action.instrument is not None:
+        name = action.instrument.symbol
+    else:
+        name = action.description.split(maxsplit=1)[0] if action.description.split() else "?"
+    return f"corporate action {name} {action.kind.value}"
 
 
 def transfer_note(transfer: OptionExerciseTransfer) -> str:
@@ -232,6 +257,8 @@ __all__ = [
     "cash_description",
     "cash_label",
     "close_kind_label",
+    "corporate_action_description",
+    "corporate_action_label",
     "coupon_description",
     "coupon_label",
     "dividend_description",

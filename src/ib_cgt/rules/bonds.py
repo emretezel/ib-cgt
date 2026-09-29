@@ -42,6 +42,13 @@ S.104 pools span every account belonging to the taxpayer (per
 expected to feed in trades for the bond across **all** accounts.
 The engine does not filter by `account_id`.
 
+A maturity is a corporate action, not a trade: the runner hands it
+in as a `CorporateAction` (`cash_disposal` kind) and the engine
+disposes of the face value for the redemption cash at the effective
+date — an exempt gilt's redemption is counted in its summary, a
+non-exempt bond's goes through the matcher. The redemption cash
+reaches the FX pool under the same event id.
+
 Author: Emre Tezel
 """
 
@@ -49,6 +56,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
 from ib_cgt.domain import (
@@ -56,6 +64,7 @@ from ib_cgt.domain import (
     AnyInstrument,
     AssetClass,
     BondInstrument,
+    CorporateAction,
     Disposal,
     Money,
     Trade,
@@ -79,13 +88,16 @@ class ExemptBondResult:
     Attributes:
         instrument: The exempt bond.
         exempt_buy_count: Number of `BUY` trades skipped.
-        exempt_sell_count: Number of `SELL` trades skipped.
+        exempt_sell_count: Number of `SELL` trades and redemptions
+            (`cash_disposal` corporate actions) skipped.
         total_buy_native: Sum of cash outlay across all skipped buys
             in the bond's native currency:
             `(price * qty + accrued + fees)` per trade. Always >= 0.
         total_sell_native: Sum of cash receipt across all skipped
             sells in the bond's native currency:
-            `(price * qty + accrued - fees)` per trade. Can be
+            `(price * qty + accrued - fees)` per trade, plus each
+            redemption's cash (converted through GBP at the effective
+            date when the issuer paid in another currency). Can be
             negative on a low-priced sale where fees exceed the
             net principal — uncommon but not invalid.
     """
@@ -136,8 +148,9 @@ class BondRuleEngine:
         trades: Sequence[tuple[int, Trade]],
         *,
         soft_residuals: bool = False,
+        corporate_actions: Sequence[tuple[int, CorporateAction]] = (),
     ) -> BondResult:
-        """Project trades and run the four-rule matcher (or skip if exempt).
+        """Project trades and corporate actions and run the four-rule matcher (or skip if exempt).
 
         Args:
             instrument: The bond these trades refer to. Must be a
@@ -153,6 +166,12 @@ class BondRuleEngine:
                 what the calculator's runner wants so an open short can
                 be reconciled against the statement rather than fail.
                 Ignored on the exempt branch (nothing is matched).
+            corporate_actions: `(event_id, action)` pairs on this bond —
+                a maturity or an early redemption is a `cash_disposal`
+                of the face value for the redemption cash at the
+                effective date. Exempt bonds count it in the summary;
+                non-exempt bonds match it under the given event id.
+                Other kinds are skipped (check A16 reports them).
 
         Returns:
             `ExemptBondResult` for exempt bonds (gilts / QCBs) —
@@ -183,7 +202,7 @@ class BondRuleEngine:
         # ingest-time key and the symbol is display text; the surrogate
         # id the caller grouped by is the only identity in this system.
         if instrument.is_cgt_exempt:
-            return self._exempt_summary(instrument, trades)
+            return self._exempt_summary(instrument, trades, corporate_actions)
 
         acquisitions: list[Acquisition] = []
         disposals: list[Disposal] = []
@@ -201,6 +220,11 @@ class BondRuleEngine:
                     trade_id=trade_id,
                     detail=f"action {trade.action.value!r} is not valid for a bond trade",
                 )
+        for event_id, action in corporate_actions:
+            if action.is_cash_disposal:
+                disposals.append(
+                    self._build_corporate_action_disposal(event_id, action, instrument)
+                )
 
         return self._matcher.match(
             instrument, acquisitions, disposals, soft_residuals=soft_residuals
@@ -214,6 +238,7 @@ class BondRuleEngine:
         self,
         instrument: BondInstrument,
         trades: Sequence[tuple[int, Trade]],
+        corporate_actions: Sequence[tuple[int, CorporateAction]],
     ) -> ExemptBondResult:
         """Aggregate exempt-bond cash flows in native currency for audit."""
         currency = instrument.currency
@@ -221,6 +246,12 @@ class BondRuleEngine:
         sell_total = Decimal(0)
         buy_count = 0
         sell_count = 0
+        # A redemption is a sell for the summary's purposes: the face
+        # value left and the redemption cash arrived.
+        for _event_id, action in corporate_actions:
+            if action.is_cash_disposal and action.cash is not None:
+                sell_total += self._in_currency(action.cash, currency, action.effective_date).amount
+                sell_count += 1
         for _trade_id, trade in trades:
             accrued_amount = (
                 trade.accrued_interest.amount if trade.accrued_interest is not None else Decimal(0)
@@ -247,6 +278,21 @@ class BondRuleEngine:
             total_buy_native=Money(buy_total, currency),
             total_sell_native=Money(sell_total, currency),
         )
+
+    def _in_currency(self, amount: Money, currency: str, on: date) -> Money:
+        """`amount` in `currency` at the spot for `on`, via GBP when the currencies differ.
+
+        The `FXConverter` converts to or from GBP only, so a cash leg
+        in a third currency (an issuer redeeming a USD bond in EUR — not
+        seen in practice, but the leg is signed and typed) goes through
+        two GBP legs. Identity when the currencies already agree, which
+        is every redemption in the corpus.
+        """
+        if amount.currency == currency:
+            return amount
+        gbp, _rate = self._fx.convert_with_rate(amount, target="GBP", on=on)
+        native, _rate = self._fx.convert_with_rate(gbp, target=currency, on=on)
+        return native
 
     # ------------------------------------------------------------------
     # Per-trade projection (non-exempt branch)
@@ -329,6 +375,36 @@ class BondRuleEngine:
             quantity=trade.quantity,
             proceeds_gbp=proceeds_gbp,
             fees_gbp=fees_gbp,
+        )
+
+    def _build_corporate_action_disposal(
+        self,
+        event_id: int,
+        action: CorporateAction,
+        instrument: BondInstrument,
+    ) -> Disposal:
+        """Project a `cash_disposal` corporate action (a redemption) into a GBP `Disposal`.
+
+        The consideration is the redemption cash in the currency the
+        issuer paid, converted to GBP at the effective date; there is
+        no commission and no accrued-interest leg (the final coupon is
+        its own row in the Interest section). `event_id` is the
+        row-derived synthetic id the FX engine also uses for the cash.
+        """
+        cash = action.cash
+        # The domain guarantees a cash_disposal carries positive cash.
+        assert cash is not None
+        proceeds_gbp, _rate = self._fx.convert_with_rate(
+            cash, target="GBP", on=action.effective_date
+        )
+        return Disposal(
+            trade_id=event_id,
+            account_id=action.account_id,
+            instrument=instrument,
+            disposal_date=action.effective_date,
+            quantity=action.disposed_quantity,
+            proceeds_gbp=proceeds_gbp,
+            fees_gbp=Money.gbp(Decimal(0)),
         )
 
 

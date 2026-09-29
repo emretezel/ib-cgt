@@ -29,10 +29,11 @@ from ib_cgt.domain import (
     BondCoupon,
     BondInstrument,
     CashEvent,
+    CorporateAction,
     Dividend,
+    EventSource,
     FutureInstrument,
     FutureRealisation,
-    FXEventSource,
     OptionInstrument,
     StockInstrument,
     Trade,
@@ -54,6 +55,11 @@ class StockEngineRun:
         result: The engine's output, or `None` when it raised.
         error: The captured engine exception, or `None` on success.
             Exactly one of `result` / `error` is set.
+        corporate_actions: The `(event_id, CorporateAction)` pairs on
+            this instrument, every kind, in effective-date order. The
+            engine disposes of the `cash_disposal` rows under the
+            synthetic event id (`runner.corporate_action_event_id`);
+            the unsupported rows ride along for the checks.
     """
 
     instrument_id: int
@@ -61,6 +67,7 @@ class StockEngineRun:
     trades: tuple[tuple[int, Trade], ...]
     result: MatchingResult | None
     error: Exception | None
+    corporate_actions: tuple[tuple[int, CorporateAction], ...] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -76,6 +83,7 @@ class BondEngineRun:
     trades: tuple[tuple[int, Trade], ...]
     result: BondResult | None
     error: Exception | None
+    corporate_actions: tuple[tuple[int, CorporateAction], ...] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -113,16 +121,19 @@ class FXInputs:
     Built once per pass by `runner.load_fx_inputs` and shared by every
     pool. Trade-backed sources carry real `trades.trade_id` values;
     the non-trade sources carry caller-issued synthetic ids whose
-    provenance is recorded in `sources` (see `ib_cgt.domain.fx_events`).
+    provenance is recorded in `sources` (see `ib_cgt.domain.event_sources`).
 
     Synthetic id ranges are disjoint by construction so an id can be
     classified by magnitude alone if ever needed for debugging:
     realisations start at ``10**12``, dividends at ``2 * 10**12``,
-    coupons at ``3 * 10**12``, cash events at ``4 * 10**12``.
-    Allocation order is deterministic for a given database (futures in
-    `list_futures` order then engine emit order; dividends, coupons and
-    cash events by currency then date), which the persisted-run
-    provenance table relies on.
+    coupons at ``3 * 10**12``, cash events at ``4 * 10**12``,
+    corporate actions at ``5 * 10**12``. Allocation order is
+    deterministic for a given database (futures in `list_futures`
+    order then engine emit order; dividends, coupons and cash events
+    by currency then date), which the persisted-run provenance table
+    relies on. A corporate action's id is not allocated at all: it is
+    ``5 * 10**12 + corporate_action_id``, a pure function of the row,
+    so the stock and bond engines cite the same id for the same event.
 
     Attributes:
         forex_trades: Every forex trade, in chronological order.
@@ -144,6 +155,11 @@ class FXInputs:
             sorted — the list of pools a full pass computes.
         option_trades: Non-GBP option trades only — their premiums,
             commissions and settlements are the cashflow.
+        corporate_actions: `(synthetic_id, action)` for every
+            `cash_disposal` corporate action, whatever its cash
+            currency: the projector skips GBP cash, but every row is
+            registered in `sources` because the stock and bond engines
+            cite the same id.
     """
 
     forex_trades: tuple[tuple[int, Trade], ...]
@@ -154,9 +170,10 @@ class FXInputs:
     dividends: tuple[tuple[int, Dividend], ...]
     bond_coupons: tuple[tuple[int, BondCoupon], ...]
     cash_events: tuple[tuple[int, CashEvent], ...]
-    sources: Mapping[int, FXEventSource]
+    sources: Mapping[int, EventSource]
     currencies: tuple[str, ...]
     option_trades: tuple[tuple[int, Trade], ...] = ()
+    corporate_actions: tuple[tuple[int, CorporateAction], ...] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

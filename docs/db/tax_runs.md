@@ -46,7 +46,7 @@ None outbound. Inbound, all `ON DELETE CASCADE`:
 [`option_grants.run_id`](./option_grants.md) (and through it
 [`option_grant_closes`](./option_grant_closes.md)),
 [`option_exercise_transfers.run_id`](./option_exercise_transfers.md),
-[`fx_event_sources.run_id`](./fx_event_sources.md) and
+[`event_sources.run_id`](./event_sources.md) and
 [`tax_run_issues.run_id`](./tax_run_issues.md) — replacing a run
 automatically removes its chunks, its futures realisations, its option
 grants with their closes, its exercise transfers, its synthetic-id map

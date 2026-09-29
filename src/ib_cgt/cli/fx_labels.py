@@ -2,7 +2,7 @@
 
 The FX engine works on synthetic integer event ids. These helpers map
 them back to the citeable labels documented in `docs/audit.md`
-(`Div #N`, `Cpn #N`, `Cash #N`, `P&L #a→#b`, …), to event dates, and
+(`Div #N`, `Cpn #N`, `Cash #N`, `CA #N`, `P&L #a→#b`, …), to event dates, and
 to the short id labels that fit a narrow table cell. `FxLabels`
 bundles the three side maps so both commands build them the same way.
 
@@ -19,11 +19,13 @@ from ib_cgt.cli.common import format_money_2dp, format_qty_2dp
 from ib_cgt.domain import (
     BondCouponRef,
     CashEventRef,
+    CorporateActionRef,
     DirectAcquisition,
     DividendKind,
     DividendRef,
     TaxLotSnapshot,
 )
+from ib_cgt.report.labels import corporate_action_description, corporate_action_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +85,8 @@ def build_fx_source_descriptions(inputs: FXInputs) -> dict[int, str]:
         out[synth_id] = f"bond coupon {coupon.instrument.symbol}"
     for synth_id, event in inputs.cash_events:
         out[synth_id] = f"{event.kind.value}: {event.description}"
+    for synth_id, action in inputs.corporate_actions:
+        out[synth_id] = corporate_action_description(action)
     return out
 
 
@@ -114,6 +118,8 @@ def build_fx_event_date_map(inputs: FXInputs) -> dict[int, date]:
         out[synth_id] = coupon.pay_date
     for synth_id, event in inputs.cash_events:
         out[synth_id] = event.value_date
+    for synth_id, action in inputs.corporate_actions:
+        out[synth_id] = action.effective_date
     return out
 
 
@@ -181,6 +187,12 @@ def build_fx_id_label_map(inputs: FXInputs) -> dict[int, str]:
         source = inputs.sources[synth_id]
         real_id = source.cash_event_id if isinstance(source, CashEventRef) else synth_id
         out[synth_id] = f"Cash #{real_id}"
+    # Corporate actions — `CA #N`, the same label the stock and bond
+    # tables print for the disposal of the units.
+    for synth_id, _action in inputs.corporate_actions:
+        source = inputs.sources[synth_id]
+        real_id = source.corporate_action_id if isinstance(source, CorporateActionRef) else synth_id
+        out[synth_id] = corporate_action_label(real_id)
     return out
 
 

@@ -13,15 +13,16 @@ file bytes ──hash──▶ already imported?  ──yes──▶ stop (const
                                                           │
                                                    assembler ──▶ ParsedStatement (raw string rows)
                                                           │
-                            mappers: trades, corporate actions, dividends, coupons, cash events, positions
+             mappers: trades, corporate actions, dividends, coupons, cash events, positions, cash balances
                                                           │
                                       exercise links (option row ↔ share trade at the strike)
                                                           │
                                         coverage filter (days an earlier statement owns)
                                                           │
                                 one transaction: statements + trades + option_exercise_links
-                                                 + dividends + bond_coupons + cash_events
-                                                 + statement_positions
+                                                 + corporate_actions + dividends + bond_coupons
+                                                 + cash_events + statement_positions
+                                                 + statement_cash_balances
 ```
 
 Every stage below the parser is format-blind: a PDF and an HTML statement of
@@ -111,15 +112,17 @@ IB draws its PDF statement as a grid, which is all the adapter reads:
   two rows, one per page column (the gutter of a two-column page);
 - a row whose words are all 10 pt is a **title** — it opens the section of the
   rows that follow in its column, closes the column when it is a section we do
-  not read (`Cash Report`, `Interest Accruals`, `Forex Balances`, `Codes`, …),
-  and, when it repeats the section already open there, is a page-break
-  continuation (IB repeats the title but not always the header);
+  not read (`Interest Accruals`, `Forex Balances`, `Codes`, …), and, when it
+  repeats the section already open there, is a page-break continuation (IB
+  repeats the title but not always the header);
 - a one-cell row is a sub-header: a three-letter upper-case code is the
   currency, `Carried by …` and `Total …` are noise, anything else is the
   asset class;
 - a multi-cell row whose first cell starts with `Total` is an aggregate; one
   whose first cell is `Symbol`, `Date`, `Date/Time`, `Description`, `Code` or
-  `Report Date` is a header; everything else is data;
+  `Report Date` is a header, and so is one whose first cell is blank and whose
+  second is `Total` (the Cash Report's label column has no header); everything
+  else is data;
 - a word belongs to the cell that contains its centre on **both** axes — on a
   two-column page the left and right rows have different heights, so a band's
   vertical extent says nothing about the other column. Words inside a cell are
@@ -248,7 +251,9 @@ source row.
 a statement fails the batch before anything is written) and persists them
 earliest period first, so the rule does not depend on the order the shell
 expanded the paths. Check **A15** warns when a fact is dated more than a month
-outside its own statement's period — the symptom of a mis-read period.
+outside its own statement's period — the symptom of a mis-read period. Check
+**A16** warns when a corporate action the mappers did not classify moves units
+or cash — the symptom of an event the engines are silently not modelling.
 
 ## Idempotency, in layers
 
@@ -262,12 +267,14 @@ outside its own statement's period — the symptom of a mis-read period.
 
 | Section | Table | Notes |
 |---|---|---|
-| Trades | `trades` | Stocks, bonds, futures, options, forex. Corporate-action cash mergers and bond maturities are synthesised as SELL trades after the regular rows. |
+| Trades | `trades` | Stocks, bonds, futures, options, forex. Nothing is synthesised. |
+| Corporate Actions | `corporate_actions` | One row per event as its legs (units out, units in, cash), grouped by `Date/Time` and description: a cash-for-shares merger or a bond redemption is a `cash_disposal`; any other shape is stored line by line as `unsupported` and reported by check **A16**. Dated on the London date of the `Date/Time`. |
 | Trades (options with `Ex` / `A`) | `option_exercise_links` | The option row and the share trade IB booked for it at the strike, when exactly one matches. |
 | Financial Instrument Information | `*_instruments` | The conid (stocks, futures, options) and ISIN (bonds) that key instruments; for options also underlying, multiplier, expiry, strike and right. |
 | Dividends, Withholding Tax | `dividends` | Instrument-less; withholding rows with no stock tag are cash events. |
 | Interest | `bond_coupons` / `cash_events` | Coupon payments to the former, everything else to the latter. |
 | Deposits & Withdrawals, Fees | `cash_events` | Internal transfers between the taxpayer's own accounts are dropped. |
-| Open Positions | `statement_positions` | As of the period's last day; resolved through the same instrument identities. |
+| Open Positions | `statement_positions` | As of the period's last day, with the statement's close price; resolved through the same instrument identities. |
+| Cash Report | `statement_cash_balances` | Starting and ending cash per currency; the `Base Currency Summary` and `Cash Detail` blocks are skipped. Never coverage-filtered. |
 
 See [`db/statements.md`](./db/statements.md) for the statement row itself.

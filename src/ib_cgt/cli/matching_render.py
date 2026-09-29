@@ -11,20 +11,23 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 from rich.table import Table
 
+from ib_cgt.calculator import corporate_action_id_of
 from ib_cgt.cli.common import console, format_money_2dp, format_qty_2dp
 from ib_cgt.domain import (
     AnyInstrument,
+    CorporateAction,
     DirectAcquisition,
     MatchedDisposal,
     TaxLotSnapshot,
     Trade,
     UnmatchedDisposalChunk,
 )
+from ib_cgt.report.labels import corporate_action_label
 
 
 def trade_dates(trades: Sequence[tuple[int, Trade]]) -> dict[int, date]:
@@ -37,8 +40,36 @@ def trade_dates(trades: Sequence[tuple[int, Trade]]) -> dict[int, date]:
     return {trade_id: trade.trade_date for trade_id, trade in trades}
 
 
+def corporate_action_labels(
+    actions: Sequence[tuple[int, CorporateAction]],
+) -> dict[int, str]:
+    """Event-id → `CA #N` map for the disposals a run's corporate actions constituted.
+
+    A stock or bond disposed of by a cash merger or a maturity is cited
+    by its synthetic event id; the label carries the row id the user
+    can follow (`docs/audit.md`), the same label `match fx` prints for
+    the cash leg of the same event.
+    """
+    out: dict[int, str] = {}
+    for event_id, _action in actions:
+        action_id = corporate_action_id_of(event_id)
+        if action_id is not None:
+            out[event_id] = corporate_action_label(action_id)
+    return out
+
+
+def disposal_label(disposal_id: int, id_labels: Mapping[int, str] | None) -> str:
+    """The `Disp ID` cell: the citeable label when the id has one, else the id itself."""
+    if id_labels is not None:
+        label = id_labels.get(disposal_id)
+        if label is not None:
+            return label
+    return str(disposal_id)
+
+
 def render_instrument_unmatched_disposals(
     chunks: Sequence[tuple[AnyInstrument, UnmatchedDisposalChunk]],
+    id_labels: Mapping[int, str] | None = None,
 ) -> None:
     """Yellow warning block for soft-residual unmatched disposals (stocks / bonds).
 
@@ -66,7 +97,7 @@ def render_instrument_unmatched_disposals(
         table.add_row(
             instrument.symbol,
             instrument.currency,
-            str(chunk.disposal_trade_id),
+            disposal_label(chunk.disposal_trade_id, id_labels),
             chunk.disposal_date.isoformat(),
             format_qty_2dp(chunk.quantity_remaining),
             format_money_2dp(chunk.proceeds_remaining_gbp),
@@ -74,9 +105,15 @@ def render_instrument_unmatched_disposals(
     console.print(table)
 
 
-def matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) -> tuple[str, ...]:
+def matched_disposal_to_cells(
+    md: MatchedDisposal,
+    date_map: dict[int, date],
+    id_labels: Mapping[int, str] | None = None,
+) -> tuple[str, ...]:
     """Project a `MatchedDisposal` into the 11 columns of the disposals table.
 
+    `Disp ID` is the trade id, or the citeable label from `id_labels`
+    for a disposal a corporate action constituted (`CA #N`).
     `Acq ID / Basis` and `Acq Date` are basis-aware:
     - `DirectAcquisition` (SAME_DAY / BED_AND_BREAKFAST /
       LATER_ACQUISITION) → `acq #N` and the acquisition's
@@ -97,7 +134,7 @@ def matched_disposal_to_cells(md: MatchedDisposal, date_map: dict[int, date]) ->
     gain_style = "green" if gain.amount >= 0 else "red"
     basis_text, acq_date_text = basis_cells(md.basis, date_map)
     return (
-        str(md.disposal_trade_id),
+        disposal_label(md.disposal_trade_id, id_labels),
         md.disposal_date.isoformat(),
         md.match_rule.value,
         format_qty_2dp(md.matched_quantity),

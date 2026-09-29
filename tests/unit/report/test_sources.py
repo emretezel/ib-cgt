@@ -18,6 +18,7 @@ from ib_cgt.db import FXRateRepo, apply_migrations, open_connection
 from ib_cgt.domain import (
     BondCouponRef,
     CashEventRef,
+    CorporateActionRef,
     DividendRef,
     FutureRealisationRef,
     TaxYear,
@@ -71,7 +72,7 @@ def test_trade_ids_resolve_to_dated_described_references(
 def test_every_provenance_kind_resolves(persisted_db: sqlite3.Connection) -> None:
     loaded = load_persisted_run(persisted_db, Y2025)
     assert loaded is not None
-    sources = loaded.computation.fx_event_sources
+    sources = loaded.computation.event_sources
     kinds = {type(source) for source in sources.values()}
     assert {DividendRef, FutureRealisationRef} <= kinds
     resolver = DbEventResolver(persisted_db, sources)
@@ -87,6 +88,9 @@ def test_every_provenance_kind_resolves(persisted_db: sqlite3.Connection) -> Non
             assert ref.description.startswith("futures P&L ")
         elif isinstance(source, BondCouponRef):
             assert ref.label == f"Cpn #{source.bond_coupon_id}"
+        elif isinstance(source, CorporateActionRef):
+            assert ref.label == f"CA #{source.corporate_action_id}"
+            assert ref.description.startswith("corporate action ")
         else:
             assert isinstance(source, CashEventRef)
             assert ref.label == f"Cash #{source.cash_event_id}"
@@ -99,7 +103,7 @@ def test_labels_agree_with_the_match_commands(persisted_db: sqlite3.Connection) 
     fx = FXService(FXRateRepo(persisted_db), FrankfurterClient(base_url="https://example.invalid"))
     inputs = load_fx_inputs(persisted_db, future_runs=run_future_engine(persisted_db, fx))
     live = FxLabels.from_inputs(inputs)
-    resolver = DbEventResolver(persisted_db, loaded.computation.fx_event_sources)
+    resolver = DbEventResolver(persisted_db, loaded.computation.event_sources)
     cited: set[int] = set()
     for chunk in loaded.computation.report.matched_disposals:
         cited.add(chunk.disposal_trade_id)

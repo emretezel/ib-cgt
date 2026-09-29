@@ -370,6 +370,25 @@ Two things are refused with `InconsistentTradeError`: a transfer whose
 option implies the other direction (a holder's call pointing at a
 sale) — either means the exercise link is wrong.
 
+### Corporate actions (cash disposals)
+
+`compute(instrument, trades, corporate_actions=...)` also takes the
+stock's rows from
+[`corporate_actions`](./db/corporate_actions.md). Each `cash_disposal`
+row — a cash-for-shares merger, a tender for cash — becomes a
+`Disposal` of `|quantity|` units on `effective_date` (the London date
+of the statement's `Date/Time`; TCGA 1992 s.28), with proceeds = the
+cash the issuer paid converted to GBP at that date's spot rate and no
+fees (IB charges no commission on a corporate action). It is then
+matched like any sale: same-day, 30-day, S.104, s.105(2). The
+disposal's `trade_id` is the synthetic event id `5 * 10**12 +
+corporate_action_id`, printed as `CA #N`, and the FX engine books the
+cash leg into its currency's pool under the same id — so the IEMI
+cash-out (824 units of a GBP-listed fund for 14,425.52 USD) is one
+event cited twice: a stock disposal of 10,641.43 GBP and a USD-pool
+acquisition of 14,425.52 USD, both on 2025-08-16. `unsupported` rows
+are ignored here; check A16 reports them.
+
 ### Errors
 
 | Exception                | When                                                                                              |
@@ -594,7 +613,7 @@ earlier run for the same year:
 | [`future_realisations`](./db/future_realisations.md) | One row per closed-out futures slice. |
 | [`option_grants`](./db/option_grants.md) / [`option_grant_closes`](./db/option_grant_closes.md) | One row per written option's grant dated in the year, with every later close on record (whatever its year). |
 | [`option_exercise_transfers`](./db/option_exercise_transfers.md) | One row per amount an exercise or assignment dated in the year moved into a share trade. |
-| [`fx_event_sources`](./db/fx_event_sources.md) | The synthetic FX event ids the chunks cite, resolved to their dividend / coupon / cash event / realisation. |
+| [`event_sources`](./db/event_sources.md) | The synthetic event ids the chunks cite, resolved to their dividend / coupon / cash event / realisation / corporate action. |
 | [`tax_run_issues`](./db/tax_run_issues.md) | What the run could not do (errors) and what it wants noticed (warnings). |
 
 Whole history, then filter: UK matching is path-dependent (a S.104
@@ -649,18 +668,21 @@ result = engine.compute(
     bond_trades=non_gbp_bond_trades,  # real trade ids, like stocks
     cash_events=non_gbp_cash_events,  # from CashEventRepo.for_currency
     option_trades=non_gbp_option_trades,  # real trade ids, like stocks
+    corporate_actions=cash_disposals,  # from CorporateActionRepo.list_cash_disposals
 )
 ```
 
 `FXRuleEngine` is a thin strategy on top of `MatchingEngine`. It
-projects events from **nine sources** into GBP-denominated
-`Acquisition` and `Disposal` records via the FX service, then
-delegates the match. Unlike the stock engine its API is
+projects events from **ten sources** into GBP-denominated
+`Acquisition` and `Disposal` records via the FX service
+(`project`), then delegates the match (`compute`). The projection is
+exposed on its own because the cash-balance reconciliation sums it
+without matching. Unlike the stock engine its API is
 **per-currency** rather than per-instrument, because UK CGT pools FX
 per single non-GBP currency vs GBP — and a single `EUR.USD` trade
 therefore touches *two* pools (one EUR, one USD).
 
-The nine cashflow sources implement HMRC CG78315 — "foreign currency
+The ten cashflow sources implement HMRC CG78315 — "foreign currency
 arising from any source" — so the per-currency pool reflects every
 foreign-cash movement IB reports:
 
@@ -670,12 +692,17 @@ foreign-cash movement IB reports:
    from the pool (a disposal of `(price*qty + fees)` USD); a SELL
    brings USD in (an acquisition of `(price*qty − fees)` USD). GBP
    value is the cash amount converted at trade-date spot.
-3. **Non-GBP dividends** — cash dividends and payment-in-lieu rows
-   credit the pool on `pay_date` (acquisitions); withholding-tax
-   rows debit the pool (disposals). Stored as their own table
-   `dividends` rather than synthesised `Trade` rows because a
-   distribution does not transact a quantity of the underlying
-   stock — see [`docs/db/dividends.md`](db/dividends.md).
+3. **Non-GBP dividends** — cash dividends, payments in lieu and
+   withholding tax on `pay_date`. **Direction is the sign of the
+   amount**, exactly as for cash events: a cash dividend or a
+   payment in lieu is normally positive (an acquisition) and
+   withholding tax negative (a disposal), but a payment in lieu
+   *paid* on a short position is negative and a withholding refund
+   positive, and each goes the other way — the row's `kind` is never
+   consulted for direction. Stored as their own table `dividends`
+   rather than synthesised `Trade` rows because a distribution does
+   not transact a quantity of the underlying stock — see
+   [`docs/db/dividends.md`](db/dividends.md).
 4. **Non-GBP futures trade fees** — every OPEN/CLOSE leg pays a
    commission in the contract's native currency at trade_date,
    regardless of whether the position eventually realises a gain
@@ -695,9 +722,9 @@ foreign-cash movement IB reports:
    [`docs/db/bond_coupons.md`](db/bond_coupons.md).
 7. **Non-GBP bond trades** — the mirror of the stock projection: a
    BUY spends `(price*qty + accrued + fees)` of the bond's currency
-   (a disposal), a SELL — a synthesised maturity included — brings
-   `(price*qty + accrued − fees)` in (an acquisition), GBP value at
-   trade-date spot. Whether the bond is CGT-exempt is irrelevant to
+   (a disposal), a SELL brings `(price*qty + accrued − fees)` in (an
+   acquisition), GBP value at trade-date spot. A redemption is not a
+   trade; its cash arrives through source 10. Whether the bond is CGT-exempt is irrelevant to
    the cash leg. `accrued` is `Trade.accrued_interest` when set and
    zero otherwise — today always zero, see the accrued-interest
    invariant below.
@@ -723,6 +750,17 @@ foreign-cash movement IB reports:
    cash-settled exercise moves the settlement. The share leg of an
    exercise is an ordinary stock trade (source 2). See
    [`options.md`](./options.md).
+10. **Corporate-action cash** — the cash leg of a `cash_disposal`
+    corporate action (a cash-for-shares merger, a bond redemption)
+    in the pool's currency, on `effective_date`
+    (`fx_cashflow.from_corporate_action`): an acquisition of the
+    amount received, whatever currency the security traded in —
+    IEMI trades in GBP and was cashed out in USD, so the USD pool
+    acquires 14,425.52 USD on 2025-08-16 under the same `CA #N` id
+    the stock engine cites for the disposal of the units. The amount
+    is statement-sourced and posted as printed. A GBP cash leg
+    touches no pool; `unsupported` rows project nothing. See
+    [`docs/db/corporate_actions.md`](db/corporate_actions.md).
 
 Three conventions behind the cash-event source are user decisions rather
 than HMRC guidance, and are recorded here as such:
@@ -750,18 +788,17 @@ Each is a pure function returning `Acquisition | Disposal | None`.
 ### Sources the pools do not see yet
 
 Every description IB has printed in this taxpayer's 2011–2026 history
-falls into one of the nine sources above (checked after the full
-ingest: broker and margin interest, stock-lending income, accrued
-interest on gilt trades, external deposits and withdrawals, wire and
-market-data fees and their refunds, dividends, payments in lieu and
-their withholding, option premiums and settlements). What the model
-does **not** carry, because nothing ingests it, is:
+falls into one of the ten sources above, and since 2026-09-29 that is
+no longer taken on trust: the pools are reconciled against IB's own
+Cash Report for every account and currency (see *Cash balances*
+below), and the reconciliation is what found the two gaps the tenth
+source and the signed dividends closed. What the model still does
+**not** carry is:
 
 | Missing source | Why it matters | Status |
 |---|---|---|
-| Corporate-action cash other than cash mergers and bond maturities (cash in lieu of fractional shares, return of capital, special cash distributions) | Cash arriving in the pool with no trade behind it | None in the history so far; the corporate-actions mapper ignores unknown shapes silently |
-| Position transfers in or out of IB with a cash component (ACATS, FOP) | Cash moving without a trade | None in the history (the 2022 move between the taxpayer's own accounts was positions only) |
-| IB's `Forex Balances` section (end-of-period cash per currency with IB's own GBP cost basis) | Not a cashflow, but the one independent figure the pool balances could be reconciled against | Not read; a natural next check |
+| Corporate actions the mapper does not classify (splits, spin-offs, share-for-share mergers, returns of capital, cash in lieu of fractional shares) | Units or cash moving with no modelled disposal behind them | Stored as `unsupported` rows in `corporate_actions` and reported by check A16; none in the history so far |
+| Position transfers in or out of IB with a cash component (ACATS, FOP) | Cash moving without a trade | None in the history (the 2022 move between the taxpayer's own accounts was positions only); C11 would show it |
 
 Every amount a projector computes (a forex quote leg, a stock or bond
 principal, a futures realisation) is posted to the cent, as IB's own
@@ -958,6 +995,16 @@ The exempt branch performs no FX conversion (none is required —
 the bond does not produce any CGT event), so an exempt-bonds-only
 run can be made before the FX cache is populated.
 
+A **redemption** reaches the engine as a `cash_disposal` row of
+[`corporate_actions`](./db/corporate_actions.md)
+(`compute(instrument, trades, corporate_actions=...)`), never as a
+synthesised trade. On the exempt branch it counts as one more sale in
+`ExemptBondResult`'s totals (a cash leg in another currency is
+converted through GBP in two steps, since the FX service refuses a
+direct cross rate); on the non-exempt branch it is a real S.104
+disposal at the redemption cash on `effective_date`, under the
+`CA #N` event id the FX engine also cites for the cash.
+
 ### Per-trade projection (non-exempt branch)
 
 Both legs use the trade-date spot rate; native-currency arithmetic
@@ -995,10 +1042,11 @@ command sees the same inputs and the same engine behaviour.
 | Entry point                                                | What it does                                                                                   |
 |------------------------------------------------------------|------------------------------------------------------------------------------------------------|
 | `run_option_engine(conn, fx, *, symbol, since, until)`     | One `OptionEngineRun` per option series, cross-account, soft-residual mode; loads the series' exercise links from `option_exercise_links`. |
-| `run_stock_engine(conn, fx, *, symbol, since, until, option_runs)` | One `StockEngineRun` per stock, cross-account, soft-residual mode. Hands each stock the exercise transfers whose share trade it owns; runs its own option pass when `option_runs` is `None`. |
-| `run_bond_engine(conn, fx, *, symbol, since, until)`       | One `BondEngineRun` per bond (sealed `BondResult` union), soft-residual mode.                   |
+| `run_stock_engine(conn, fx, *, symbol, since, until, option_runs)` | One `StockEngineRun` per stock, cross-account, soft-residual mode. Hands each stock the exercise transfers whose share trade it owns and its corporate actions; runs its own option pass when `option_runs` is `None`. |
+| `run_bond_engine(conn, fx, *, symbol, since, until)`       | One `BondEngineRun` per bond (sealed `BondResult` union), soft-residual mode, with the bond's corporate actions (redemptions). |
 | `run_future_engine(conn, fx, *, symbol, account_id, …)`    | One `FutureEngineRun` per contract, GBP contracts included.                                     |
-| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP bond / non-GBP futures / non-GBP option trades, futures realisations, dividends, coupons, cash events, provenance map, pool list. |
+| `load_fx_inputs(conn, *, future_runs, since, until)`       | The shared `FXInputs` bundle: forex / non-GBP stock / non-GBP bond / non-GBP futures / non-GBP option trades, futures realisations, dividends, coupons, cash events, `cash_disposal` corporate actions, provenance map, pool list. |
+| `project_pool(fx, inputs, currency)`                       | One pool's acquisition and disposal streams, projected but not matched — what the cash-balance reconciliation sums. |
 | `run_fx_engine(conn, fx, *, future_runs, currency, …)`     | One `FXEngineRun` per non-GBP pool; runs its own futures pass when none is supplied.            |
 | `run_engines(conn, fx)`                                    | The whole-history pass: futures → options → stocks (with the transfers) → bonds → FX.           |
 
@@ -1018,18 +1066,22 @@ run before stocks. Stock, bond and option cash legs come from the
 trades themselves, not from those engines' results, so their order
 relative to FX is immaterial; FX is a pure sink.
 
-**Synthetic ids and provenance.** Non-trade FX cashflows get
-integer ids from disjoint high ranges — realisations from
-`10**12`, dividends from `2 * 10**12`, coupons from `3 * 10**12`,
-cash events from `4 * 10**12` — allocated in a deterministic order
-(futures in `list_futures` order and engine emit order, then
-dividends, coupons and cash events by currency and date).
-`FXInputs.sources` maps every synthetic id to a
-`FutureRealisationRef` / `DividendRef` / `BondCouponRef` /
-`CashEventRef` (`ib_cgt.domain.fx_events`), which is how the audit
-output prints `P&L #A→#B`, `Div #N`, `WHT #N`, `Cpn #N` and
-`Cash #N` instead of the ids. Bond and option trades, like stock
-trades, carry their real `trades` ids and need no provenance entry.
+**Synthetic ids and provenance.** Non-trade events get integer ids
+from disjoint high ranges — realisations from `10**12`, dividends
+from `2 * 10**12`, coupons from `3 * 10**12`, cash events from
+`4 * 10**12` — allocated in a deterministic order (futures in
+`list_futures` order and engine emit order, then dividends, coupons
+and cash events by currency and date). A corporate action's id is
+different in kind: `5 * 10**12 + corporate_action_id`
+(`corporate_action_event_id`), a pure function of the row, because
+the stock or bond engine and the FX engine cite the same event
+without ever seeing each other's output. `FXInputs.sources` maps
+every synthetic id to a `FutureRealisationRef` / `DividendRef` /
+`BondCouponRef` / `CashEventRef` / `CorporateActionRef`
+(`ib_cgt.domain.event_sources`), which is how the audit output prints
+`P&L #A→#B`, `Div #N`, `WHT #N`, `Cpn #N`, `Cash #N` and `CA #N`
+instead of the ids. Bond and option trades, like stock trades, carry
+their real `trades` ids and need no provenance entry.
 
 ## Open positions and residuals
 
@@ -1043,9 +1095,12 @@ book: the Open Positions section of each account's latest statement
 ([`docs/db/statement_positions.md`](db/statement_positions.md)).
 
 `ib_cgt.calculator.positions.reconcile_positions` nets every
-account's trades up to its latest statement's `period_end`
-(`TradeRepo.signed_quantity_by_instrument`) and compares the result
-with that statement's positions, **summed across accounts**. UK CGT
+account's trades and corporate-action quantities up to its latest
+statement's `period_end` (`TradeRepo.signed_quantity_by_instrument`
+plus `CorporateActionRepo.signed_quantity_by_instrument` — a merger
+or a redemption removes the units whether or not its tax side is
+modelled) and compares the result with that statement's positions,
+**summed across accounts**. UK CGT
 pools are per taxpayer, and IB position transfers between the
 taxpayer's own accounts are not trades and are never ingested, so a
 per-account comparison would flag every transferred holding twice;
@@ -1060,12 +1115,63 @@ gets one `PositionReconciliation` whose status is:
 | `no_trades`        | A statement lists a holding the trades never built (bought before the earliest statement — cost basis unknown). |
 
 Check **C7** reports every non-`match` row (ERROR severity) and the
-tax-year calculator will turn the same rows into `position_mismatch`
+tax-year calculator turns the same rows into `position_mismatch`
 issues. A residual the statement *confirms* — an open short it lists,
-an open futures contract it lists — is not a gap. FX pools are never
-reconciled: the earliest statement is the origin of every pool and
-pre-history balances are unknowable by design, so an FX residual is
-only ever a warning.
+an open futures contract it lists — is not a gap. FX pools are not
+reconciled by position: the earliest statement is the origin of every
+pool and pre-history balances are unknowable by design, so an FX
+residual is only ever a warning. They are reconciled by **movement**
+instead — the next section.
+
+## Cash balances
+
+The FX pools have a second yardstick, independent of every trade
+and dividend: the **Cash Report** of each statement, which states
+the account's holding of every currency at the start and end of the
+period ([`docs/db/statement_cash_balances.md`](db/statement_cash_balances.md)).
+Every projected pool event is a signed movement of one currency in
+one account, so summed they must reproduce IB's movement — or a
+pool is missing a source, and every later disposal of that currency
+is matched on a wrong cost. This is how the IEMI cash (14,425.52 USD
+that never reached the USD pool) and the mis-signed payments in lieu
+and withholding reversals (516.35 USD booked the wrong way) were
+found; before 2026-09-29 nothing could have caught either, because
+the futures account's dollars covered the stock account's shortfall
+silently.
+
+`ib_cgt.calculator.cash_balances.reconcile_cash_balances` compares,
+**per account** (IB keeps cash per account, and so does every
+projected event) and per non-GBP currency:
+
+```
+IB movement   = ending cash on the account's latest statement
+              − starting cash on its earliest statement          (pre-history cash the pools never saw)
+engine total  = Σ acquisitions − Σ disposals of the currency in the account, dated ≤ the latest period_end
+              + Σ over the engine's open futures lots of (close_price − open_price) × multiplier × signed quantity
+```
+
+The futures term is the one systematic difference between the two
+views: IB settles variation margin daily, so its cash already holds
+every open contract's unrealised P&L, while the engine posts a
+contract's P&L only on close. Marking the **engine's own** FIFO lots
+(`run_future_engine(..., account_id, until=period_end)`) at the
+statement's Close Price (`statement_positions.close_price`) is what
+makes the two agree to the cent; IB's own unrealised-P&L figure,
+computed from an average cost, does not. A lot whose contract the
+statement no longer lists cannot be priced — it is counted
+(`unpriced_open_lots`) and left to C7.
+
+The tolerance is **one unit of the currency** (`CASH_TOLERANCE`):
+IB posts each ledger line to the cent independently, so over fifteen
+years the pennies can add up to a few cents, never to a pound. Each
+`CashBalanceReconciliation` is `match` or `mismatch`; check **C11**
+reports every mismatch (ERROR severity) and the calculator records
+the same rows as `cash_balance_mismatch` issues on the run. An
+account whose statements carry no Cash Report is skipped; a currency
+only IB's balances name is still compared (a mismatch, not silence).
+Live, after the migration 024 re-ingest, every account and currency
+reconciles: EUR, JPY and USD in the futures account, USD in the
+stock account.
 
 ## What's not implemented yet
 

@@ -472,26 +472,54 @@ def build_bond_instrument(
     symbol: str,
     currency: str,
     index: InstrumentInfoIndex,
+    *,
+    security_id: str | None = None,
 ) -> BondInstrument:
     """Resolve a statement bond symbol to its ISIN-keyed `BondInstrument`.
 
-    Shared by the trade mapper and the Open Positions mapper so a
-    bond held and a bond traded resolve to one identity. Walks the
-    Financial Instrument Information section via `resolve_bond_info`,
-    canonicalises the display symbol, and classifies exemption.
+    Shared by the trade mapper, the Open Positions mapper and the
+    corporate-actions mapper so a bond held, traded and redeemed
+    resolves to one identity. Walks the Financial Instrument
+    Information section — by `security_id` first when the caller has
+    one (a Corporate Actions row prints the ISIN), then via
+    `resolve_bond_info` — canonicalises the display symbol, and
+    classifies exemption.
+
+    When neither lookup finds a row but the caller supplied the ISIN,
+    the instrument is built from the ISIN and the symbol alone: the
+    2012-2017 statement vintages omit the bonds-shaped instrument
+    table, and a maturity row carries everything the identity needs.
+    The classifier then falls back to its symbol-prefix rule. Callers
+    without an ISIN keep the loud failure — a bond traded on such a
+    vintage has no identity to resolve to.
 
     Raises:
         MappingError: No instrument-info row with a Security ID can
-            be resolved for `symbol`.
+            be resolved for `symbol`, and no `security_id` was given.
     """
-    info = resolve_bond_info(symbol, index)
+    info = index.by_security_id("Bonds", security_id) if security_id else None
+    if info is None:
+        info = resolve_bond_info(symbol, index)
     if info is None or not info.security_id:
-        raise MappingError(
-            f"Bond row for symbol {symbol!r} has no resolvable ISIN. "
-            "v1 requires every bond to carry a Security ID from the "
-            "Financial Instrument Information section. Older statement "
-            "vintages may need to be re-fetched from IB with the "
-            "bonds-shaped instrument-info table enabled."
+        if security_id is None:
+            raise MappingError(
+                f"Bond row for symbol {symbol!r} has no resolvable ISIN. "
+                "v1 requires every bond to carry a Security ID from the "
+                "Financial Instrument Information section. Older statement "
+                "vintages may need to be re-fetched from IB with the "
+                "bonds-shaped instrument-info table enabled."
+            )
+        # ISIN-only path: the description alone names the bond.
+        return BondInstrument(
+            isin=security_id,
+            symbol=_canonicalise_gilt_symbol(symbol),
+            currency=currency,
+            is_cgt_exempt=_classify_bond_exempt(
+                symbol=symbol,
+                description=None,
+                currency=currency,
+                overrides=resolve_exempt_bonds_allowlist(),
+            ),
         )
     # Display form: canonicalise the instrument-info Symbol column.
     # For gilts this strips the trailing yield / IB-code token so the

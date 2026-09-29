@@ -1,7 +1,8 @@
 """Repository for the `statement_positions` table.
 
 One row per instrument still open on the last day of a statement's
-period, as printed in the statement's Open Positions section. Same
+period, with its quantity and close price as printed in the
+statement's Open Positions section. Same
 `(source_statement_hash, statement_row_index)` provenance identity
 as `trades` / `dividends`, so a re-ingest is idempotent under
 a targeted `ON CONFLICT … DO NOTHING` and the statement cascade
@@ -69,12 +70,13 @@ class StatementPositionRepo:
                     row_index,
                     instrument_id,
                     dec_to_text(position.quantity),
+                    dec_to_text(position.close_price),
                 )
             )
         cursor = self._conn.executemany(
             "INSERT INTO statement_positions "
-            "(statement_hash, statement_row_index, instrument_id, quantity) "
-            "VALUES (?, ?, ?, ?) "
+            "(statement_hash, statement_row_index, instrument_id, quantity, close_price) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT (statement_hash, statement_row_index) DO NOTHING",
             rows,
         )
@@ -91,7 +93,7 @@ class StatementPositionRepo:
         positions carry it even though the table does not store it.
         """
         rows = self._conn.execute(
-            "SELECT p.instrument_id, p.quantity, s.account_id "
+            "SELECT p.instrument_id, p.quantity, p.close_price, s.account_id "
             "FROM statement_positions p "
             "JOIN statements s ON s.statement_hash = p.statement_hash "
             "WHERE p.statement_hash = ? "
@@ -108,6 +110,7 @@ class StatementPositionRepo:
                         account_id=str(row["account_id"]),
                         instrument=self._instruments.get(instrument_id),
                         quantity=text_to_dec(row["quantity"]),
+                        close_price=text_to_dec(row["close_price"]),
                     ),
                 )
             )

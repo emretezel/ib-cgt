@@ -2,7 +2,7 @@
 
 `ib-cgt compute --year` writes a run to `tax_runs`, `matched_disposals`,
 `future_realisations`, `option_grants` (with `option_grant_closes`),
-`option_exercise_transfers`, `fx_event_sources` and `tax_run_issues`.
+`option_exercise_transfers`, `event_sources` and `tax_run_issues`.
 These checks confirm that what was written is still true: a fresh
 engine pass reproduces the persisted rows (D1), the header's net gain
 equals the rows (D2), one run per year (D3), every trade-id reference
@@ -252,7 +252,7 @@ def _check_tax_runs_unique_per_year(ctx: CheckContext) -> Finding:
 
 @register_check(
     name="D4",
-    description="matched_disposals trade-id references resolve in trades or fx_event_sources",
+    description="matched_disposals trade-id references resolve in trades or event_sources",
     tier=Tier.D,
     scopes={Scope.ALL},
     severity=Severity.ERROR,
@@ -264,17 +264,17 @@ def _check_persisted_trade_ids(ctx: CheckContext) -> Finding:
     # FKs (audit stability — a deleted statement should not orphan
     # matched_disposals rows). This check confirms the "still resolve"
     # property without enforcing referential cascade.
-    # A synthetic FX event id (>= 10**12) is not a trade; it resolves
-    # through the run's own `fx_event_sources` map instead.
+    # A synthetic event id (>= 10**12) is not a trade; it resolves
+    # through the run's own `event_sources` map instead.
     bad: list[Mapping[str, object]] = []
     rows = ctx.conn.execute(
         "SELECT md.run_id, md.disposal_trade_id, md.acquisition_trade_id "
         "FROM matched_disposals md "
         "LEFT JOIN trades td ON td.trade_id = md.disposal_trade_id "
-        "LEFT JOIN fx_event_sources sd "
+        "LEFT JOIN event_sources sd "
         "       ON sd.run_id = md.run_id AND sd.event_id = md.disposal_trade_id "
         "LEFT JOIN trades ta ON ta.trade_id = md.acquisition_trade_id "
-        "LEFT JOIN fx_event_sources sa "
+        "LEFT JOIN event_sources sa "
         "       ON sa.run_id = md.run_id AND sa.event_id = md.acquisition_trade_id "
         "WHERE (td.trade_id IS NULL AND sd.event_id IS NULL) "
         "   OR (md.acquisition_trade_id IS NOT NULL "

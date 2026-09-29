@@ -1,21 +1,23 @@
-"""Provenance references for synthetic FX-pool event ids.
+"""Provenance references for synthetic event ids.
 
-The FX rule engine receives non-trade cashflows — futures realisation
-P&L, dividends / withholding tax, bond coupons — under caller-issued
-*synthetic* integer ids so that `Acquisition.trade_id` /
-`Disposal.trade_id` can stay plain integers across every source. Those
-ids are internal plumbing: they are re-issued on every engine run and
-mean nothing on their own. The types in this module are the durable
-answer to "which real row produced this event?" — one small frozen
-record per source kind, keyed by the ids that *are* stable across runs
-(trade ids, dividend ids, coupon ids).
+The rule engines receive non-trade events — futures realisation P&L,
+dividends / withholding tax, bond coupons, cash movements, corporate
+actions — under *synthetic* integer ids so that `Acquisition.trade_id`
+/ `Disposal.trade_id` can stay plain integers across every source.
+Those ids are internal plumbing: all but the corporate-action id are
+re-issued on every engine run and mean nothing on their own. The types
+in this module are the durable answer to "which real row produced this
+event?" — one small frozen record per source kind, keyed by the ids
+that *are* stable across runs (trade ids, dividend ids, coupon ids,
+cash-event ids, corporate-action ids).
 
-The calculator's runner builds a `Mapping[int, FXEventSource]` from
+The calculator's runner builds a `Mapping[int, EventSource]` from
 synthetic id to reference while it allocates the ids; the audit
 renderers use it to print citeable labels (`P&L #A→#B`, `Div #N`,
-`Cpn #N`), and the persisted-run tables use it so an FX matched
-disposal keyed by a synthetic id can still be traced back to its
-source after the run.
+`Cpn #N`, `Cash #N`, `CA #N`), and the persisted-run tables use it so
+a matched disposal keyed by a synthetic id — an FX pool's, or a stock
+or bond disposal a corporate action constituted — can still be traced
+back to its source after the run.
 
 Author: Emre Tezel
 """
@@ -86,7 +88,23 @@ class CashEventRef:
         _require_positive("CashEventRef.cash_event_id", self.cash_event_id)
 
 
-# Sealed union of every source a synthetic FX event id can point at.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CorporateActionRef:
+    """A corporate-action row (`corporate_actions.corporate_action_id`).
+
+    The one source whose synthetic id is a pure function of the row id
+    (`calculator.runner.corporate_action_event_id`), so the stock, bond
+    and FX engines cite the same id for one event without coordinating.
+    """
+
+    corporate_action_id: int
+
+    def __post_init__(self) -> None:
+        """The corporate-action id must be a real (positive) row id."""
+        _require_positive("CorporateActionRef.corporate_action_id", self.corporate_action_id)
+
+
+# Sealed union of every source a synthetic event id can point at.
 # Consumers branch with `isinstance`; adding a source means adding a
 # member here and a branch everywhere mypy flags as non-exhaustive.
-FXEventSource = FutureRealisationRef | DividendRef | BondCouponRef | CashEventRef
+EventSource = FutureRealisationRef | DividendRef | BondCouponRef | CashEventRef | CorporateActionRef

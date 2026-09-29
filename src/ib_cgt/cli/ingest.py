@@ -1,8 +1,7 @@
 """`ib-cgt ingest PATH...` — parse IB statements into the database.
 
 Thin wrapper over `ib_cgt.ingest.ingest_statements`: resolves the DB,
-applies migrations, hands the parser an FX service for the corporate-
-action conversions, and renders one `IngestResult` summary per file.
+applies migrations, and renders one `IngestResult` summary per file.
 Several files are parsed first and then persisted earliest period
 first, so the coverage rule ("the first statement ingested owns its
 days") does not depend on the order the shell expanded the paths.
@@ -18,7 +17,7 @@ from typing import Annotated
 import typer
 
 from ib_cgt.cli.app import app
-from ib_cgt.cli.common import build_fx_service, console
+from ib_cgt.cli.common import console
 from ib_cgt.config import resolve_db_path
 from ib_cgt.db import apply_migrations, open_connection
 from ib_cgt.ingest import (
@@ -50,8 +49,9 @@ def ingest(
             "-r",
             help=(
                 "If a statement was already imported, delete the prior "
-                "import (cascading to its trades, dividends, coupons, cash "
-                "events and open positions) and re-ingest fresh. Also "
+                "import (cascading to its trades, corporate actions, "
+                "dividends, coupons, cash events, open positions and cash "
+                "balances) and re-ingest fresh. Also "
                 "withdraws any earlier import of a *different* file at the "
                 "same path, so a re-downloaded statement replaces the old "
                 "version instead of sitting beside it. Useful during "
@@ -73,7 +73,7 @@ def ingest(
         ),
     ] = StatementFormat.AUTO,
 ) -> None:
-    """Parse IB statements and persist their trades, cash rows and positions.
+    """Parse IB statements and persist their trades, corporate actions, cash rows and positions.
 
     Days already covered by an earlier statement of the same account
     are owned by that statement: a later, overlapping file adds only
@@ -87,17 +87,8 @@ def ingest(
         # SQLite will create empty files on `connect`, so the missing
         # schema manifests as a foreign-key failure deep in the ingestor.
         apply_migrations(conn)
-        # The same FXService wiring used by `match` / `compute`. Needed
-        # so cross-currency cash-merger Corporate Actions can be
-        # synthesized into SELL trades at ingest time. If FX rates
-        # haven't been synced for the merger's date+currencies, the
-        # synthesis raises `RateNotFoundError`; the operator runs
-        # `ib-cgt fx sync` to populate the cache and retries.
-        fx_service = build_fx_service(conn)
         try:
-            results = ingest_statements(
-                paths, conn, replace=replace, fx_service=fx_service, fmt=fmt
-            )
+            results = ingest_statements(paths, conn, replace=replace, fmt=fmt)
         except (StatementParseError, MappingError) as exc:
             # A file that is not a statement, or a row the mappers do
             # not understand: say which file, not where in the code.
@@ -128,17 +119,11 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
         f"for account [bold]{result.account_id}[/]: "
         f"{result.inserted_count} new / {result.trade_count} parsed"
     )
-    if result.merger_trade_count:
-        plural = "" if result.merger_trade_count == 1 else "s"
-        summary += f" (incl. {result.merger_trade_count} corporate-action disposal{plural})"
-    if result.maturity_trade_count:
-        plural = "" if result.maturity_trade_count == 1 else "s"
-        summary += f" (incl. {result.maturity_trade_count} bond maturity disposal{plural})"
-    if result.skipped_maturity_count:
-        plural = "" if result.skipped_maturity_count == 1 else "s"
+    if result.corporate_action_count:
+        plural = "" if result.corporate_action_count == 1 else "s"
         summary += (
-            f" (skipped {result.skipped_maturity_count} bond maturity row{plural} with "
-            "no matching bond instrument)"
+            f"; {result.corporate_actions_inserted} new / {result.corporate_action_count} "
+            f"corporate action{plural}"
         )
     if result.dividend_count:
         plural = "" if result.dividend_count == 1 else "s"
@@ -158,6 +143,9 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
     if result.position_count:
         plural = "" if result.position_count == 1 else "s"
         summary += f"; {result.position_count} open position{plural}"
+    if result.cash_balance_count:
+        plural = "" if result.cash_balance_count == 1 else "s"
+        summary += f"; {result.cash_balance_count} cash balance{plural}"
     if result.option_link_count:
         plural = "" if result.option_link_count == 1 else "s"
         summary += f"; {result.option_link_count} option exercise{plural} linked to a share trade"
@@ -168,6 +156,13 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
             "of this statement"
         )
     console.print(summary + ".")
+    if result.unsupported_corporate_action_count:
+        plural = "" if result.unsupported_corporate_action_count == 1 else "s"
+        console.print(
+            f"[yellow]{result.unsupported_corporate_action_count} corporate-action "
+            f"row{plural} of a shape the engines do not model[/] — stored as data; "
+            "`ib-cgt check data` (A16) lists the ones that move units or cash."
+        )
     if result.fully_covered:
         console.print(
             "[yellow]Period already covered[/] by earlier statements of this account — "
@@ -178,6 +173,7 @@ def _render_ingest_result(result: IngestResult, source: Path) -> None:
         console.print(
             f"[yellow]Skipped {result.covered_count} row{plural}[/] dated on days an earlier "
             f"statement already covers ({result.covered_trade_count} trades, "
+            f"{result.covered_corporate_action_count} corporate actions, "
             f"{result.covered_dividend_count} dividends, {result.covered_bond_coupon_count} "
             f"coupons, {result.covered_cash_event_count} cash events)."
         )

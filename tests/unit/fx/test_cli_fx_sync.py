@@ -33,6 +33,7 @@ from ib_cgt.config import DB_ENV_VAR, FX_URL_ENV_VAR
 from ib_cgt.db import (
     AccountRepo,
     CashEventRepo,
+    CorporateActionRepo,
     FXRateRepo,
     InstrumentRepo,
     StatementRepo,
@@ -44,6 +45,8 @@ from ib_cgt.domain import (
     Account,
     CashEvent,
     CashEventKind,
+    CorporateAction,
+    CorporateActionKind,
     CurrencyPair,
     FXInstrument,
     Money,
@@ -204,11 +207,12 @@ def test_fx_sync_auto_detects_currencies_from_instruments(cli_env: Path) -> None
 
 @respx.mock
 def test_fx_sync_detects_pair_quote_legs_and_cash_event_currencies(cli_env: Path) -> None:
-    """A currency that exists only as a forex quote leg or as broker interest is synced.
+    """A currency seen only as a forex quote leg, as broker interest or as merger cash is synced.
 
-    `EUR.NOK` is stored as an EUR instrument, and AUD credit interest is
-    a cash event with no instrument at all; both currencies get a pool,
-    so both need rates.
+    `EUR.NOK` is stored as an EUR instrument, AUD credit interest is a
+    cash event with no instrument at all, and a GBP-listed fund can be
+    cashed out in CHF; every one of those currencies gets a pool, so
+    every one needs rates.
     """
     conn = open_connection(cli_env)
     try:
@@ -238,6 +242,23 @@ def test_fx_sync_detects_pair_quote_legs_and_cash_event_currencies(cli_env: Path
             ],
             source_statement_hash="c" * 64,
         )
+        # A GBP-listed fund cashed out in CHF: the only CHF anywhere.
+        CorporateActionRepo(conn).insert_many(
+            [
+                CorporateAction(
+                    account_id="U0001",
+                    kind=CorporateActionKind.CASH_DISPOSAL,
+                    instrument=StockInstrument(conid=59262240, symbol="IEMI", currency="GBP"),
+                    effective_datetime=datetime(2012, 6, 1, 12, 0, tzinfo=UTC),
+                    effective_date=date(2012, 6, 1),
+                    report_date=date(2012, 6, 1),
+                    quantity=Decimal("-10"),
+                    cash=Money.of("100", "CHF"),
+                    description="IEMI(IE00B2NPL135) Merged(Acquisition) for CHF 10 per Share",
+                )
+            ],
+            source_statement_hash="c" * 64,
+        )
     finally:
         conn.close()
 
@@ -255,7 +276,7 @@ def test_fx_sync_detects_pair_quote_legs_and_cash_event_currencies(cli_env: Path
                 },
             )
         )
-        for ccy in ("AUD", "EUR", "NOK")
+        for ccy in ("AUD", "CHF", "EUR", "NOK")
     }
     result = CliRunner().invoke(app, ["fx", "sync"])
     assert result.exit_code == 0, result.output

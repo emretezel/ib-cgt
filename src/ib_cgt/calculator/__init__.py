@@ -27,7 +27,13 @@ from ib_cgt.calculator.calculator import (
     TaxYearComputation,
     build_report,
     load_persisted_run,
-    referenced_fx_sources,
+    referenced_event_sources,
+)
+from ib_cgt.calculator.cash_balances import (
+    CASH_TOLERANCE,
+    CashBalanceReconciliation,
+    CashBalanceStatus,
+    reconcile_cash_balances,
 )
 from ib_cgt.calculator.positions import (
     AccountPosition,
@@ -37,7 +43,10 @@ from ib_cgt.calculator.positions import (
     reconcile_positions,
 )
 from ib_cgt.calculator.runner import (
+    corporate_action_event_id,
+    corporate_action_id_of,
     load_fx_inputs,
+    project_pool,
     run_bond_engine,
     run_engines,
     run_future_engine,
@@ -58,9 +67,12 @@ from ib_cgt.calculator.runs import (
 )
 
 __all__ = [
+    "CASH_TOLERANCE",
     "AccountPosition",
     "BondEngineRun",
     "Calculator",
+    "CashBalanceReconciliation",
+    "CashBalanceStatus",
     "EngineFailure",
     "EngineOutputs",
     "FXEngineRun",
@@ -73,11 +85,15 @@ __all__ = [
     "StockEngineRun",
     "TaxYearComputation",
     "build_report",
+    "corporate_action_event_id",
+    "corporate_action_id_of",
     "instrument_reconciles",
     "load_fx_inputs",
     "load_persisted_run",
+    "project_pool",
+    "reconcile_cash_balances",
     "reconcile_positions",
-    "referenced_fx_sources",
+    "referenced_event_sources",
     "run_bond_engine",
     "run_engines",
     "run_future_engine",

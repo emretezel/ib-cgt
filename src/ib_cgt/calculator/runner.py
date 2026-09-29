@@ -50,13 +50,19 @@ calculator's position reconciliation — the runner only reports.
 Synthetic ids
 -------------
 
-Non-trade FX cashflows get caller-issued integer ids from disjoint
-high ranges (see `FXInputs`). Allocation order is deterministic for a
+Non-trade events get caller-issued integer ids from disjoint high
+ranges (see `FXInputs`). Allocation order is deterministic for a
 given database: futures in `InstrumentRepo.list_futures` order and
 engine emit order, then dividends, coupons and cash events by
 currency then date. The persisted-run provenance table and the D1
 recompute check both rely on that determinism, so any change to the
 iteration order here is a behaviour change, not a refactor.
+
+Corporate actions are the exception: their id is a pure function of
+the row (`corporate_action_event_id`), because one event is cited by
+two engines — the stock or bond engine disposes of the units under
+it, and the FX engine acquires the cash under it — and they must
+agree without coordinating.
 
 Author: Emre Tezel
 """
@@ -81,22 +87,27 @@ from ib_cgt.calculator.runs import (
 from ib_cgt.db import (
     BondCouponRepo,
     CashEventRepo,
+    CorporateActionRepo,
     DividendRepo,
     InstrumentRepo,
     OptionExerciseLinkRepo,
     TradeRepo,
 )
 from ib_cgt.domain import (
+    Acquisition,
     AssetClass,
     BondCoupon,
     BondCouponRef,
     CashEvent,
     CashEventRef,
+    CorporateAction,
+    CorporateActionRef,
+    Disposal,
     Dividend,
     DividendRef,
+    EventSource,
     FutureRealisation,
     FutureRealisationRef,
-    FXEventSource,
     FXInstrument,
     OptionExerciseTransfer,
 )
@@ -157,6 +168,31 @@ _REALISATION_ID_BASE = 10**12
 _DIVIDEND_ID_BASE = 2 * 10**12
 _COUPON_ID_BASE = 3 * 10**12
 _CASH_EVENT_ID_BASE = 4 * 10**12
+_CORPORATE_ACTION_ID_BASE = 5 * 10**12
+# Every corporate-action id lives in `(base, base + 10**12)`.
+_CORPORATE_ACTION_ID_LIMIT = 6 * 10**12
+
+
+def corporate_action_event_id(corporate_action_id: int) -> int:
+    """The synthetic event id of a corporate action — a pure function of its row id.
+
+    Unlike the counter-allocated ranges, this needs no allocation
+    pass: the stock or bond engine and the FX engine each derive the
+    same id from `corporate_actions.corporate_action_id`, so the
+    disposal of the units and the acquisition of the cash cite one
+    event, and the provenance row resolves both.
+    """
+    if corporate_action_id <= 0:
+        raise ValueError(f"corporate_action_id must be positive, got {corporate_action_id}")
+    return _CORPORATE_ACTION_ID_BASE + corporate_action_id
+
+
+def corporate_action_id_of(event_id: int) -> int | None:
+    """The row id behind a corporate-action event id, or `None` for any other id."""
+    if _CORPORATE_ACTION_ID_BASE < event_id < _CORPORATE_ACTION_ID_LIMIT:
+        return event_id - _CORPORATE_ACTION_ID_BASE
+    return None
+
 
 # Account label used when a realisation's close trade is not among the
 # loaded futures trades (only possible under a date-clipped load).
@@ -207,6 +243,7 @@ def run_stock_engine(
 
     engine = StockRuleEngine(fx)
     trade_repo = TradeRepo(conn)
+    action_repo = CorporateActionRepo(conn)
     out: list[StockEngineRun] = []
     for instrument_id, instrument in InstrumentRepo(conn).list_stocks(symbol=symbol):
         trades = trade_repo.for_instrument_with_ids(
@@ -220,10 +257,17 @@ def run_stock_engine(
             for trade_id, _trade in trades
             for transfer in transfers_by_share_trade.get(trade_id, ())
         ]
+        actions = _corporate_actions_for(action_repo, instrument_id, since=since, until=until)
         result: MatchingResult | None = None
         error: Exception | None = None
         try:
-            result = engine.compute(instrument, trades, soft_residuals=True, transfers=transfers)
+            result = engine.compute(
+                instrument,
+                trades,
+                soft_residuals=True,
+                transfers=transfers,
+                corporate_actions=actions,
+            )
         except _STOCK_ENGINE_ERRORS as exc:
             error = exc
         out.append(
@@ -233,9 +277,24 @@ def run_stock_engine(
                 trades=tuple(trades),
                 result=result,
                 error=error,
+                corporate_actions=actions,
             )
         )
     return tuple(out)
+
+
+def _corporate_actions_for(
+    repo: CorporateActionRepo,
+    instrument_id: int,
+    *,
+    since: date | None,
+    until: date | None,
+) -> tuple[tuple[int, CorporateAction], ...]:
+    """The corporate actions on one instrument, keyed by their synthetic event ids."""
+    return tuple(
+        (corporate_action_event_id(action_id), action)
+        for action_id, action in repo.for_instrument(instrument_id, since=since, until=until)
+    )
 
 
 def run_bond_engine(
@@ -254,15 +313,19 @@ def run_bond_engine(
     """
     engine = BondRuleEngine(fx)
     trade_repo = TradeRepo(conn)
+    action_repo = CorporateActionRepo(conn)
     out: list[BondEngineRun] = []
     for instrument_id, instrument in InstrumentRepo(conn).list_bonds(symbol=symbol):
         trades = trade_repo.for_instrument_with_ids(
             instrument_id, account_id=None, since=since, until=until
         )
+        actions = _corporate_actions_for(action_repo, instrument_id, since=since, until=until)
         result: BondResult | None = None
         error: Exception | None = None
         try:
-            result = engine.compute(instrument, trades, soft_residuals=True)
+            result = engine.compute(
+                instrument, trades, soft_residuals=True, corporate_actions=actions
+            )
         except _BOND_ENGINE_ERRORS as exc:
             error = exc
         out.append(
@@ -272,6 +335,7 @@ def run_bond_engine(
                 trades=tuple(trades),
                 result=result,
                 error=error,
+                corporate_actions=actions,
             )
         )
     return tuple(out)
@@ -433,7 +497,7 @@ def load_fx_inputs(
         if t.instrument.currency != "GBP"
     )
 
-    sources: dict[int, FXEventSource] = {}
+    sources: dict[int, EventSource] = {}
 
     # Futures realisations — the P&L cashflow of every closed slice of
     # a non-GBP contract. The account is looked up from the close
@@ -458,9 +522,22 @@ def load_fx_inputs(
                 close_trade_id=realisation.close_trade_id,
             )
 
+    # Corporate actions — every disposal for cash, whatever the cash
+    # currency. GBP cash never reaches a pool, but the row is registered
+    # in `sources` all the same: the stock or bond engine cites the
+    # same event id for the disposal of the units, and a persisted
+    # chunk must resolve through the provenance map (check D4).
+    action_repo = CorporateActionRepo(conn)
+    corporate_actions: list[tuple[int, CorporateAction]] = []
+    for action_id, action in action_repo.list_cash_disposals(since=since, until=until):
+        synth_id = corporate_action_event_id(action_id)
+        corporate_actions.append((synth_id, action))
+        sources[synth_id] = CorporateActionRef(corporate_action_id=action_id)
+
     # Pool discovery: every non-GBP currency touched by any source. The
-    # dividend / coupon tables are consulted directly so a currency
-    # with cashflows but no trades in the window still gets a pool.
+    # dividend / coupon / cash-event / corporate-action tables are
+    # consulted directly so a currency with cashflows but no trades in
+    # the window still gets a pool.
     seen: set[str] = set()
     for _tid, trade in forex_trades:
         if isinstance(trade.instrument, FXInstrument):
@@ -474,6 +551,7 @@ def load_fx_inputs(
     seen.update(dividend_repo.distinct_currencies())
     seen.update(coupon_repo.distinct_currencies())
     seen.update(cash_event_repo.distinct_currencies())
+    seen.update(action_repo.distinct_cash_currencies())
     seen.discard("GBP")
     currencies = tuple(sorted(seen))
 
@@ -513,6 +591,7 @@ def load_fx_inputs(
         sources=MappingProxyType(sources),
         currencies=currencies,
         option_trades=option_trades,
+        corporate_actions=tuple(corporate_actions),
     )
 
 
@@ -544,11 +623,39 @@ def run_fx_pools(
                 bond_coupons=inputs.bond_coupons,
                 cash_events=inputs.cash_events,
                 option_trades=inputs.option_trades,
+                corporate_actions=inputs.corporate_actions,
             )
         except _FX_ENGINE_ERRORS as exc:
             error = exc
         out.append(FXEngineRun(currency=currency, inputs=inputs, result=result, error=error))
     return tuple(out)
+
+
+def project_pool(
+    fx: FXConverter,
+    inputs: FXInputs,
+    currency: str,
+) -> tuple[list[Acquisition], list[Disposal]]:
+    """Project one pool's events from a shared input bundle without matching them.
+
+    What `run_fx_pools` feeds the matcher for `currency`, returned as
+    the raw acquisition and disposal streams. The cash-balance
+    reconciliation sums these per account to compare the engine's
+    view of a currency balance with the statements' Cash Report.
+    """
+    return FXRuleEngine(fx).project(
+        currency,
+        forex_trades=inputs.forex_trades,
+        stock_trades=inputs.stock_trades,
+        bond_trades=inputs.bond_trades,
+        future_trades=inputs.future_trades,
+        future_realisations=inputs.future_realisations,
+        dividends=inputs.dividends,
+        bond_coupons=inputs.bond_coupons,
+        cash_events=inputs.cash_events,
+        option_trades=inputs.option_trades,
+        corporate_actions=inputs.corporate_actions,
+    )
 
 
 def run_fx_engine(

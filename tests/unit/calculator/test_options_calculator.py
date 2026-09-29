@@ -97,7 +97,8 @@ def seed_options(conn: sqlite3.Connection) -> dict[str, int]:
     # provenance key is `(statement, row index)`).
     conn.execute(
         "INSERT INTO statement_positions "
-        "(statement_hash, statement_row_index, instrument_id, quantity) VALUES (?, 100, ?, '-1')",
+        "(statement_hash, statement_row_index, instrument_id, quantity, close_price) "
+        "VALUES (?, 100, ?, '-1', '1')",
         (STATEMENT_HASH, InstrumentRepo(conn).upsert(AAPL_CALL)),
     )
     return {

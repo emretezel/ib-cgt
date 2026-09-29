@@ -86,8 +86,17 @@ def _stock_acquisition_qty(run: StockEngineRun) -> dict[int, Decimal]:
 
 
 def _stock_disposal_qty(run: StockEngineRun) -> dict[int, Decimal]:
-    """Map every SELL trade_id in a stock run to its disposal quantity."""
-    return {tid: t.quantity for tid, t in run.trades if t.action is TradeAction.SELL}
+    """Map every disposal id in a stock run to its quantity.
+
+    SELL trades by trade id, plus the disposals corporate actions
+    constituted (a cash merger takes the whole holding) by their
+    synthetic event id — the engine cites both the same way.
+    """
+    out = {tid: t.quantity for tid, t in run.trades if t.action is TradeAction.SELL}
+    for event_id, action in run.corporate_actions:
+        if action.is_cash_disposal:
+            out[event_id] = action.disposed_quantity
+    return out
 
 
 def _stock_acquisition_dates(run: StockEngineRun) -> dict[int, date]:

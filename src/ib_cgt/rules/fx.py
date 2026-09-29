@@ -5,7 +5,7 @@ Per `docs/architecture.md §Scope — FX treatment` and HMRC CG78315
 each non-GBP currency as its own chargeable asset, pooled per single
 currency vs GBP under the same four-rule matching as ordinary shares
 (same-day → 30-day → S.104 → s.105(2)). This engine projects events
-from **eight** sources into the GBP `Acquisition` / `Disposal` shapes
+from **ten** sources into the GBP `Acquisition` / `Disposal` shapes
 consumed by the shared `MatchingEngine` and runs one matcher per
 non-GBP currency:
 
@@ -30,6 +30,11 @@ non-GBP currency:
 9. **Option trades** — every premium received or paid, commission,
    and cash settlement on a non-GBP option series, on the trade
    date (the shares of a linked exercise are the stock projection's).
+10. **Corporate actions** — the cash a disposal for cash (a cash
+    merger, a fund redemption, a bond maturity) put into the balance,
+    in the currency the issuer paid, on the effective date. The
+    units leave through the stock or bond engine under the same
+    event id.
 
 Pool model — per currency, not per traded pair
 ----------------------------------------------
@@ -73,6 +78,7 @@ from ib_cgt.domain import (
     AssetClass,
     BondCoupon,
     CashEvent,
+    CorporateAction,
     Disposal,
     Dividend,
     FutureRealisation,
@@ -84,6 +90,7 @@ from ib_cgt.rules.fx_cashflow import (
     from_bond_coupon,
     from_bond_trade,
     from_cash_event,
+    from_corporate_action,
     from_dividend,
     from_forex_trade,
     from_future_fee,
@@ -134,6 +141,7 @@ class FXRuleEngine:
         bond_coupons: Sequence[tuple[int, BondCoupon]] = (),
         cash_events: Sequence[tuple[int, CashEvent]] = (),
         option_trades: Sequence[tuple[int, Trade]] = (),
+        corporate_actions: Sequence[tuple[int, CorporateAction]] = (),
     ) -> MatchingResult:
         """Match every disposal of `currency` against acquisitions of `currency`.
 
@@ -196,6 +204,11 @@ class FXRuleEngine:
                 trades. Premiums received acquire the series' currency,
                 premiums and commissions paid dispose of it, on the
                 trade date. Pass an empty sequence to skip.
+            corporate_actions: `(synth_id, action)` pairs for every
+                `cash_disposal` corporate action. The cash leg acquires
+                its own currency on the effective date; GBP cash and
+                unsupported rows project nothing. The synthetic id is
+                the row-derived one the stock / bond engine cites.
 
         Returns:
             A `MatchingResult` describing the four-rule matching for
@@ -216,7 +229,51 @@ class FXRuleEngine:
         validate_currency_code(currency)
         if currency == "GBP":
             raise ValueError("FXRuleEngine.compute: currency must be non-GBP, got 'GBP'")
+        acquisitions, disposals = self.project(
+            currency,
+            forex_trades=forex_trades,
+            stock_trades=stock_trades,
+            bond_trades=bond_trades,
+            future_trades=future_trades,
+            future_realisations=future_realisations,
+            dividends=dividends,
+            bond_coupons=bond_coupons,
+            cash_events=cash_events,
+            option_trades=option_trades,
+            corporate_actions=corporate_actions,
+        )
+        return self._matcher.match(
+            make_pool_instrument(currency),
+            acquisitions,
+            disposals,
+            soft_residuals=True,
+        )
 
+    def project(
+        self,
+        currency: str,
+        forex_trades: Sequence[tuple[int, Trade]] = (),
+        stock_trades: Sequence[tuple[int, Trade]] = (),
+        bond_trades: Sequence[tuple[int, Trade]] = (),
+        future_trades: Sequence[tuple[int, Trade]] = (),
+        future_realisations: Sequence[tuple[int, FutureRealisation, str]] = (),
+        dividends: Sequence[tuple[int, Dividend]] = (),
+        bond_coupons: Sequence[tuple[int, BondCoupon]] = (),
+        cash_events: Sequence[tuple[int, CashEvent]] = (),
+        option_trades: Sequence[tuple[int, Trade]] = (),
+        corporate_actions: Sequence[tuple[int, CorporateAction]] = (),
+    ) -> tuple[list[Acquisition], list[Disposal]]:
+        """Project every source's events for `currency` without matching them.
+
+        The pure first half of `compute`: the same arguments, the same
+        projection rules, returned as the raw acquisition and disposal
+        streams (each stamped with the synthetic pool instrument and
+        the source's account). `compute` matches them; the cash-balance
+        reconciliation sums them per account instead, so the two views
+        of a currency can never drift apart. Does not validate the
+        currency — a caller that wants the GBP rejection goes through
+        `compute`.
+        """
         pool_instrument = make_pool_instrument(currency)
 
         acquisitions: list[Acquisition] = []
@@ -327,9 +384,18 @@ class FXRuleEngine:
             else:
                 disposals.append(option_event)
 
-        return self._matcher.match(
-            pool_instrument,
-            acquisitions,
-            disposals,
-            soft_residuals=True,
-        )
+        # Corporate actions — the cash a disposal for cash put into the
+        # balance, in the currency the issuer paid, on the effective
+        # date. The units left through the stock or bond engine.
+        for synth_id, action in corporate_actions:
+            action_event = from_corporate_action(
+                synth_id, action, currency, self._fx, pool_instrument
+            )
+            if action_event is None:
+                continue
+            if isinstance(action_event, Acquisition):
+                acquisitions.append(action_event)
+            else:
+                disposals.append(action_event)
+
+        return acquisitions, disposals

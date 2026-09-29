@@ -43,7 +43,7 @@ def compute(
     matching is path-dependent, so the year cannot be computed from
     its own trades alone), keeps the disposals and futures close-outs
     dated inside the year, and writes them to `tax_runs`,
-    `matched_disposals`, `future_realisations`, `fx_event_sources`
+    `matched_disposals`, `future_realisations`, `event_sources`
     and `tax_run_issues` in one transaction, replacing any earlier
     run for the same year.
 

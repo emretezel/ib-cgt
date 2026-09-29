@@ -226,3 +226,72 @@ def test_B8_fires_on_basis_rule_mismatch(db: sqlite3.Connection, fx_service: FXS
         if c.name == "B8":
             out.append(c.fn(ctx))
     assert out and out[0].triggered, "B8 must fire on basis-rule mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Corporate actions — the disposal id is a synthetic event id
+# ---------------------------------------------------------------------------
+
+
+def test_B1_counts_a_disposal_a_corporate_action_constituted(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """Quantity conservation reads the corporate action's units, cited by its event id."""
+    from datetime import UTC, date, datetime
+    from zoneinfo import ZoneInfo
+
+    from ib_cgt.db import CorporateActionRepo, TradeRepo
+    from ib_cgt.domain import (
+        CorporateAction,
+        CorporateActionKind,
+        StockInstrument,
+        Trade,
+        TradeAction,
+    )
+
+    iemi = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+    uk = ZoneInfo("Europe/London")
+    # Row identity is (statement, row index): the baseline holds 0..4
+    # under `hash-a`, so the buy takes an index past them.
+    TradeRepo(db).insert_indexed(
+        [
+            (
+                100,
+                Trade(
+                    account_id="U1004320",
+                    instrument=iemi,
+                    action=TradeAction.BUY,
+                    trade_datetime=datetime(2025, 4, 1, 14, 0, tzinfo=uk),
+                    trade_date=date(2025, 4, 1),
+                    settlement_date=date(2025, 4, 1),
+                    quantity=Decimal("824"),
+                    price=Money.of(Decimal("12.52"), "GBP"),
+                    fees=Money.of(Decimal("6"), "GBP"),
+                ),
+            )
+        ],
+        source_statement_hash="hash-a",
+    )
+    CorporateActionRepo(db).insert_many(
+        [
+            CorporateAction(
+                account_id="U1004320",
+                kind=CorporateActionKind.CASH_DISPOSAL,
+                instrument=iemi,
+                effective_datetime=datetime(2025, 4, 3, 1, 25, tzinfo=UTC),
+                effective_date=date(2025, 4, 3),
+                report_date=date(2025, 4, 3),
+                quantity=Decimal("-824"),
+                cash=Money.of("10641.43", "GBP"),
+                description="IEMI(IE00B2NPL135) Merged(Acquisition) for GBP 12.914 per Share",
+            )
+        ],
+        source_statement_hash="hash-a",
+    )
+    runs = run_stock_engine(db, fx_service, symbol="IEMI")
+    [run] = runs
+    assert run.result is not None
+    assert [md.disposal_trade_id for md in run.result.matched_disposals] == [5 * 10**12 + 1]
+    report = run_all(db, fx=fx_service, scope=Scope.STOCKS)
+    assert _check(report.results, "B1").status is Status.OK
+    assert _check(report.results, "C7").status is Status.OK

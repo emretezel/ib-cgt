@@ -176,10 +176,11 @@ class RawDividendRow:
         description: Free-text — the gate the mapper uses to
             classify the row's `kind` and to extract the symbol.
         amount_text: The cash amount as printed (`"249.67"`,
-            `"-12.50"`, etc.). Sign in the source: dividends are
-            positive, WHT is negative when surfaced as a separate
-            line on a same-section sibling. The mapper takes the
-            absolute value and uses `kind` to encode direction.
+            `"-12.50"`, etc.). Sign in the source: a distribution
+            received is positive, withholding debited at source is
+            negative, and IB flips the sign for a payment in lieu
+            owed on a short or a withholding reversal. The mapper
+            keeps the sign — it is the direction.
     """
 
     section: str
@@ -245,6 +246,10 @@ class RawOpenPositionRow:
             stocks and futures) — a resolution aid for bonds.
         quantity_text: Signed quantity as printed, thousands commas
             included (`"-3"`, `"30,000"`).
+        close_price_text: The `Close Price` cell as printed — the
+            statement's valuation price for the last day of the period
+            (a futures contract's settlement price, a bond's percentage
+            of par).
         multiplier_text: The `Mult` cell where the sub-table has one,
             else `None`.
     """
@@ -254,7 +259,37 @@ class RawOpenPositionRow:
     symbol: str
     description: str
     quantity_text: str
+    close_price_text: str
     multiplier_text: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RawCashReportRow:
+    """One line of the Cash Report section, still as raw text.
+
+    The Cash Report closes the statement with, per currency, the cash
+    at the start of the period, IB's own breakdown of the movements
+    (`Commissions`, `Dividends`, `Broker Interest Paid and Received`,
+    …) and the cash at the end. Its label column has no header and
+    the numeric columns are one per account segment plus their sum,
+    of which only the `Total` is read. The parser is label-blind: it
+    emits every line and lets `ingest/cash_balances.py` keep the two
+    balance lines.
+
+    Attributes:
+        currency: The sub-header the line sat under: an ISO-4217 code
+            for a real currency block, `"Base Currency Summary"` (the
+            HTML adapter) or `""` (the PDF adapter) for the block that
+            translates every currency into GBP.
+        label: The line's label as printed (`"Starting Cash"`,
+            `"Ending Cash"`, `"Dividends"`, …).
+        total_text: The `Total` column as printed, thousands commas
+            and sign included.
+    """
+
+    currency: str
+    label: str
+    total_text: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -280,10 +315,12 @@ class ParsedStatement:
     # the others. Real parser output always populates every field.
     cash_rows: tuple[RawCashRow, ...] = ()
     open_positions: tuple[RawOpenPositionRow, ...] = ()
+    cash_report: tuple[RawCashReportRow, ...] = ()
 
 
 __all__ = [
     "ParsedStatement",
+    "RawCashReportRow",
     "RawCashRow",
     "RawCorporateActionRow",
     "RawDividendRow",

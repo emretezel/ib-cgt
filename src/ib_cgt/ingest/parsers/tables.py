@@ -59,6 +59,7 @@ class SectionKind(StrEnum):
     DEPOSITS_WITHDRAWALS = "deposits_withdrawals"
     FEES = "fees"
     OPEN_POSITIONS = "open_positions"
+    CASH_REPORT = "cash_report"
 
 
 class RowKind(StrEnum):

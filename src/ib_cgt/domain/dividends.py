@@ -25,10 +25,14 @@ listing's trades in (IEMI trades in GBP and pays USD), so the
 dividend's `amount` currency is simply the payment currency and
 nothing forces it to agree with any instrument.
 
-Direction is encoded in `kind` (`cash_dividend` and
-`payment_in_lieu` are pool acquisitions; `withholding_tax` is a
-pool disposal) so `amount` stays strictly positive — same
-convention `Trade.quantity` follows with `Trade.action`.
+Direction is the **sign of the amount**, exactly as IB prints it —
+the same convention `CashEvent` follows. `kind` records what the row
+*is* (a cash dividend, a payment in lieu, withholding tax), not which
+way the cash moved: a payment in lieu is normally received but is
+*paid* when the stock is held short (TUR, June 2019, -887.72 USD),
+and withholding is normally debited but is *refunded* when IB
+re-books it at a different rate (January 2017, +206.10 / +412.20 USD).
+A kind-based direction misread both; the sign never does.
 
 Author: Emre Tezel
 """
@@ -49,20 +53,23 @@ class InvalidDividendError(ValueError):
 class DividendKind(StrEnum):
     """Discriminator for the three dividend-section row variants.
 
-    `cash_dividend`: gross cash distribution received, in the
-        payment currency. Inflow into the FX pool.
-    `withholding_tax`: foreign-jurisdiction WHT debited at source
-        on a `cash_dividend`. Outflow from the FX pool. Stored as
-        a positive amount with `kind=WITHHOLDING_TAX` rather than
-        a signed dividend so the gross / WHT split is auditable
-        independently and so each contributes its own row to the
-        FX-pool table.
+    `cash_dividend`: gross cash distribution, in the payment
+        currency. Normally positive (received).
+    `withholding_tax`: foreign-jurisdiction WHT on a distribution.
+        Normally negative (debited at source); positive when IB
+        reverses a charge it re-books at another rate. Kept as its
+        own row rather than netted into the dividend so the gross /
+        WHT split is auditable independently and so each contributes
+        its own row to the FX-pool table.
     `payment_in_lieu`: payment in lieu of dividend on stock the
-        broker has loaned out (Stock Yield Enhancement Programme).
-        Treated identically to `cash_dividend` for FX-pool
-        purposes; kept distinct so income-tax reporting can apply
-        the right HMRC treatment later (PILs are not qualifying
-        dividends).
+        broker has loaned out (Stock Yield Enhancement Programme), or
+        *owed* on stock held short. Positive when received, negative
+        when paid. Kept distinct from `cash_dividend` so income-tax
+        reporting can apply the right HMRC treatment later (PILs are
+        not qualifying dividends).
+
+    The kind never decides direction — the sign of `Dividend.amount`
+    does.
     """
 
     CASH_DIVIDEND = "cash_dividend"
@@ -85,9 +92,10 @@ class Dividend:
         pay_date: The settlement / payment date — when the cash
             hits the foreign-currency balance and therefore the
             date whose FX rate is applied for GBP conversion.
-        amount: Strictly positive `Money` in the payment currency,
+        amount: Signed, non-zero `Money` in the payment currency,
             which may differ from the currency the stock trades in.
-            Direction is in `kind`.
+            Positive means cash arrived in the balance, negative
+            means cash left it — the sign is the direction.
         description: The raw IB description string verbatim
             (e.g. ``"AAPL(US0378331005) Cash Dividend USD 0.24
             per Share (Mixed Income)"``). Kept so `show dividend`
@@ -108,13 +116,23 @@ class Dividend:
             raise InvalidDividendError("Dividend.account_id must be non-empty")
         if not self.symbol or not self.symbol.strip():
             raise InvalidDividendError("Dividend.symbol must be non-empty")
-        if self.amount.amount <= 0:
+        if self.amount.amount == 0:
             raise InvalidDividendError(
-                f"Dividend.amount must be strictly positive (got {self.amount.amount}); "
-                "direction is encoded in `kind`, not the sign of the amount."
+                "Dividend.amount must be non-zero — a zero row moves no cash and is not a "
+                "distribution; direction is the sign of the amount."
             )
         if not self.description or not self.description.strip():
             raise InvalidDividendError("Dividend.description must be non-empty")
+
+    @property
+    def is_inflow(self) -> bool:
+        """True when cash arrived in the balance (positive amount).
+
+        A received dividend or payment in lieu, or a withholding
+        reversal. False for withholding debited at source and for a
+        payment in lieu owed on a short.
+        """
+        return self.amount.amount > 0
 
 
 __all__ = ["Dividend", "DividendKind", "InvalidDividendError"]

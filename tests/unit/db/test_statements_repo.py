@@ -133,6 +133,19 @@ def test_latest_for_account_picks_the_greatest_period_end(db: sqlite3.Connection
     assert latest.statement_hash == "h-25"
 
 
+def test_earliest_for_account_picks_the_smallest_period_start(db: sqlite3.Connection) -> None:
+    """The cash-balance reconciliation starts every pool at the first statement's opening cash."""
+    _seed_account(db)
+    repo = StatementRepo(db)
+    _record(repo, statement_hash="h-late", period_end=date(2026, 4, 5))
+    _record(repo, statement_hash="h-early", period_end=date(2011, 12, 31))
+    _record(repo, statement_hash="h-mid", period_end=date(2012, 12, 31))
+    earliest = repo.earliest_for_account("U1")
+    assert earliest is not None
+    assert earliest.statement_hash == "h-early"
+    assert repo.earliest_for_account("U-unknown") is None
+
+
 def test_latest_for_account_is_none_without_statements(db: sqlite3.Connection) -> None:
     _seed_account(db)
     assert StatementRepo(db).latest_for_account("U1") is None

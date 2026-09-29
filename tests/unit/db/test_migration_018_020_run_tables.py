@@ -98,24 +98,26 @@ def test_018_emptied_tax_runs_on_apply() -> None:
 
 
 def test_019_unique_source_per_run_for_each_kind() -> None:
+    """The provenance map (renamed `event_sources` by 024) keeps one id per source per run."""
     conn, run_id = _conn()
     conn.execute(
-        "INSERT INTO fx_event_sources (run_id, event_id, kind, open_trade_id, close_trade_id) "
+        "INSERT INTO event_sources (run_id, event_id, kind, open_trade_id, close_trade_id) "
         "VALUES (?, 1000000000000, 'FUTURE_REALISATION', 5, 9)",
         (run_id,),
     )
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
-            "INSERT INTO fx_event_sources (run_id, event_id, kind, open_trade_id, close_trade_id) "
+            "INSERT INTO event_sources (run_id, event_id, kind, open_trade_id, close_trade_id) "
             "VALUES (?, 1000000000001, 'FUTURE_REALISATION', 5, 9)",
             (run_id,),
         )
-    indexes = {r["name"] for r in conn.execute("PRAGMA index_list(fx_event_sources)")}
+    indexes = {r["name"] for r in conn.execute("PRAGMA index_list(event_sources)")}
     assert {
-        "ux_fx_event_sources_realisation",
-        "ux_fx_event_sources_dividend",
-        "ux_fx_event_sources_coupon",
-        "ux_fx_event_sources_cash_event",
+        "ux_event_sources_realisation",
+        "ux_event_sources_dividend",
+        "ux_event_sources_coupon",
+        "ux_event_sources_cash_event",
+        "ux_event_sources_corporate_action",
     } <= indexes
 
 

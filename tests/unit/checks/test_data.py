@@ -133,6 +133,52 @@ def test_baseline_per_check_clean(
 
 
 # ---------------------------------------------------------------------------
+# A13 — dividends referential integrity and sanity
+# ---------------------------------------------------------------------------
+
+
+def _seed_dividend(db: sqlite3.Connection) -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from ib_cgt.db import DividendRepo
+    from ib_cgt.domain import Dividend, DividendKind, Money
+
+    DividendRepo(db).insert_many(
+        [
+            Dividend(
+                account_id="U1004320",
+                symbol="TUR",
+                kind=DividendKind.PAYMENT_IN_LIEU,
+                pay_date=date(2025, 4, 3),
+                amount=Money.of(Decimal("-887.72"), "USD"),
+                description="TUR(US4642867158) Payment in Lieu of Dividend (Ordinary Dividend)",
+            )
+        ],
+        source_statement_hash="hash-a",
+    )
+
+
+def test_A13_clean_with_a_signed_dividend(db: sqlite3.Connection, fx_service: FXService) -> None:
+    """A negative row (a payment in lieu paid on a short) is a fact, not a defect."""
+    _seed_dividend(db)
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    assert _check(report.results, "A13").status is Status.OK
+
+
+def test_A13_warns_on_zero_amount(db: sqlite3.Connection, fx_service: FXService) -> None:
+    """Schema and domain both refuse a zero; a stored zero can only be a hand-edit."""
+    _seed_dividend(db)
+    db.execute("PRAGMA ignore_check_constraints = ON")
+    db.execute("UPDATE dividends SET amount_native = '0.00'")
+    db.commit()
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    r = _check(report.results, "A13")
+    assert r.status is Status.WARN
+    assert "zero amount" in (r.detail or "")
+
+
+# ---------------------------------------------------------------------------
 # A14 — cash_events referential integrity and sanity
 # ---------------------------------------------------------------------------
 
@@ -201,3 +247,74 @@ def test_A15_flags_a_fact_dated_far_outside_its_statement_period(
     a15 = _check(report.results, "A15")
     assert a15.status is Status.WARN
     assert any(ev["source_table"] == "trades" for ev in a15.evidence)
+
+
+# ---------------------------------------------------------------------------
+# A16 — unsupported corporate actions that move units or cash
+# ---------------------------------------------------------------------------
+
+
+def _seed_corporate_action(db: sqlite3.Connection, *, quantity: str, cash: str | None) -> None:
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+
+    from ib_cgt.db import CorporateActionRepo
+    from ib_cgt.domain import CorporateAction, CorporateActionKind, Money
+
+    CorporateActionRepo(db).insert_many(
+        [
+            CorporateAction(
+                account_id="U1004320",
+                kind=CorporateActionKind.UNSUPPORTED,
+                instrument=None,
+                effective_datetime=datetime(2025, 4, 3, 1, 25, tzinfo=UTC),
+                effective_date=date(2025, 4, 3),
+                report_date=date(2025, 4, 3),
+                quantity=Decimal(quantity),
+                cash=Money.of(cash, "USD") if cash is not None else None,
+                description="XYZ(US0000000001) Spin-off",
+            )
+        ],
+        source_statement_hash="hash-a",
+    )
+
+
+def test_A16_warns_on_an_unsupported_row_that_moves_units(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    _seed_corporate_action(db, quantity="50", cash=None)
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    r = _check(report.results, "A16")
+    assert r.status is Status.WARN
+    assert "1 corporate-action row(s)" in (r.detail or "")
+    assert r.evidence is not None
+    assert r.evidence[0]["description"] == "XYZ(US0000000001) Spin-off"
+
+
+def test_A16_warns_on_an_unsupported_row_that_moves_cash(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    _seed_corporate_action(db, quantity="0", cash="12.34")
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    assert _check(report.results, "A16").status is Status.WARN
+
+
+def test_A16_quiet_for_an_inert_unsupported_row(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """A name change moves nothing; it is stored but not worth a warning."""
+    _seed_corporate_action(db, quantity="0", cash=None)
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    assert _check(report.results, "A16").status is Status.OK
+
+
+def test_A15_covers_corporate_actions(db: sqlite3.Connection, fx_service: FXService) -> None:
+    """A corporate action dated far outside its statement's period is flagged like a trade."""
+    _seed_corporate_action(db, quantity="0", cash=None)
+    db.execute("UPDATE corporate_actions SET effective_date = '2019-01-01'")
+    db.commit()
+    report = run_all(db, fx=fx_service, scope=Scope.DATA)
+    r = _check(report.results, "A15")
+    assert r.status is Status.WARN
+    assert r.evidence is not None
+    assert r.evidence[0]["source_table"] == "corporate_actions"

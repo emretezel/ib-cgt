@@ -64,3 +64,16 @@ def test_rows_cascade_with_the_run(db: sqlite3.Connection) -> None:
     runs.replace_for(TaxYear(2024), Money.gbp("1"))
     assert repo.count() == 0
     assert repo.insert_many(run_id, []) == 0
+
+
+def test_cash_balance_mismatch_round_trips_on_the_pool_instrument(db: sqlite3.Connection) -> None:
+    """Migration 024 admits the twelfth kind; it names the currency's pool like `fx_residual`."""
+    run_id = TaxRunRepo(db).create(TaxYear(2025), Money.gbp("0"))
+    repo = TaxRunIssueRepo(db)
+    issue = RunIssue(
+        kind=RunIssueKind.CASH_BALANCE_MISMATCH,
+        instrument=make_pool_instrument("USD"),
+        message="U1 USD at 2026-04-03: IB 0.00 -> 1,127.55 (moved 1,127.55); difference 516.35",
+    )
+    assert repo.insert_many(run_id, [issue]) == 1
+    assert repo.for_run(run_id) == [issue]

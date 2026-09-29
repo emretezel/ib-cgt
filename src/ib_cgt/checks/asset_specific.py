@@ -31,6 +31,11 @@ Each Tier C invariant is anchored to one rule engine:
 * **C10** — every exercise link pairs an option row with a stock
   trade of the underlying at the strike for `contracts x multiplier`
   at the same instant, in the direction the right implies.
+* **C11** — every account's holding of every non-GBP currency, as the
+  FX-pool sources project it (open futures marked at the statement's
+  close), agrees with the Cash Report's ending cash within one unit
+  of the currency (the calculator's cash reconciliation, run
+  standalone).
 
 C1, C6 and C8 catch engine-time exceptions; the others are pure
 post-conditions the engines should already enforce. Tier C is
@@ -47,6 +52,7 @@ from datetime import date as date_cls
 from decimal import Decimal
 from typing import Final, Literal
 
+from ib_cgt.calculator.cash_balances import CashBalanceStatus
 from ib_cgt.calculator.positions import PositionStatus
 from ib_cgt.calculator.runs import BondEngineRun, OptionEngineRun, StockEngineRun
 from ib_cgt.checks.framework import (
@@ -601,5 +607,66 @@ def _check_positions_reconcile(ctx: CheckContext) -> Finding:
     return Finding(
         triggered=True,
         detail=f"{len(bad)} position(s) disagree with the latest statement",
+        evidence=_truncate(bad),
+    )
+
+
+# ---------------------------------------------------------------------------
+# C11 — projected currency balances reconcile with the Cash Report
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="C11",
+    description=(
+        "every account's non-GBP cash balance projected by the FX-pool sources, with open "
+        "futures marked at the statement's close, matches the Cash Report's ending cash"
+    ),
+    tier=Tier.C,
+    scopes={Scope.ALL, Scope.FX, Scope.POOL},
+    severity=Severity.ERROR,
+)
+def _check_cash_balances_reconcile(ctx: CheckContext) -> Finding:
+    """Report every account and currency whose pools and Cash Report disagree.
+
+    The same reconciliation `compute` turns into `cash_balance_mismatch`
+    issues, run standalone so a missing pool source is visible before
+    any tax year is computed. It is the money-side twin of C7: C7
+    proves every unit of every security is accounted for, C11 proves
+    every unit of every currency is. The comparison is per account
+    over the whole history — IB's ending cash on the latest statement
+    less its starting cash on the earliest, against the engine's
+    projected events plus the unrealised P&L of its open futures lots
+    at the statement's close prices — within one unit of the currency
+    (`CASH_TOLERANCE`), the sum of IB's per-line cent roundings. An
+    open lot whose contract the statement no longer lists cannot be
+    marked; it is counted in the evidence and is C7's finding.
+    """
+    bad: list[Mapping[str, object]] = []
+    for rec in ctx.cash_reconciliations():
+        if rec.status is CashBalanceStatus.MATCH:
+            continue
+        bad.append(
+            {
+                "account": rec.account_id,
+                "currency": rec.currency,
+                "as_of": rec.latest.period_end.isoformat(),
+                # Fixed to the cent: the sums carry whatever exponent
+                # their inputs had, and evidence must read the same
+                # whether a figure came from one row or a thousand.
+                "ib_starting": f"{rec.ib_starting:.2f}",
+                "ib_ending": f"{rec.ib_ending:.2f}",
+                "ib_delta": f"{rec.ib_delta:.2f}",
+                "engine_balance": f"{rec.engine_balance:.2f}",
+                "open_futures": f"{rec.futures_adjustment:.2f}",
+                "difference": f"{rec.difference:.2f}",
+                "unpriced_open_lots": rec.unpriced_open_lots,
+            }
+        )
+    if not bad:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=f"{len(bad)} cash balance(s) disagree with the Cash Report",
         evidence=_truncate(bad),
     )

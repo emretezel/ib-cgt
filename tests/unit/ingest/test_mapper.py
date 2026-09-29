@@ -16,7 +16,8 @@ from ib_cgt.domain import (
     StockInstrument,
     TradeAction,
 )
-from ib_cgt.ingest.mapper import MappingError, map_rows
+from ib_cgt.ingest.instrument_info import InstrumentInfoIndex
+from ib_cgt.ingest.mapper import MappingError, build_bond_instrument, map_rows
 from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawInstrumentInfo,
@@ -648,3 +649,47 @@ def test_option_row_without_instrument_info_raises_mapping_error() -> None:
     )
     with pytest.raises(MappingError, match="no matching entry"):
         map_rows(_make([row]))
+
+
+# ---------------------------------------------------------------------------
+# build_bond_instrument — the ISIN a corporate-action row supplies
+# ---------------------------------------------------------------------------
+
+
+def test_build_bond_instrument_prefers_the_security_id_lookup() -> None:
+    """A row keyed by ISIN resolves even when the caller's symbol is a stale rendering."""
+    index = InstrumentInfoIndex(
+        [
+            _bond_info(
+                symbol="UKT 0 1/4 01/31/25",
+                description="United Kingdom Gilt UKT 0 1/4 01/31/25",
+                security_id="GB00BLPK7110",
+            )
+        ]
+    )
+    bond = build_bond_instrument(
+        "UKT 0 1/4 01/31/25 FH45", "GBP", index, security_id="GB00BLPK7110"
+    )
+    assert bond.isin == "GB00BLPK7110"
+    assert bond.symbol == "UKT 0 1/4 01/31/25"
+    assert bond.is_cgt_exempt is True
+
+
+def test_build_bond_instrument_falls_back_to_the_isin_when_no_info_row() -> None:
+    """The 2012-2017 vintages have no bonds-shaped instrument table; the ISIN alone suffices."""
+    bond = build_bond_instrument(
+        "UKT 2 3/4 09/07/24 FH45", "GBP", InstrumentInfoIndex([]), security_id="GB00BHBFH458"
+    )
+    assert bond.isin == "GB00BHBFH458"
+    assert bond.symbol == "UKT 2 3/4 09/07/24"
+    # No description: the symbol-prefix rule classifies a GBP `UKT` as a gilt.
+    assert bond.is_cgt_exempt is True
+    corporate = build_bond_instrument(
+        "ACME 5 2030", "USD", InstrumentInfoIndex([]), security_id="US0000000789"
+    )
+    assert corporate.is_cgt_exempt is False
+
+
+def test_build_bond_instrument_without_an_isin_still_fails_loudly() -> None:
+    with pytest.raises(MappingError, match="no resolvable ISIN"):
+        build_bond_instrument("UKT 2 3/4 09/07/24", "GBP", InstrumentInfoIndex([]))

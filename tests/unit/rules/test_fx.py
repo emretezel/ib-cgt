@@ -31,6 +31,8 @@ from ib_cgt.domain import (
     BondInstrument,
     CashEvent,
     CashEventKind,
+    CorporateAction,
+    CorporateActionKind,
     DirectAcquisition,
     Dividend,
     DividendKind,
@@ -817,7 +819,7 @@ def test_compute_treats_withholding_tax_as_disposal() -> None:
     engine = FXRuleEngine(fx)
 
     cash_div = _dividend(pay_date=div_date, amount="100")
-    wht = _dividend(kind=DividendKind.WITHHOLDING_TAX, pay_date=wht_date, amount="15")
+    wht = _dividend(kind=DividendKind.WITHHOLDING_TAX, pay_date=wht_date, amount="-15")
     result = engine.compute(
         "USD",
         dividends=[(2 * 10**12, cash_div), (2 * 10**12 + 1, wht)],
@@ -993,3 +995,73 @@ def test_pool_reconciles_to_the_cent_like_ibs_ledger() -> None:
     assert [m.match_rule for m in result.matched_disposals] == [MatchRule.SAME_DAY]
     assert result.matched_disposals[0].matched_quantity == Decimal("0.40")
     assert result.final_pool.quantity == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# project() and corporate-action cash
+# ---------------------------------------------------------------------------
+
+
+def _corporate_action(cash: Money, on: date) -> CorporateAction:
+    """A GBP-listed stock cashed out for `cash` on `on` (the IEMI shape)."""
+    return CorporateAction(
+        account_id="U1",
+        kind=CorporateActionKind.CASH_DISPOSAL,
+        instrument=StockInstrument(conid=59262240, symbol="IEMI", currency="GBP"),
+        effective_datetime=datetime(on.year, on.month, on.day, 12, 0, tzinfo=UTC),
+        effective_date=on,
+        report_date=on,
+        quantity=Decimal("-824"),
+        cash=cash,
+        description="IEMI(IE00B2NPL135) Merged(Acquisition) for USD 17.506705 per Share",
+    )
+
+
+def test_project_returns_the_streams_compute_matches() -> None:
+    """`project` is the first half of `compute`: the same events, unmatched."""
+    d = date(2024, 5, 1)
+    fx = MultiCcyStubFXService(
+        {("USD", d): Decimal("0.80"), ("USD", d + timedelta(days=9)): Decimal("0.80")}
+    )
+    engine = FXRuleEngine(fx)
+    buy = (
+        1,
+        fx_trade(
+            action=TradeAction.BUY, on=d, qty=100, price="0.80", instrument=fx_pair("USD", "GBP")
+        ),
+    )
+    fee = CashEvent(
+        account_id="U1",
+        kind=CashEventKind.FEE,
+        value_date=d + timedelta(days=9),
+        amount=Money.of("-30", "USD"),
+        description="Snapshot Market Data Fee",
+    )
+    acquisitions, disposals = engine.project(
+        "USD", forex_trades=[buy], cash_events=[(4 * 10**12, fee)]
+    )
+    assert [(a.trade_id, a.quantity) for a in acquisitions] == [(1, Decimal("100"))]
+    assert [(x.trade_id, x.quantity) for x in disposals] == [(4 * 10**12, Decimal("30"))]
+    result = engine.compute("USD", forex_trades=[buy], cash_events=[(4 * 10**12, fee)])
+    assert [m.matched_quantity for m in result.matched_disposals] == [Decimal("30")]
+    assert result.final_pool.quantity == Decimal("70")
+
+
+def test_corporate_action_cash_feeds_the_pool_under_its_event_id() -> None:
+    """The USD an issuer paid for a GBP-listed fund acquires the USD pool."""
+    on = date(2025, 8, 16)
+    fx = MultiCcyStubFXService({("USD", on): Decimal("0.7377")})
+    engine = FXRuleEngine(fx)
+    action = _corporate_action(Money.of("14425.52", "USD"), on)
+    event_id = 5 * 10**12 + 1
+    acquisitions, disposals = engine.project("USD", corporate_actions=[(event_id, action)])
+    assert disposals == []
+    [acq] = acquisitions
+    assert acq.trade_id == event_id
+    assert acq.quantity == Decimal("14425.52")
+    result = engine.compute("USD", corporate_actions=[(event_id, action)])
+    assert result.final_pool.quantity == Decimal("14425.52")
+    assert result.final_pool.total_cost_gbp == Money.gbp(Decimal("14425.52") * Decimal("0.7377"))
+    # GBP cash (a gilt maturity) never reaches a pool.
+    gbp_action = _corporate_action(Money.of("250000", "GBP"), on)
+    assert engine.project("USD", corporate_actions=[(event_id, gbp_action)]) == ([], [])

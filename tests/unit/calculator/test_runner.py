@@ -23,23 +23,26 @@ from ib_cgt.calculator import (
     run_fx_engine,
     run_stock_engine,
 )
-from ib_cgt.db import CashEventRepo, FXRateRepo, StatementRepo, TradeRepo
+from ib_cgt.db import CashEventRepo, CorporateActionRepo, FXRateRepo, StatementRepo, TradeRepo
+from ib_cgt.db.repos.fx_rates import FXRate
 from ib_cgt.domain import (
     BondCouponRef,
     CashEvent,
     CashEventKind,
     CashEventRef,
+    CorporateActionRef,
     DividendKind,
     DividendRef,
     FutureInstrument,
     FutureRealisationRef,
     Money,
+    StockInstrument,
     TradeAction,
 )
 from ib_cgt.fx import FXService
 from ib_cgt.rules import ExemptBondResult, InconsistentTradeError, MatchingResult
 
-from .conftest import CORP_USD, STATEMENT_HASH, trade
+from .conftest import CORP_USD, GILT, STATEMENT_HASH, corporate_action, trade
 
 
 def _fx_run(outputs: EngineOutputs, currency: str) -> FXEngineRun:
@@ -311,8 +314,6 @@ def test_cash_event_only_currency_gets_a_pool(
     db: sqlite3.Connection, fx_service: FXService
 ) -> None:
     """JPY appears nowhere but in a cash event — it must still be discovered."""
-    from ib_cgt.db.repos.fx_rates import FXRate
-
     FXRateRepo(db).upsert_many(
         [FXRate(base="GBP", quote="JPY", rate_date=date(2025, 4, 3), rate=Decimal("190"))]
     )
@@ -352,3 +353,109 @@ def test_gbp_cash_events_never_create_a_pool(db: sqlite3.Connection, fx_service:
     outputs = run_engines(db, fx_service)
     assert [run.currency for run in outputs.fx] == ["EUR", "USD"]
     assert _fx_run(outputs, "USD").inputs.cash_events == ()
+
+
+# ---------------------------------------------------------------------------
+# Corporate actions — one event id shared by the stock / bond engine and the pool
+# ---------------------------------------------------------------------------
+
+IEMI = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+
+
+def _seed_iemi_merger(db: sqlite3.Connection) -> int:
+    """824 IEMI bought in GBP, cashed out for USD on 16 April; returns the row id."""
+    # Row identity is (statement, row index): the baseline already holds
+    # indexes 0..15 under this hash, so the buy takes an index past them.
+    TradeRepo(db).insert_indexed(
+        [
+            (
+                100,
+                trade(
+                    IEMI,
+                    TradeAction.BUY,
+                    date(2025, 3, 3),
+                    "824",
+                    "12.52",
+                    fees="6",
+                    account_id="U2",
+                ),
+            )
+        ],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    CorporateActionRepo(db).insert_many(
+        [
+            corporate_action(
+                IEMI, date(2025, 4, 16), "-824", Money.of("14425.52", "USD"), account_id="U2"
+            )
+        ],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    return 1
+
+
+def test_corporate_action_reaches_the_stock_engine_and_the_pool_under_one_id(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    action_id = _seed_iemi_merger(db)
+    event_id = 5 * 10**12 + action_id
+
+    outputs = run_engines(db, fx_service)
+
+    iemi = next(run for run in outputs.stocks if run.instrument.symbol == "IEMI")
+    assert [eid for eid, _a in iemi.corporate_actions] == [event_id]
+    assert iemi.result is not None
+    [md] = iemi.result.matched_disposals
+    assert md.disposal_trade_id == event_id
+    assert md.disposal_date == date(2025, 4, 16)
+    assert md.matched_proceeds_gbp == Money.gbp(Decimal("14425.52") / Decimal("1.25"))
+
+    inputs = _fx_run(outputs, "USD").inputs
+    assert [eid for eid, _a in inputs.corporate_actions] == [event_id]
+    assert inputs.sources[event_id] == CorporateActionRef(corporate_action_id=action_id)
+    usd = _fx_run(outputs, "USD").result
+    assert usd is not None
+    assert any(
+        getattr(chunk.basis, "acquisition_trade_id", None) == event_id
+        or chunk.disposal_trade_id == event_id
+        for chunk in usd.matched_disposals
+    ) or usd.final_pool.quantity >= Decimal("14425.52")
+
+
+def test_gbp_cash_disposal_is_registered_but_projects_nothing(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """A GBP maturity is cited by the bond engine and resolvable, but no pool sees it."""
+    CorporateActionRepo(db).insert_many(
+        [corporate_action(GILT, date(2025, 4, 12), "-10000", Money.of("10000", "GBP"))],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    outputs = run_engines(db, fx_service)
+    gilt = next(run for run in outputs.bonds if run.instrument == GILT)
+    assert isinstance(gilt.result, ExemptBondResult)
+    assert gilt.result.exempt_sell_count == 2  # the baseline sell plus the redemption
+    inputs = _fx_run(outputs, "USD").inputs
+    assert [a.cash.currency for _e, a in inputs.corporate_actions if a.cash] == ["GBP"]
+    assert CorporateActionRef(corporate_action_id=1) in inputs.sources.values()
+    assert "GBP" not in inputs.currencies
+
+
+def test_corporate_action_only_currency_gets_a_pool(
+    db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    FXRateRepo(db).upsert_many(
+        [FXRate(base="GBP", quote="CHF", rate_date=date(2025, 4, 16), rate=Decimal("1.10"))]
+    )
+    TradeRepo(db).insert_indexed(
+        [(101, trade(IEMI, TradeAction.BUY, date(2025, 3, 3), "10", "12.52"))],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    CorporateActionRepo(db).insert_many(
+        [corporate_action(IEMI, date(2025, 4, 16), "-10", Money.of("150", "CHF"))],
+        source_statement_hash=STATEMENT_HASH,
+    )
+    outputs = run_engines(db, fx_service)
+    assert [run.currency for run in outputs.fx] == ["CHF", "EUR", "USD"]
+    chf = _fx_run(outputs, "CHF").result
+    assert chf is not None
+    assert chf.final_pool.quantity == Decimal("150")

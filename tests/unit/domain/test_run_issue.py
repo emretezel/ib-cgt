@@ -21,6 +21,7 @@ def test_every_kind_has_the_planned_severity() -> None:
         RunIssueKind.RATE_NOT_FOUND,
         RunIssueKind.INCONSISTENT_TRADES,
         RunIssueKind.ENGINE_FAILURE,
+        RunIssueKind.CASH_BALANCE_MISMATCH,
     }
     for kind in RunIssueKind:
         expected = IssueSeverity.ERROR if kind in errors else IssueSeverity.WARNING
@@ -33,6 +34,7 @@ def test_kind_values_match_the_schema_check() -> None:
         "rate_not_found",
         "inconsistent_trades",
         "engine_failure",
+        "cash_balance_mismatch",
         "open_short_position",
         "fx_residual",
         "history_incomplete",

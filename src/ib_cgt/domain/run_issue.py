@@ -47,6 +47,12 @@ class RunIssueKind(StrEnum):
     `inconsistent_trades`: the trade history of one instrument is
         self-contradictory — a futures CLOSE with no OPEN.
     `engine_failure`: an engine raised anything else.
+    `cash_balance_mismatch`: an account's holding of a currency, as
+        the FX-pool sources project it (open futures marked at the
+        statement's close), differs from the Cash Report's ending cash
+        by more than one unit of the currency — a pool is missing a
+        source or carrying a phantom one, so every later disposal of
+        that currency is matched on a wrong cost.
 
     Warnings (notices; the figures stand):
 
@@ -74,6 +80,7 @@ class RunIssueKind(StrEnum):
     RATE_NOT_FOUND = "rate_not_found"
     INCONSISTENT_TRADES = "inconsistent_trades"
     ENGINE_FAILURE = "engine_failure"
+    CASH_BALANCE_MISMATCH = "cash_balance_mismatch"
     OPEN_SHORT_POSITION = "open_short_position"
     FX_RESIDUAL = "fx_residual"
     HISTORY_INCOMPLETE = "history_incomplete"
@@ -101,6 +108,7 @@ _ERROR_KINDS: Final[frozenset[RunIssueKind]] = frozenset(
         RunIssueKind.RATE_NOT_FOUND,
         RunIssueKind.INCONSISTENT_TRADES,
         RunIssueKind.ENGINE_FAILURE,
+        RunIssueKind.CASH_BALANCE_MISMATCH,
     }
 )
 

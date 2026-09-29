@@ -1,6 +1,6 @@
 # Schema
 
-Effective schema after migrations `001`–`023`
+Effective schema after migrations `001`–`024`
 ([`src/ib_cgt/db/migrations/`](../../src/ib_cgt/db/migrations)). Every table
 is `STRICT`. Columns are `NOT NULL` unless marked `null`. `PK` = primary key.
 `FK → t.c` = foreign key, `RESTRICT` unless marked `cascade` (`ON DELETE
@@ -10,7 +10,7 @@ pages linked from [`index.md`](./index.md).
 
 Trade-id columns on run-scoped tables (`matched_disposals`,
 `future_realisations`, `option_grants`, `option_grant_closes`,
-`option_exercise_transfers`, `fx_event_sources`) deliberately have no
+`option_exercise_transfers`, `event_sources`) deliberately have no
 FK to `trades`, so audit rows survive a re-ingest. The one table that
 does reference `trades` — `option_exercise_links` — is ingest data and
 cascades with them.
@@ -132,9 +132,21 @@ ever compares `instrument_id`.
 | `statement_row_index` | INTEGER | CHECK `>= 0` |
 | `instrument_id` | INTEGER | FK → `instruments.instrument_id` |
 | `quantity` | TEXT | |
+| `close_price` | TEXT | |
 
 - PK `(statement_hash, statement_row_index)`
 - UNIQUE `(statement_hash, instrument_id)`
+
+### `statement_cash_balances`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `statement_hash` | TEXT | FK → `statements.statement_hash` cascade |
+| `currency` | TEXT | CHECK `GLOB '[A-Z][A-Z][A-Z]'` |
+| `starting_cash` | TEXT | |
+| `ending_cash` | TEXT | |
+
+- PK `(statement_hash, currency)`
 
 ### `trades`
 
@@ -181,7 +193,7 @@ ever compares `instrument_id`.
 | `symbol` | TEXT | CHECK `length > 0` |
 | `kind` | TEXT | CHECK IN (`'cash_dividend'`, `'withholding_tax'`, `'payment_in_lieu'`) |
 | `pay_date` | TEXT | |
-| `amount_native` | TEXT | |
+| `amount_native` | TEXT | signed; CHECK `CAST(amount_native AS REAL) <> 0` |
 | `currency` | TEXT | |
 | `description` | TEXT | |
 | `statement_row_index` | INTEGER | CHECK `>= 0` |
@@ -227,6 +239,32 @@ ever compares `instrument_id`.
 - UNIQUE `(source_statement_hash, statement_row_index)`
 - INDEX `ix_cash_events_currency_date` `(currency, value_date)`
 - INDEX `ix_cash_events_statement` `(source_statement_hash)`
+
+### `corporate_actions`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `corporate_action_id` | INTEGER | PK |
+| `account_id` | TEXT | FK → `accounts.account_id` |
+| `kind` | TEXT | CHECK IN (`'cash_disposal'`, `'unsupported'`) |
+| `instrument_id` | INTEGER | null, FK → `instruments.instrument_id` |
+| `effective_datetime` | TEXT | |
+| `effective_date` | TEXT | |
+| `report_date` | TEXT | |
+| `quantity` | TEXT | signed |
+| `cash_amount` | TEXT | null, signed |
+| `cash_currency` | TEXT | null, CHECK `GLOB '[A-Z][A-Z][A-Z]'` |
+| `description` | TEXT | CHECK `length > 0` |
+| `statement_row_index` | INTEGER | CHECK `>= 0` |
+| `source_statement_hash` | TEXT | FK → `statements.statement_hash` cascade |
+
+- UNIQUE `(source_statement_hash, statement_row_index)`
+- CHECK `(cash_amount IS NULL) = (cash_currency IS NULL)`
+- CHECK `kind = 'unsupported' OR instrument_id IS NOT NULL`
+- CHECK `kind <> 'cash_disposal' OR (cash_amount IS NOT NULL AND CAST(quantity AS REAL) < 0 AND CAST(cash_amount AS REAL) > 0)`
+- INDEX `ix_corporate_actions_instrument_date` `(instrument_id, effective_date)`
+- INDEX `ix_corporate_actions_cash_currency_date` `(cash_currency, effective_date)`
+- INDEX `ix_corporate_actions_statement` `(source_statement_hash)`
 
 ## FX cache
 
@@ -367,28 +405,31 @@ ever compares `instrument_id`.
 - CHECK `(grant_trade_id IS NULL) = (side = 'LONG')`
 - INDEX `ix_option_exercise_transfers_run` `(run_id, on_date)`
 
-### `fx_event_sources`
+### `event_sources`
 
 | Column | Type | Constraints |
 |---|---|---|
 | `run_id` | INTEGER | FK → `tax_runs.run_id` cascade |
 | `event_id` | INTEGER | |
-| `kind` | TEXT | CHECK IN (`'FUTURE_REALISATION'`, `'DIVIDEND'`, `'BOND_COUPON'`, `'CASH_EVENT'`) |
+| `kind` | TEXT | CHECK IN (`'FUTURE_REALISATION'`, `'DIVIDEND'`, `'BOND_COUPON'`, `'CASH_EVENT'`, `'CORPORATE_ACTION'`) |
 | `open_trade_id` | INTEGER | null |
 | `close_trade_id` | INTEGER | null |
 | `dividend_id` | INTEGER | null |
 | `bond_coupon_id` | INTEGER | null |
 | `cash_event_id` | INTEGER | null |
+| `corporate_action_id` | INTEGER | null |
 
 - PK `(run_id, event_id)`
 - CHECK exactly the id columns for `kind` are non-null
   (`'FUTURE_REALISATION'` → `open_trade_id`, `close_trade_id`;
   `'DIVIDEND'` → `dividend_id`; `'BOND_COUPON'` → `bond_coupon_id`;
-  `'CASH_EVENT'` → `cash_event_id`), all others NULL
-- UNIQUE INDEX `ux_fx_event_sources_realisation` `(run_id, open_trade_id, close_trade_id)` WHERE `kind = 'FUTURE_REALISATION'`
-- UNIQUE INDEX `ux_fx_event_sources_dividend` `(run_id, dividend_id)` WHERE `kind = 'DIVIDEND'`
-- UNIQUE INDEX `ux_fx_event_sources_coupon` `(run_id, bond_coupon_id)` WHERE `kind = 'BOND_COUPON'`
-- UNIQUE INDEX `ux_fx_event_sources_cash_event` `(run_id, cash_event_id)` WHERE `kind = 'CASH_EVENT'`
+  `'CASH_EVENT'` → `cash_event_id`; `'CORPORATE_ACTION'` →
+  `corporate_action_id`), all others NULL
+- UNIQUE INDEX `ux_event_sources_realisation` `(run_id, open_trade_id, close_trade_id)` WHERE `kind = 'FUTURE_REALISATION'`
+- UNIQUE INDEX `ux_event_sources_dividend` `(run_id, dividend_id)` WHERE `kind = 'DIVIDEND'`
+- UNIQUE INDEX `ux_event_sources_coupon` `(run_id, bond_coupon_id)` WHERE `kind = 'BOND_COUPON'`
+- UNIQUE INDEX `ux_event_sources_cash_event` `(run_id, cash_event_id)` WHERE `kind = 'CASH_EVENT'`
+- UNIQUE INDEX `ux_event_sources_corporate_action` `(run_id, corporate_action_id)` WHERE `kind = 'CORPORATE_ACTION'`
 
 ### `tax_run_issues`
 
@@ -396,7 +437,7 @@ ever compares `instrument_id`.
 |---|---|---|
 | `run_id` | INTEGER | FK → `tax_runs.run_id` cascade |
 | `seq` | INTEGER | CHECK `>= 0` |
-| `kind` | TEXT | CHECK IN (`'position_mismatch'`, `'rate_not_found'`, `'inconsistent_trades'`, `'engine_failure'`, `'open_short_position'`, `'fx_residual'`, `'history_incomplete'`, `'history_no_lookahead'`, `'empty_year'`, `'option_grant_restated'`, `'option_exercise_unlinked'`) |
+| `kind` | TEXT | CHECK IN (`'position_mismatch'`, `'rate_not_found'`, `'inconsistent_trades'`, `'engine_failure'`, `'cash_balance_mismatch'`, `'open_short_position'`, `'fx_residual'`, `'history_incomplete'`, `'history_no_lookahead'`, `'empty_year'`, `'option_grant_restated'`, `'option_exercise_unlinked'`) |
 | `instrument_id` | INTEGER | null, FK → `instruments.instrument_id` |
 | `message` | TEXT | |
 

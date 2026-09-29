@@ -172,7 +172,7 @@ def persisted(
         run=TaxRun(
             run_id=run_id, tax_year=tax_year, computed_at=COMPUTED_AT, net_gbp=report.net_gbp
         ),
-        computation=TaxYearComputation(report=report, issues=tuple(issues), fx_event_sources={}),
+        computation=TaxYearComputation(report=report, issues=tuple(issues), event_sources={}),
     )
 
 

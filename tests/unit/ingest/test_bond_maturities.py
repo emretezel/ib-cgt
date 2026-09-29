@@ -1,16 +1,12 @@
-"""Tests for `ib_cgt.ingest.corporate_actions.map_bond_maturities`.
+"""Tests for bond maturities through `ib_cgt.ingest.corporate_actions.map_corporate_actions`.
 
-A Bond Maturity Corporate Actions row is, for HMRC purposes, a SELL
-at par on the redemption date. The synthesizer must:
-
-1. Recognise the IB description shape and ignore non-maturity rows.
-2. Build a `BondInstrument` with the right `is_cgt_exempt` flag,
-   re-using the gilt classifier and the Financial Instrument
-   Information section's description text.
-3. Synthesise a SELL `Trade` at `1.00` cash-per-bond (already in
-   cash terms — no /100 par rescale, unlike the trades-section
-   bond price).
-4. Loud-fail on malformed quantities.
+A Bond Maturity Corporate Actions row is, for HMRC purposes, a
+disposal at par on the redemption date. Its legs — the face value
+leaving, the redemption cash arriving in the bond's currency — make
+it a `cash_disposal` like any other; what is specific to bonds is
+the instrument resolution: the ISIN-keyed `BondInstrument`, the
+gilt classifier, and the fallback for statement vintages without a
+bonds-shaped instrument table.
 
 Author: Emre Tezel
 """
@@ -21,11 +17,9 @@ from datetime import date
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-import pytest
-
-from ib_cgt.domain import BondInstrument, TradeAction
-from ib_cgt.ingest.corporate_actions import map_bond_maturities
-from ib_cgt.ingest.mapper import MappingError, _canonicalise_gilt_symbol
+from ib_cgt.domain import BondInstrument, CorporateActionKind, Money
+from ib_cgt.ingest.corporate_actions import map_corporate_actions
+from ib_cgt.ingest.mapper import _canonicalise_gilt_symbol
 from ib_cgt.ingest.raw import (
     ParsedStatement,
     RawCorporateActionRow,
@@ -98,53 +92,44 @@ def _make(
 # ---------------------------------------------------------------------------
 
 
-def test_synthesizes_sell_trade_from_gilt_maturity_with_description() -> None:
-    """A GBP gilt's maturity row produces one SELL at 1.00 GBP per bond.
+def test_gilt_maturity_with_instrument_info_is_an_exempt_cash_disposal() -> None:
+    """A GBP gilt's maturity row disposes of the face value for the redemption cash.
 
     The instrument-info description starts with "United Kingdom Gilt",
-    so `is_cgt_exempt` must be `True` on the synthesized instrument.
+    so `is_cgt_exempt` must be `True` on the resolved instrument.
     """
     description = (
         "(GB00BLPK7110)  Bond Maturity FOR GBP 1.00 PER BOND "
         "(UKT 0 1/4 01/31/25, UKT 0 1/4 01/31/25, GB00BLPK7110)"
     )
     parsed = _make(
-        [
-            _ca_row(
-                description=description,
-                quantity_text="-215,000",
-            ),
-        ],
+        [_ca_row(description=description, quantity_text="-215,000")],
         instruments=[_gilt_info()],
     )
 
-    [trade] = map_bond_maturities(parsed)
+    [action] = map_corporate_actions(parsed)
 
-    assert isinstance(trade.instrument, BondInstrument)
-    assert trade.instrument.isin == "GB00BLPK7110"
-    assert trade.instrument.symbol == "UKT 0 1/4 01/31/25"
-    assert trade.instrument.currency == "GBP"
-    assert trade.instrument.is_cgt_exempt is True
-    assert trade.action is TradeAction.SELL
-    assert trade.quantity == Decimal("215000")
-    assert trade.price.amount == Decimal("1.00")
-    assert trade.price.currency == "GBP"
+    assert action.kind is CorporateActionKind.CASH_DISPOSAL
+    assert isinstance(action.instrument, BondInstrument)
+    assert action.instrument.isin == "GB00BLPK7110"
+    assert action.instrument.symbol == "UKT 0 1/4 01/31/25"
+    assert action.instrument.currency == "GBP"
+    assert action.instrument.is_cgt_exempt is True
+    assert action.quantity == Decimal("-215000")
+    assert action.cash == Money.of("215000.00", "GBP")
     # The row is printed 2025-01-30, 20:25:00 Eastern — 01:25 UK on the 31st.
-    assert trade.trade_date == date(2025, 1, 31)
-    # Bond maturities carry no commissions and no accrued interest.
-    assert trade.fees.amount == Decimal("0")
-    assert trade.accrued_interest is None
+    assert action.effective_date == date(2025, 1, 31)
+    assert action.report_date == date(2025, 1, 31)
 
 
-def test_falls_back_to_symbol_prefix_when_no_instrument_info() -> None:
-    """No instrument-info section + UKT-prefix + GBP → still flagged exempt.
+def test_falls_back_to_the_isin_and_symbol_prefix_when_no_instrument_info() -> None:
+    """No instrument-info section + UKT-prefix + GBP → still resolved and flagged exempt.
 
-    Older statement vintages can omit the Financial Instrument
-    Information section. The maturity synthesiser must fall back to
-    the same `_classify_bond_exempt` symbol-prefix path the trades
-    mapper uses, so historical gilts still classify correctly. The
-    ISIN comes from the description's `(<ISIN>)` capture; the symbol
-    falls back to canonicalising the regex's `symbol` capture.
+    Older statement vintages omit the Financial Instrument Information
+    section. The ISIN comes from the description's leading `(<ISIN>)`,
+    the symbol from the trailing triple (canonicalised: the `FH45`
+    suffix is stripped), and the classifier falls back to the same
+    symbol-prefix path the trade mapper uses.
     """
     description = (
         "(GB00BHBFH458)  Bond Maturity FOR GBP 1.00 PER BOND "
@@ -162,58 +147,19 @@ def test_falls_back_to_symbol_prefix_when_no_instrument_info() -> None:
         instruments=[],
     )
 
-    [trade] = map_bond_maturities(parsed)
+    [action] = map_corporate_actions(parsed)
 
-    assert isinstance(trade.instrument, BondInstrument)
-    assert trade.instrument.isin == "GB00BHBFH458"
-    # Canonicalised: "FH45" suffix stripped from the regex's symbol.
-    assert trade.instrument.symbol == "UKT 2 3/4 09/07/24"
-    assert trade.instrument.is_cgt_exempt is True
-    assert trade.quantity == Decimal("250000")
-
-
-def test_skips_non_bond_asset_class() -> None:
-    """A `Stocks` Corporate Action row is not interpreted as a bond maturity."""
-    description = (
-        "(US0000000123) Bond Maturity FOR USD 1.00 PER BOND (SHOULDNTMATCH, anything, US0000000123)"
-    )
-    parsed = _make(
-        [
-            _ca_row(
-                asset_class="Stocks",
-                currency="USD",
-                description=description,
-                quantity_text="-100",
-            ),
-        ]
-    )
-
-    assert map_bond_maturities(parsed) == []
-
-
-def test_skips_unrelated_bond_corporate_action() -> None:
-    """Bond rows whose description doesn't match the maturity shape are skipped."""
-    parsed = _make(
-        [
-            _ca_row(
-                description="(GB00BHBFH458) Some other action that should not match",
-                quantity_text="-100",
-            ),
-        ],
-        instruments=[_gilt_info()],
-    )
-
-    assert map_bond_maturities(parsed) == []
+    assert action.kind is CorporateActionKind.CASH_DISPOSAL
+    assert isinstance(action.instrument, BondInstrument)
+    assert action.instrument.isin == "GB00BHBFH458"
+    assert action.instrument.symbol == "UKT 2 3/4 09/07/24"
+    assert action.instrument.is_cgt_exempt is True
+    assert action.quantity == Decimal("-250000")
+    assert action.effective_date == date(2024, 9, 7)
 
 
 def test_non_gilt_maturity_is_not_flagged_exempt() -> None:
-    """A USD corporate bond's maturity is not auto-promoted to exempt.
-
-    The classifier returns False (no description match, GBP gate
-    fails on USD), so the synthesised instrument carries
-    `is_cgt_exempt=False` and the BondRuleEngine will route it
-    through normal four-rule matching.
-    """
+    """A USD corporate bond's maturity is not auto-promoted to exempt."""
     description = (
         "(US0000000789)  Bond Maturity FOR USD 1.00 PER BOND "
         "(ACME 5 2030, ACME 5 2030, US0000000789)"
@@ -241,37 +187,42 @@ def test_non_gilt_maturity_is_not_flagged_exempt() -> None:
         ],
     )
 
-    [trade] = map_bond_maturities(parsed)
+    [action] = map_corporate_actions(parsed)
 
-    assert isinstance(trade.instrument, BondInstrument)
-    assert trade.instrument.isin == "US0000000789"
-    assert trade.instrument.is_cgt_exempt is False
-    assert trade.price.currency == "USD"
+    assert isinstance(action.instrument, BondInstrument)
+    assert action.instrument.isin == "US0000000789"
+    assert action.instrument.is_cgt_exempt is False
+    assert action.cash == Money.of("100.00", "USD")
 
 
-def test_zero_quantity_raises() -> None:
-    """A maturity row with zero quantity is loud-fail (real bug, not silent drop)."""
+def test_zero_quantity_maturity_row_is_stored_as_unsupported() -> None:
+    """A row moving no units and no cash is kept as data, never a disposal."""
     description = (
         "(GB00BLPK7110)  Bond Maturity FOR GBP 1.00 PER BOND "
         "(UKT 0 1/4 01/31/25, UKT 0 1/4 01/31/25, GB00BLPK7110)"
     )
     parsed = _make(
-        [
-            _ca_row(
-                description=description,
-                quantity_text="0",
-                proceeds_text="0.00",
-            ),
-        ],
+        [_ca_row(description=description, quantity_text="0", proceeds_text="0.00")],
         instruments=[_gilt_info()],
     )
+    [action] = map_corporate_actions(parsed)
+    assert action.kind is CorporateActionKind.UNSUPPORTED
+    assert action.has_effect is False
+    assert isinstance(action.instrument, BondInstrument)
 
-    with pytest.raises(MappingError, match="zero quantity"):
-        map_bond_maturities(parsed)
+
+def test_bond_row_that_names_no_isin_is_unsupported_without_instrument() -> None:
+    parsed = _make(
+        [_ca_row(description="Some other bond action with no identifier", quantity_text="-100")],
+        instruments=[_gilt_info()],
+    )
+    [action] = map_corporate_actions(parsed)
+    assert action.kind is CorporateActionKind.UNSUPPORTED
+    assert action.instrument is None
+    assert action.quantity == Decimal("-100")
 
 
-def test_preserves_input_order_across_multiple_maturities() -> None:
-    """Two maturity rows in one statement appear in source order in the output."""
+def test_events_keep_effective_order_across_multiple_maturities() -> None:
     desc_a = (
         "(GB00BLPK7110)  Bond Maturity FOR GBP 1.00 PER BOND "
         "(UKT 0 1/4 01/31/25, UKT 0 1/4 01/31/25, GB00BLPK7110)"
@@ -282,16 +233,8 @@ def test_preserves_input_order_across_multiple_maturities() -> None:
     )
     parsed = _make(
         [
-            _ca_row(
-                description=desc_a,
-                quantity_text="-100",
-                datetime_text="2025-01-30, 20:25:00",
-            ),
-            _ca_row(
-                description=desc_b,
-                quantity_text="-50",
-                datetime_text="2024-09-06, 20:25:00",
-            ),
+            _ca_row(description=desc_a, quantity_text="-100", datetime_text="2025-01-30, 20:25:00"),
+            _ca_row(description=desc_b, quantity_text="-50", datetime_text="2024-09-06, 20:25:00"),
         ],
         instruments=[
             _gilt_info(),
@@ -301,15 +244,15 @@ def test_preserves_input_order_across_multiple_maturities() -> None:
         ],
     )
 
-    trades = map_bond_maturities(parsed)
-    # Symbols are canonicalised — "FH45" suffix stripped on the second.
-    assert [t.instrument.symbol for t in trades] == [
-        "UKT 0 1/4 01/31/25",
-        "UKT 2 3/4 09/07/24",
-    ]
-    bonds = [t.instrument for t in trades]
+    actions = map_corporate_actions(parsed)
+    bonds = [a.instrument for a in actions]
     assert all(isinstance(bond, BondInstrument) for bond in bonds)
+    # Earliest first, symbols canonicalised ("FH45" stripped).
+    assert [bond.symbol for bond in bonds if isinstance(bond, BondInstrument)] == [
+        "UKT 2 3/4 09/07/24",
+        "UKT 0 1/4 01/31/25",
+    ]
     assert [bond.isin for bond in bonds if isinstance(bond, BondInstrument)] == [
-        "GB00BLPK7110",
         "GB00BHBFH458",
+        "GB00BLPK7110",
     ]

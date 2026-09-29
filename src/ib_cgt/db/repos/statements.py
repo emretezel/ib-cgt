@@ -171,6 +171,24 @@ class StatementRepo:
             return None
         return _row_to_statement(row)
 
+    def earliest_for_account(self, account_id: str) -> StatementRow | None:
+        """Return the statement whose period starts first for `account_id`, or `None`.
+
+        The cash-balance reconciliation reads its `Starting Cash` as the
+        origin of every pool the account holds. Ties on `period_start`
+        resolve to the shorter period, then to the most recently
+        imported row, mirroring `latest_for_account`. Served by
+        `ix_statements_account_period` read in the other direction.
+        """
+        row = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM statements WHERE account_id = ? "
+            "ORDER BY period_start ASC, period_end ASC, imported_at DESC LIMIT 1",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_statement(row)
+
     def periods_for_account(self, account_id: str) -> tuple[tuple[date, date], ...]:
         """Return every `(period_start, period_end)` on file for `account_id`, sorted.
 

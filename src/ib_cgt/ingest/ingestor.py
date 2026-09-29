@@ -40,27 +40,26 @@ from ib_cgt.db.connection import transaction
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo
 from ib_cgt.db.repos.cash_events import CashEventRepo
+from ib_cgt.db.repos.corporate_actions import CorporateActionRepo
 from ib_cgt.db.repos.dividends import DividendRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
 from ib_cgt.db.repos.option_exercises import OptionExerciseLinkRepo
+from ib_cgt.db.repos.statement_cash_balances import StatementCashBalanceRepo
 from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo
 from ib_cgt.db.repos.trades import TradeRepo
-from ib_cgt.domain import Account, AssetClass, BondInstrument, StatementPosition, Trade
+from ib_cgt.domain import Account, AssetClass, StatementPosition, Trade
 from ib_cgt.ingest.bond_coupons import map_bond_coupons
+from ib_cgt.ingest.cash_balances import map_cash_balances
 from ib_cgt.ingest.cash_events import map_cash_events
-from ib_cgt.ingest.corporate_actions import (
-    FXConverter,
-    map_bond_maturities,
-    map_corporate_actions,
-)
+from ib_cgt.ingest.corporate_actions import map_corporate_actions
 from ib_cgt.ingest.coverage import Coverage
 from ib_cgt.ingest.dividends import map_dividends
 from ib_cgt.ingest.hashing import compute_statement_hash
 from ib_cgt.ingest.mapper import OPTION_LABELS, map_rows
 from ib_cgt.ingest.option_exercises import ExerciseLink, map_option_exercise_links
 from ib_cgt.ingest.parsers import StatementFormat, parser_for
-from ib_cgt.ingest.positions import map_open_positions
+from ib_cgt.ingest.positions import map_open_positions, parse_close_price
 from ib_cgt.ingest.raw import ParsedStatement, RawOpenPositionRow
 
 
@@ -71,25 +70,20 @@ class IngestResult:
     Attributes:
         statement_hash: The SHA-256 of the source file (hex).
         account_id: Account the statement belonged to.
-        trade_count: Number of trades the parser produced (regular +
-            synthesized). Zero is a legal outcome for a statement with
-            no activity. On the `already_imported` path it is the
-            number of trades on record for the statement instead.
-        merger_trade_count: Subset of `trade_count` originating from
-            cash-for-shares Corporate Actions rows ("Merged(Acquisition)").
-            Reported separately so the CLI can surface them; matching
-            treats them identically to ordinary sells.
-        maturity_trade_count: Subset of `trade_count` originating from
-            Bond Maturity Corporate Actions rows. Reported separately
-            so the CLI can surface them; matching treats them
-            identically to ordinary sells.
-        skipped_maturity_count: Maturity rows the synthesiser produced
-            that were dropped because no bond with the ISIN the
-            maturity description names has ever been bought — neither
-            in the database nor earlier in this statement. A
-            redemption with no purchase behind it would create an
-            orphan `bond_instruments` row that no BUY covers, so these
-            rows are surfaced as a warning instead.
+        trade_count: Number of trades the parser produced. Zero is a
+            legal outcome for a statement with no activity. On the
+            `already_imported` path it is the number of trades on
+            record for the statement instead.
+        corporate_action_count: Corporate-action events the mapper
+            produced from the Corporate Actions section — one per
+            disposal for cash, one per row of any other shape.
+        unsupported_corporate_action_count: Subset of
+            `corporate_action_count` the engines do not model (a split,
+            a spin-off, a return of capital, an unresolvable security).
+            Stored as data; check A16 reports the ones that move units
+            or cash.
+        corporate_actions_inserted: How many corporate actions were
+            new rows in `corporate_actions`.
         inserted_count: How many trades were new rows. Less than
             `trade_count` when the coverage rule skipped rows an
             earlier statement already owns (see `covered_trade_count`)
@@ -111,6 +105,10 @@ class IngestResult:
             to no instrument — reported, never stored.
         cash_event_count: Instrument-less cash rows the mapper kept.
         cash_events_inserted: How many of those were new rows.
+        cash_balance_count: Currencies with a Starting / Ending Cash
+            pair in the statement's Cash Report (GBP included).
+        cash_balances_inserted: How many of those were new rows in
+            `statement_cash_balances`.
         option_link_count: Exercised / assigned option rows paired with
             the share trade IB booked for them (`option_exercise_links`).
         unlinked_exercise_count: Exercised / assigned option rows with
@@ -118,6 +116,8 @@ class IngestResult:
             treats them as cash-settled (TCGA 1992 s.144A) and warns.
         covered_trade_count: Parsed trades skipped because an earlier
             statement of the account already owns their date.
+        covered_corporate_action_count: Corporate actions skipped for
+            the same reason (by effective date).
         covered_dividend_count: Dividend rows skipped for the same reason.
         covered_bond_coupon_count: Coupon rows skipped for the same reason.
         covered_cash_event_count: Cash-event rows skipped for the same reason.
@@ -145,9 +145,9 @@ class IngestResult:
     trade_count: int
     inserted_count: int
     already_imported: bool
-    merger_trade_count: int = 0
-    maturity_trade_count: int = 0
-    skipped_maturity_count: int = 0
+    corporate_action_count: int = 0
+    unsupported_corporate_action_count: int = 0
+    corporate_actions_inserted: int = 0
     dividend_count: int = 0
     dividends_inserted: int = 0
     bond_coupon_count: int = 0
@@ -157,9 +157,12 @@ class IngestResult:
     unresolved_position_symbols: tuple[str, ...] = ()
     cash_event_count: int = 0
     cash_events_inserted: int = 0
+    cash_balance_count: int = 0
+    cash_balances_inserted: int = 0
     option_link_count: int = 0
     unlinked_exercise_count: int = 0
     covered_trade_count: int = 0
+    covered_corporate_action_count: int = 0
     covered_dividend_count: int = 0
     covered_bond_coupon_count: int = 0
     covered_cash_event_count: int = 0
@@ -170,9 +173,10 @@ class IngestResult:
 
     @property
     def covered_count(self) -> int:
-        """Every row the coverage rule skipped, across the four dated tables."""
+        """Every row the coverage rule skipped, across the five dated tables."""
         return (
             self.covered_trade_count
+            + self.covered_corporate_action_count
             + self.covered_dividend_count
             + self.covered_bond_coupon_count
             + self.covered_cash_event_count
@@ -216,7 +220,6 @@ def ingest_statement(
     conn: sqlite3.Connection,
     *,
     replace: bool = False,
-    fx_service: FXConverter | None = None,
     fmt: StatementFormat = StatementFormat.AUTO,
 ) -> IngestResult:
     """Parse the file at `path` and persist its facts via `conn`.
@@ -234,12 +237,6 @@ def ingest_statement(
             preserves the historical short-circuit behaviour — a repeat
             ingest of an already-imported statement is a constant-time
             no-op.
-        fx_service: Optional FX service for synthesizing `SELL` trades
-            from cash-for-shares Corporate Actions rows. When omitted,
-            corporate-action rows are silently ignored — the CLI's
-            `ingest` command always passes one, so production runs
-            cover the IEMI-shaped case; tests opt in by injecting a
-            mock or seeded service.
         fmt: The statement format, or `AUTO` to detect it from the
             suffix.
 
@@ -258,7 +255,7 @@ def ingest_statement(
         statement_hash=statement_hash,
         parsed=parser_for(fmt, path=path).parse(source_bytes),
     )
-    return ingest_parsed(loaded, conn, replace=replace, fx_service=fx_service)
+    return ingest_parsed(loaded, conn, replace=replace)
 
 
 def ingest_statements(
@@ -266,7 +263,6 @@ def ingest_statements(
     conn: sqlite3.Connection,
     *,
     replace: bool = False,
-    fx_service: FXConverter | None = None,
     fmt: StatementFormat = StatementFormat.AUTO,
 ) -> list[tuple[Path, IngestResult]]:
     """Ingest several statements, earliest period first.
@@ -302,9 +298,7 @@ def ingest_statements(
         key=lambda s: (s.parsed.account_id, s.parsed.period_start, s.parsed.period_end, str(s.path))
     )
     for loaded in pending:
-        done.append(
-            (loaded.path, ingest_parsed(loaded, conn, replace=replace, fx_service=fx_service))
-        )
+        done.append((loaded.path, ingest_parsed(loaded, conn, replace=replace)))
     return done
 
 
@@ -313,14 +307,13 @@ def ingest_parsed(
     conn: sqlite3.Connection,
     *,
     replace: bool = False,
-    fx_service: FXConverter | None = None,
 ) -> IngestResult:
     """Map a parsed statement and persist it in one transaction.
 
     The write half of `ingest_statement`; see there for the `replace`
-    and `fx_service` semantics. A statement whose hash is already on
-    record short-circuits here too (a batch may list one file twice),
-    unless `replace` is set.
+    semantics. A statement whose hash is already on record
+    short-circuits here too (a batch may list one file twice), unless
+    `replace` is set.
     """
     parsed = loaded.parsed
     statement_hash = loaded.statement_hash
@@ -329,38 +322,17 @@ def ingest_parsed(
     if prior_existed and not replace:
         return _already_imported(conn, statement_hash)
 
-    regular_trades = map_rows(parsed)
+    trades = map_rows(parsed)
 
-    # Synthesize SELL trades from cash-for-shares Corporate Actions rows
-    # (e.g. the IEMI fund-merger that pays cash for the entire position).
-    # The synthesized trades are appended *after* the regular ones so
-    # their statement_row_index values are strictly greater than any
-    # real-trade index. This keeps re-ingest identities stable as long
-    # as the parser's emission order is stable.
-    if fx_service is not None:
-        merger_trades = map_corporate_actions(parsed, fx_service=fx_service)
-    else:
-        merger_trades = []
-
-    # Bond maturities — issuer-redemption disposals at par. Always
-    # synthesised when present (no FX dependency: par price is in the
-    # bond's own currency). Appended after mergers for the same
-    # identity-stability reason.
-    #
-    # A maturity row names its bond by ISIN — the bond's identity — so
-    # a redemption of a bond this corpus has never bought is a data
-    # gap, not a disposal: letting the synthesised SELL through would
-    # create an orphan `bond_instruments` row that no `BUY` covers and
-    # surface as an `UnmatchedDisposalError` in `match bonds`. The
-    # filter below drops any maturity whose ISIN has no BUY behind it;
-    # the user is told which were skipped so they can follow up.
-    candidate_maturities = map_bond_maturities(parsed)
-    maturity_trades, skipped_maturity_trades = _filter_maturities_with_known_instruments(
-        candidate_maturities,
-        conn,
-        in_flight=regular_trades + merger_trades,
-    )
-    trades = regular_trades + merger_trades + maturity_trades
+    # Corporate actions — cash mergers, fund redemptions, bond
+    # maturities and whatever else IB prints under Corporate Actions —
+    # are their own event stream with their own table and row-index
+    # space. The stock and bond engines take the disposals from there;
+    # the FX engine takes the cash in its own currency; the position
+    # reconciliation nets the quantities. Nothing is synthesised into
+    # `trades` any more, and nothing is dropped: a shape the engines do
+    # not model is stored as `unsupported` for check A16 to report.
+    corporate_actions = map_corporate_actions(parsed)
 
     # Exercised / assigned options and the share trade IB booked for
     # each (TCGA 1992 s.144(2)-(3) treats the two as one transaction).
@@ -391,12 +363,18 @@ def ingest_parsed(
     # in the DB — including the ones this very ingest is about to add.
     positions, leftover_position_rows = map_open_positions(parsed)
 
+    # IB's own cash per currency at the period's start and end — the
+    # yardstick the cash-balance reconciliation holds the FX pools to.
+    cash_balances = map_cash_balances(parsed)
+
     accounts = AccountRepo(conn)
     trade_repo = TradeRepo(conn)
+    corporate_action_repo = CorporateActionRepo(conn)
     dividend_repo = DividendRepo(conn)
     bond_coupon_repo = BondCouponRepo(conn)
     cash_event_repo = CashEventRepo(conn)
     position_repo = StatementPositionRepo(conn)
+    cash_balance_repo = StatementCashBalanceRepo(conn)
 
     # One transaction for everything the parser produced. `transaction()`
     # issues COMMIT on successful exit and ROLLBACK on exception, which
@@ -412,10 +390,10 @@ def ingest_parsed(
     with transaction(conn):
         if prior_existed and replace:
             # Every dependent table's `source_statement_hash` is
-            # ON DELETE CASCADE (migrations 004, 009, 012, 016, 017), so
-            # removing the `statements` row atomically removes every
-            # trade, dividend, coupon, position and cash event that
-            # pointed at it.
+            # ON DELETE CASCADE (migrations 004, 009, 012, 016, 017,
+            # 024), so removing the `statements` row atomically removes
+            # every trade, corporate action, dividend, coupon, position,
+            # cash event and cash balance that pointed at it.
             prior = statements.get(statement_hash)
             if prior is not None:
                 withdrawn_periods.append((prior.period_start, prior.period_end))
@@ -443,6 +421,7 @@ def ingest_parsed(
             parsed.period_end,
         )
         kept_trades = _not_owned_elsewhere(trades, coverage, lambda t: t.trade_date)
+        kept_actions = _not_owned_elsewhere(corporate_actions, coverage, lambda a: a.effective_date)
         kept_dividends = _not_owned_elsewhere(dividends, coverage, lambda d: d.pay_date)
         kept_coupons = _not_owned_elsewhere(bond_coupons, coverage, lambda c: c.pay_date)
         kept_cash_events = _not_owned_elsewhere(cash_events, coverage, lambda e: e.value_date)
@@ -463,6 +442,12 @@ def ingest_parsed(
         links_inserted = OptionExerciseLinkRepo(conn).insert_many(
             _resolve_exercise_links(exercise_links, kept_trades, trade_repo, statement_hash)
         )
+        # Corporate actions after the trades: their instruments are the
+        # ones the trades just registered (a merged-away stock, a
+        # matured gilt), so the upsert resolves to the same rows.
+        corporate_actions_inserted = corporate_action_repo.insert_indexed(
+            kept_actions, source_statement_hash=statement_hash
+        )
         dividends_inserted = dividend_repo.insert_indexed(
             kept_dividends, source_statement_hash=statement_hash
         )
@@ -482,6 +467,11 @@ def ingest_parsed(
             all_positions,
             source_statement_hash=statement_hash,
         )
+        # Cash balances are a fact of the statement, like the
+        # positions: never coverage-filtered.
+        cash_balances_inserted = cash_balance_repo.insert_many(
+            cash_balances, statement_hash=statement_hash
+        )
         withdrawn_overlaps = _overlaps_of_withdrawn(
             statements, parsed.account_id, withdrawn_periods, except_hash=statement_hash
         )
@@ -490,9 +480,11 @@ def ingest_parsed(
         statement_hash=statement_hash,
         account_id=parsed.account_id,
         trade_count=len(trades),
-        merger_trade_count=len(merger_trades),
-        maturity_trade_count=len(maturity_trades),
-        skipped_maturity_count=len(skipped_maturity_trades),
+        corporate_action_count=len(corporate_actions),
+        unsupported_corporate_action_count=sum(
+            1 for action in corporate_actions if not action.is_cash_disposal
+        ),
+        corporate_actions_inserted=corporate_actions_inserted,
         dividend_count=len(dividends),
         dividends_inserted=dividends_inserted,
         bond_coupon_count=len(bond_coupons),
@@ -502,9 +494,12 @@ def ingest_parsed(
         unresolved_position_symbols=tuple(row.symbol for row in unresolved),
         cash_event_count=len(cash_events),
         cash_events_inserted=cash_events_inserted,
+        cash_balance_count=len(cash_balances),
+        cash_balances_inserted=cash_balances_inserted,
         option_link_count=links_inserted,
         unlinked_exercise_count=len(unlinked_exercises),
         covered_trade_count=len(trades) - len(kept_trades),
+        covered_corporate_action_count=len(corporate_actions) - len(kept_actions),
         covered_dividend_count=len(dividends) - len(kept_dividends),
         covered_bond_coupon_count=len(bond_coupons) - len(kept_coupons),
         covered_cash_event_count=len(cash_events) - len(kept_cash_events),
@@ -634,6 +629,7 @@ def _resolve_leftover_positions(
                 account_id=account_id,
                 instrument=instrument,
                 quantity=Decimal(raw.quantity_text.replace(",", "")),
+                close_price=parse_close_price(raw),
             )
         )
     return resolved, unresolved
@@ -648,72 +644,6 @@ _POSITION_ASSET_CLASSES: Final[dict[str, AssetClass]] = {
     "Futures": AssetClass.FUTURE,
     **dict.fromkeys(OPTION_LABELS, AssetClass.OPTION),
 }
-
-
-def _filter_maturities_with_known_instruments(
-    candidates: list[Trade],
-    conn: sqlite3.Connection,
-    *,
-    in_flight: list[Trade],
-) -> tuple[list[Trade], list[Trade]]:
-    """Split synthesised bond-maturity trades into kept vs skipped.
-
-    A maturity is kept only when the bond it redeems — identified by
-    ISIN, the bond's natural key — already has at least one BUY trade
-    in the DB or earlier in this statement, i.e. an open holding the
-    redemption could plausibly be settling. A redemption with no
-    purchase behind it is a data gap (a bond bought before the
-    ingested history starts); letting it through would create an
-    orphan `bond_instruments` row that no BUY ever covers, polluting
-    `match bonds` and surfacing as an `UnmatchedDisposalError`.
-    Skipped maturities are returned so the CLI can warn the user.
-
-    Args:
-        candidates: Trades produced by `map_bond_maturities`.
-        conn: Open SQLite connection — read-only for this lookup.
-        in_flight: Trades already mapped this run that haven't yet been
-            persisted (regular trades + merger synth). Their bond BUY
-            ISINs count as covered for the purpose of the filter,
-            otherwise a fresh statement that buys *and* matures the
-            same bond in one ingest would have its maturity dropped.
-
-    Returns:
-        `(kept, skipped)`. The two lists partition `candidates`. Order
-        is preserved within each.
-    """
-    if not candidates:
-        return [], []
-
-    isins: set[str] = {
-        t.instrument.isin for t in candidates if isinstance(t.instrument, BondInstrument)
-    }
-    if not isins:
-        return [], list(candidates)
-
-    placeholders = ",".join(["?"] * len(isins))
-    sql = (
-        "SELECT DISTINCT b.isin "
-        "FROM bond_instruments AS b "
-        "JOIN trades AS t ON t.instrument_id = b.instrument_id "
-        "WHERE t.action = 'buy' "
-        f"AND b.isin IN ({placeholders})"
-    )
-    rows = conn.execute(sql, sorted(isins)).fetchall()
-    known: set[str] = {str(r["isin"]) for r in rows}
-
-    # Add this-statement BUYs that haven't been persisted yet.
-    for trade in in_flight:
-        if isinstance(trade.instrument, BondInstrument) and trade.action.value == "buy":
-            known.add(trade.instrument.isin)
-
-    kept: list[Trade] = []
-    skipped: list[Trade] = []
-    for trade in candidates:
-        if isinstance(trade.instrument, BondInstrument) and trade.instrument.isin in known:
-            kept.append(trade)
-        else:
-            skipped.append(trade)
-    return kept, skipped
 
 
 __all__ = [

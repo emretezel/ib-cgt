@@ -22,6 +22,8 @@ import pytest
 
 from ib_cgt.domain import (
     BondInstrument,
+    CorporateAction,
+    CorporateActionKind,
     MatchRule,
     Money,
     StockInstrument,
@@ -393,3 +395,66 @@ def test_non_exempt_open_short_with_soft_residuals_reports_chunk() -> None:
     assert isinstance(result, MatchingResult)
     assert result.matched_disposals == ()
     assert [c.quantity_remaining for c in result.unmatched_disposals] == [Decimal("10")]
+
+
+# ---------------------------------------------------------------------------
+# Redemptions — corporate actions on bonds
+# ---------------------------------------------------------------------------
+
+
+def _redemption(instrument: BondInstrument, on: date, qty: str, cash: Money) -> CorporateAction:
+    return CorporateAction(
+        account_id="U1",
+        kind=CorporateActionKind.CASH_DISPOSAL,
+        instrument=instrument,
+        effective_datetime=datetime(on.year, on.month, on.day, 1, 25, tzinfo=UTC),
+        effective_date=on,
+        report_date=on,
+        quantity=Decimal(qty),
+        cash=cash,
+        description=f"({instrument.isin})  Bond Maturity FOR {cash.currency} 1.00 PER BOND",
+    )
+
+
+def test_exempt_gilt_maturity_counts_as_a_sell_in_the_summary() -> None:
+    gilt = _gilt()
+    engine = BondRuleEngine(StubFXService({}))
+    buy = _bond_trade(
+        action=TradeAction.BUY, on=date(2024, 5, 15), qty="250000", price="0.98602", instrument=gilt
+    )
+    maturity = _redemption(gilt, date(2026, 1, 30), "-250000", Money.of("250000", "GBP"))
+    result = engine.compute(gilt, [(1, buy)], corporate_actions=[(5 * 10**12 + 1, maturity)])
+    assert isinstance(result, ExemptBondResult)
+    assert result.exempt_buy_count == 1
+    assert result.exempt_sell_count == 1
+    assert result.total_sell_native == Money.of("250000", "GBP")
+
+
+def test_exempt_redemption_in_another_currency_is_summarised_in_the_bonds_currency() -> None:
+    """A GBP bond redeemed in USD: the summary carries the GBP value at the effective date."""
+    gilt = _gilt()
+    on = date(2026, 1, 30)
+    engine = BondRuleEngine(StubFXService({on: Decimal("0.8")}))  # 1 USD = 0.8 GBP
+    redemption = _redemption(gilt, on, "-100", Money.of("300", "USD"))
+    result = engine.compute(gilt, [], corporate_actions=[(5 * 10**12 + 2, redemption)])
+    assert isinstance(result, ExemptBondResult)
+    assert result.total_sell_native == Money.of("240", "GBP")
+
+
+def test_non_exempt_bond_redemption_is_a_matched_disposal() -> None:
+    corp = _corp_bond_usd()
+    buy_on, redeem_on = date(2025, 4, 4), date(2026, 3, 31)
+    fx = StubFXService({buy_on: Decimal("0.80"), redeem_on: Decimal("0.75")})
+    engine = BondRuleEngine(fx)
+    buy = _bond_trade(action=TradeAction.BUY, on=buy_on, qty="100", price="0.95", instrument=corp)
+    redemption = _redemption(corp, redeem_on, "-100", Money.of("100", "USD"))
+    event_id = 5 * 10**12 + 3
+    result = engine.compute(corp, [(1, buy)], corporate_actions=[(event_id, redemption)])
+    assert isinstance(result, MatchingResult)
+    [md] = result.matched_disposals
+    assert md.disposal_trade_id == event_id
+    assert md.disposal_date == redeem_on
+    assert md.match_rule is MatchRule.SECTION_104
+    assert md.matched_proceeds_gbp == Money.gbp(Decimal("100") * Decimal("0.75"))
+    assert md.matched_cost_gbp == Money.gbp(Decimal("95") * Decimal("0.80"))
+    assert md.matched_disposal_fees_gbp == Money.gbp("0")

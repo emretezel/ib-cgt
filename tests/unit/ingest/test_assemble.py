@@ -104,11 +104,11 @@ def test_later_header_resets_the_column_map() -> None:
     table = RawTable(
         SectionKind.OPEN_POSITIONS,
         (
-            _header("Symbol", "Quantity", "Mult", "Cost Price"),
+            _header("Symbol", "Quantity", "Mult", "Cost Price", "Close Price"),
             _asset("Futures"),
             _currency("USD"),
-            _data("6LK6", "6", "100,000", "0.19"),
-            _header("Symbol", "Quantity", "Accrued Int", "Cost Price"),
+            _data("6LK6", "6", "100,000", "0.19", "0.1923"),
+            _header("Symbol", "Quantity", "Accrued Int", "Cost Price", "Close Price"),
             _asset("Bonds"),
             _currency("GBP"),
             _data(
@@ -116,12 +116,15 @@ def test_later_header_resets_the_column_map() -> None:
                 "310,000",
                 "533.34",
                 "97.99",
+                "98.1240",
             ),
         ),
     )
     future, bond = assemble(_document(table)).open_positions
     assert future.multiplier_text == "100,000"
+    assert future.close_price_text == "0.1923"
     assert bond.multiplier_text is None
+    assert bond.close_price_text == "98.1240"
     assert bond.symbol == "UKT 0 3/8 10/22/26"
     assert bond.description == "United Kingdom Gilt UKT 0 3/8 10/22/26"
 
@@ -276,10 +279,10 @@ def test_option_rows_are_read_in_every_section_that_has_an_asset_header() -> Non
     positions = RawTable(
         SectionKind.OPEN_POSITIONS,
         (
-            _header("Symbol", "Quantity", "Mult"),
+            _header("Symbol", "Quantity", "Mult", "Close Price"),
             _asset("Equity and Index Options"),
             _currency("USD"),
-            _data("TUR 17MAY19 22.0 P", "5", "100"),
+            _data("TUR 17MAY19 22.0 P", "5", "100", "0.60"),
         ),
     )
     parsed = assemble(_document(trades, instruments, positions))
@@ -437,3 +440,51 @@ def test_header_facts_are_passed_through() -> None:
     assert parsed.time_zone.key == "America/New_York"
     assert parsed.trades == ()
     assert parsed.open_positions == ()
+
+
+# ---------------------------------------------------------------------------
+# Cash Report — the label column has no header
+# ---------------------------------------------------------------------------
+
+
+def test_cash_report_rows_resolve_the_unnamed_label_column() -> None:
+    """The blank header cell aliases the label column; every line keeps its currency."""
+    table = RawTable(
+        SectionKind.CASH_REPORT,
+        (
+            _header("", "Total", "Securities", "Futures", "IB-UKL"),
+            _currency("Base Currency Summary"),
+            _data("Starting Cash", "10,293.40", "10,293.40", "0.00", "0.00"),
+            _data("Ending Cash", "81,332.17", "81,332.17", "0.00", "0.00"),
+            _currency("USD"),
+            _data("Cash Detail"),
+            _data("Starting Cash", "212.10", "212.10", "0.00", "0.00"),
+            _data("Dividends", "2,889.86", "2,889.86", "0.00", "0.00"),
+            _data("Ending Cash", "1,127.55", "1,127.55", "0.00", "0.00"),
+            _total("Total", "1,127.55"),
+        ),
+    )
+    rows = assemble(_document(table)).cash_report
+    assert [(r.currency, r.label, r.total_text) for r in rows] == [
+        ("Base Currency Summary", "Starting Cash", "10,293.40"),
+        ("Base Currency Summary", "Ending Cash", "81,332.17"),
+        ("USD", "Starting Cash", "212.10"),
+        ("USD", "Dividends", "2,889.86"),
+        ("USD", "Ending Cash", "1,127.55"),
+    ]
+
+
+def test_cash_report_needs_no_asset_or_currency_block() -> None:
+    """The PDF adapter tags the base-currency block as an asset header; its rows still flow."""
+    table = RawTable(
+        SectionKind.CASH_REPORT,
+        (
+            _header("", "Total", "Securities", "Futures", "IB-UKL"),
+            _asset("Base Currency Summary"),
+            _data("Starting Cash", "0.00", "0.00", "0.00", "0.00"),
+            _currency("EUR"),
+            _data("Ending Cash", "-5,000.00", "-5,000.00", "0.00", "0.00"),
+        ),
+    )
+    rows = assemble(_document(table)).cash_report
+    assert [(r.currency, r.label) for r in rows] == [("", "Starting Cash"), ("EUR", "Ending Cash")]

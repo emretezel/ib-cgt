@@ -131,7 +131,7 @@ def load_sa108_report(conn: sqlite3.Connection, tax_year: TaxYear) -> Sa108Repor
         return None
     resolver = DbEventResolver(
         conn,
-        persisted.computation.fx_event_sources,
+        persisted.computation.event_sources,
         persisted.computation.report.option_exercise_transfers,
     )
     return build_sa108_report(persisted, resolver)

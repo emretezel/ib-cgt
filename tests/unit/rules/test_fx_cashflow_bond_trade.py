@@ -108,21 +108,6 @@ def test_usd_bond_sell_is_a_pool_acquisition_of_principal_minus_fees() -> None:
     assert event.acquisition_date == ON
 
 
-def test_synthesised_maturity_is_an_acquisition_at_par_with_no_fees() -> None:
-    """A maturity is a SELL at price 1 with zero fees — cash in equals face."""
-    fx = _StubFx({("USD", ON): Decimal("0.75")})
-    event = from_bond_trade(
-        44,
-        _bond_trade(action=TradeAction.SELL, price="1", fees="0"),
-        "USD",
-        fx,
-        make_pool_instrument("USD"),
-    )
-    assert isinstance(event, Acquisition)
-    assert event.quantity == Decimal("1000")
-    assert event.cost_gbp == Money.gbp("750")
-
-
 def test_accrued_interest_is_folded_in_when_the_trade_carries_it() -> None:
     """When populated, accrued interest adds to a buy's outflow and a sell's inflow."""
     fx = _StubFx({("USD", ON): Decimal("1")})

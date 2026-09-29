@@ -100,7 +100,12 @@ def _set_positions(db: sqlite3.Connection, *positions: tuple[AnyInstrument, str]
     db.execute("DELETE FROM statement_positions WHERE statement_hash = 'hash-a'")
     StatementPositionRepo(db).insert_many(
         [
-            StatementPosition(account_id=ACCOUNT, instrument=instrument, quantity=Decimal(qty))
+            StatementPosition(
+                account_id=ACCOUNT,
+                instrument=instrument,
+                quantity=Decimal(qty),
+                close_price=Decimal("1"),
+            )
             for instrument, qty in positions
         ],
         source_statement_hash="hash-a",
@@ -198,7 +203,14 @@ def test_C7_quiet_for_a_holding_moved_to_the_other_account(
         period_end=date(2025, 4, 5),
     )
     StatementPositionRepo(db).insert_many(
-        [StatementPosition(account_id="U10049818", instrument=AAPL, quantity=Decimal("20"))],
+        [
+            StatementPosition(
+                account_id="U10049818",
+                instrument=AAPL,
+                quantity=Decimal("20"),
+                close_price=Decimal("1"),
+            )
+        ],
         source_statement_hash="hash-b",
     )
     assert _c7(db, fx_service).status is Status.OK

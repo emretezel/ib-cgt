@@ -1,10 +1,18 @@
 """`ib-cgt show match --disposal ID` — every chunk matched against one FX disposal.
 
+The disposal is normally a real trade. A corporate action that paid
+cash (`CA #N` in the match tables) is cited by its synthetic event id
+instead; `--corporate-action N` names it by the row id the tables
+print, and `--disposal` accepts the event id itself.
+
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -12,29 +20,53 @@ from typing import Annotated
 import typer
 from rich.table import Table
 
-from ib_cgt.calculator import load_fx_inputs, run_future_engine, run_fx_pools
+from ib_cgt.calculator import (
+    corporate_action_event_id,
+    corporate_action_id_of,
+    load_fx_inputs,
+    run_future_engine,
+    run_fx_pools,
+)
 from ib_cgt.cli.app import show_app
 from ib_cgt.cli.common import build_fx_service, console, format_money_2dp, format_qty_2dp
 from ib_cgt.cli.fx_labels import FxLabels, fx_basis_cells, fx_divider
 from ib_cgt.config import resolve_db_path
-from ib_cgt.db import StoredTrade, TradeRepo, apply_migrations, open_connection
-from ib_cgt.domain import FutureInstrument, FXInstrument, StockInstrument, Trade
+from ib_cgt.db import CorporateActionRepo, TradeRepo, apply_migrations, open_connection
+from ib_cgt.domain import CorporateAction, FutureInstrument, FXInstrument, StockInstrument, Trade
+from ib_cgt.report.labels import corporate_action_label
 from ib_cgt.rules import MatchingResult
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DisposalHeader:
+    """What the report line names: the disposal's citeable label and its date."""
+
+    label: str
+    on: date
 
 
 @show_app.command("match")
 def show_match(
     disposal: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--disposal",
             help=(
-                "Disposal trade_id whose matched chunks you want to audit. "
-                "Use the trade_id printed in `match fx` (real DB id, not a "
-                "synthetic P&L id)."
+                "Disposal id whose matched chunks you want to audit: a trade_id as printed "
+                "in `match fx`, or the synthetic event id of a corporate action."
             ),
         ),
-    ],
+    ] = None,
+    corporate_action: Annotated[
+        int | None,
+        typer.Option(
+            "--corporate-action",
+            help=(
+                "The N of a `CA #N` label — the corporate action whose cash leg you want "
+                "to audit. Equivalent to --disposal with its event id."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Print every matched chunk attached to one disposal, with running residual.
 
@@ -46,18 +78,22 @@ def show_match(
     one matched in pieces (same-day → 30-day → S.104 →
     s.105(2)).
     """
+    if disposal is not None and corporate_action is None:
+        event_id = disposal
+    elif corporate_action is not None and disposal is None:
+        event_id = corporate_action_event_id(corporate_action)
+    else:
+        console.print("[red]Give exactly one of --disposal or --corporate-action.[/]")
+        raise typer.Exit(code=2)
+
     db_path = resolve_db_path()
     conn = open_connection(db_path)
     try:
         apply_migrations(conn)
-        stored = TradeRepo(conn).get(disposal)
-        if stored is None:
-            console.print(f"[red]No trade found with trade_id={disposal}.[/]")
-            raise typer.Exit(code=1)
-        pools = _pools_disposal_could_touch(stored.trade)
+        header, pools = _locate(conn, event_id)
         if not pools:
             console.print(
-                f"[yellow]Trade #{disposal} doesn't touch any non-GBP pool — "
+                f"[yellow]{header.label} doesn't touch any non-GBP pool — "
                 "it can't appear in `match fx` output.[/]"
             )
             raise typer.Exit(code=0)
@@ -79,12 +115,42 @@ def show_match(
         conn.close()
 
     _render_show_match(
-        disposal_trade_id=disposal,
-        stored=stored,
+        disposal_trade_id=event_id,
+        header=header,
         per_pool_results=per_pool_results,
         labels=labels,
         db_path=db_path,
     )
+
+
+def _locate(conn: sqlite3.Connection, event_id: int) -> tuple[_DisposalHeader, list[str]]:
+    """Resolve an event id to its header line and the pools it could touch.
+
+    A real trade resolves through `trades`; a corporate-action event
+    id through `corporate_actions` (the pool is its cash currency).
+    Anything else is an error the user sees.
+    """
+    stored = TradeRepo(conn).get(event_id)
+    if stored is not None:
+        header = _DisposalHeader(label=f"#{event_id}", on=stored.trade.trade_date)
+        return header, _pools_disposal_could_touch(stored.trade)
+    action_id = corporate_action_id_of(event_id)
+    stored_action = CorporateActionRepo(conn).get(action_id) if action_id is not None else None
+    if action_id is None or stored_action is None:
+        console.print(f"[red]No trade or corporate action found for id={event_id}.[/]")
+        raise typer.Exit(code=1)
+    header = _DisposalHeader(
+        label=f"{corporate_action_label(action_id)} (event id {event_id})",
+        on=stored_action.action.effective_date,
+    )
+    return header, _pools_corporate_action_could_touch(stored_action.action)
+
+
+def _pools_corporate_action_could_touch(action: CorporateAction) -> list[str]:
+    """The pool a corporate action's cash leg feeds: its cash currency, unless GBP."""
+    if action.cash is None or action.cash.currency == "GBP":
+        return []
+    return [action.cash.currency]
 
 
 def _pools_disposal_could_touch(trade: Trade) -> list[str]:
@@ -110,17 +176,14 @@ def _pools_disposal_could_touch(trade: Trade) -> list[str]:
 def _render_show_match(
     *,
     disposal_trade_id: int,
-    stored: StoredTrade,
+    header: _DisposalHeader,
     per_pool_results: list[tuple[str, MatchingResult]],
     labels: FxLabels,
     db_path: Path,
 ) -> None:
     """Render per-pool tables of chunks belonging to one disposal."""
     source_label = labels.source_descriptions.get(disposal_trade_id, "—")
-    console.print(
-        f"\n[bold]Disposal #{disposal_trade_id} — {source_label} on "
-        f"{stored.trade.trade_date.isoformat()}[/]"
-    )
+    console.print(f"\n[bold]Disposal {header.label} — {source_label} on {header.on.isoformat()}[/]")
 
     found_anything = False
     for ccy, result in per_pool_results:

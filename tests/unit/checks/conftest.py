@@ -132,7 +132,14 @@ def _seed_baseline(conn: sqlite3.Connection) -> None:
     # the trade-derived position reconciles (check C7). U10049818 has
     # no statement of its own and is therefore not reconciled at all.
     StatementPositionRepo(conn).insert_many(
-        [StatementPosition(account_id="U1004320", instrument=aapl, quantity=Decimal("10"))],
+        [
+            StatementPosition(
+                account_id="U1004320",
+                instrument=aapl,
+                quantity=Decimal("10"),
+                close_price=Decimal("1"),
+            )
+        ],
         source_statement_hash="hash-a",
     )
 

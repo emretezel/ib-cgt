@@ -58,6 +58,7 @@ def _row(
     quantity_text: str = "10",
     description: str = "",
     multiplier_text: str | None = None,
+    close_price_text: str = "1.00",
 ) -> RawOpenPositionRow:
     return RawOpenPositionRow(
         asset_class=asset_class,
@@ -65,6 +66,7 @@ def _row(
         symbol=symbol,
         description=description,
         quantity_text=quantity_text,
+        close_price_text=close_price_text,
         multiplier_text=multiplier_text,
     )
 
@@ -126,6 +128,7 @@ def test_stock_position_resolves_conid_through_instrument_info() -> None:
             account_id="U1",
             instrument=StockInstrument(conid=59262240, symbol="IEMI", currency="USD"),
             quantity=Decimal("100"),
+            close_price=Decimal("1.00"),
         )
     ]
 
@@ -294,3 +297,34 @@ def test_mixed_statement_keeps_resolved_and_leftover_rows_in_order() -> None:
     ]
     assert all(p.account_id == "U9999996" for p in positions)
     assert [row.symbol for row in leftovers] == ["CBK6"]
+
+
+# ---------------------------------------------------------------------------
+# Close price
+# ---------------------------------------------------------------------------
+
+
+def test_close_price_is_parsed_as_printed() -> None:
+    """The statement's Close Price rides on the position, commas stripped, sign kept."""
+    parsed = _parsed(
+        _row(asset_class="Futures", symbol="6LK6", quantity_text="6", close_price_text="0.1923"),
+        _row(
+            asset_class="Stocks",
+            symbol="IEMI",
+            quantity_text="100",
+            close_price_text="1,026.5000",
+        ),
+        instruments=(_future_info(), _stock_info("IEMI", "59262240")),
+    )
+    positions, leftovers = map_open_positions(parsed)
+    assert leftovers == []
+    assert [p.close_price for p in positions] == [Decimal("0.1923"), Decimal("1026.5000")]
+
+
+def test_unparseable_close_price_raises() -> None:
+    parsed = _parsed(
+        _row(asset_class="Futures", symbol="6LK6", close_price_text="n/a"),
+        instruments=(_future_info(),),
+    )
+    with pytest.raises(MappingError, match="close price"):
+        map_open_positions(parsed)

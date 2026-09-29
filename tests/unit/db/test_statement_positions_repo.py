@@ -50,7 +50,9 @@ def _seed_statement(db: sqlite3.Connection, statement_hash: str = "hash-1") -> N
 def _position(
     instrument: StockInstrument | BondInstrument | FutureInstrument, qty: str
 ) -> StatementPosition:
-    return StatementPosition(account_id="U1", instrument=instrument, quantity=Decimal(qty))
+    return StatementPosition(
+        account_id="U1", instrument=instrument, quantity=Decimal(qty), close_price=Decimal("1")
+    )
 
 
 def test_insert_and_for_statement_round_trip(db: sqlite3.Connection) -> None:

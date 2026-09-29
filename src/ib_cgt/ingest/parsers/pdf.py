@@ -122,9 +122,9 @@ class PageGeometry:
 # footer in 6 pt. Anything at or above this size is a title.
 _TITLE_SIZE: Final = 9.5
 
-# Title text → section. Titles absent from this map (`Cash Report`,
-# `Net Asset Value`, `Interest Accruals`, `Forex Balances`, `Codes`,
-# `Notes/Legal Notes`, …) close the column they appear in.
+# Title text → section. Titles absent from this map (`Net Asset
+# Value`, `Interest Accruals`, `Forex Balances`, `Codes`, `Notes/Legal
+# Notes`, …) close the column they appear in.
 _TITLE_SECTIONS: Final[dict[str, SectionKind]] = {
     "Trades": SectionKind.TRADES,
     "Open Positions": SectionKind.OPEN_POSITIONS,
@@ -135,12 +135,19 @@ _TITLE_SECTIONS: Final[dict[str, SectionKind]] = {
     "Interest": SectionKind.INTEREST,
     "Deposits & Withdrawals": SectionKind.DEPOSITS_WITHDRAWALS,
     "Fees": SectionKind.FEES,
+    "Cash Report": SectionKind.CASH_REPORT,
 }
 
 # First-cell texts that mark a column-label row in every section we read.
 _HEADER_LEADS: Final[frozenset[str]] = frozenset(
     {"Symbol", "Date", "Date/Time", "Description", "Code", "Report Date"}
 )
+
+# The Cash Report's label column has no header: its column-label row
+# starts with a blank cell and `Total` (the sum of the account
+# segments) comes next. No data row of any section we read starts
+# blank with `Total` beside it — a total row starts *with* `Total`.
+_BLANK_LEAD_HEADER_SECOND: Final = "Total"
 
 # A currency sub-header is a bare ISO-4217 code.
 _CURRENCY_CODE: Final = re.compile(r"[A-Z]{3}")
@@ -450,6 +457,8 @@ def _classify(row: _Row) -> TableRow | None:
     if lead.startswith("Total"):
         return TableRow(RowKind.TOTAL, cells)
     if lead in _HEADER_LEADS:
+        return TableRow(RowKind.HEADER, cells)
+    if not lead and _squash(cells[1]) == _BLANK_LEAD_HEADER_SECOND:
         return TableRow(RowKind.HEADER, cells)
     return TableRow(RowKind.DATA, cells)
 

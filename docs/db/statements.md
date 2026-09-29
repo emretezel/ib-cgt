@@ -5,9 +5,10 @@
 One row per imported IB activity statement (HTML or PDF). The primary key is a
 deterministic SHA-256 hash of the statement's source bytes, which lets
 the ingestor answer "have I already processed this exact file?" in
-O(1). Every `trades`, `dividends`, `bond_coupons`, `cash_events` and
-`statement_positions` row carries the source statement's hash as a
-foreign key, giving every stored fact an unambiguous, audit-grade
+O(1). Every `trades`, `dividends`, `bond_coupons`, `cash_events`,
+`corporate_actions`, `statement_positions` and
+`statement_cash_balances` row carries the source statement's hash as
+a foreign key, giving every stored fact an unambiguous, audit-grade
 provenance link back to the file it came from.
 
 Since migration 015 the row also records the **period the statement
@@ -59,8 +60,10 @@ Inbound, all `ON DELETE CASCADE`:
 [`trades.source_statement_hash`](./trades.md) (migration 004),
 [`dividends.source_statement_hash`](./dividends.md) (009),
 [`bond_coupons.source_statement_hash`](./bond_coupons.md) (012),
-[`statement_positions.statement_hash`](./statement_positions.md) (016)
-and [`cash_events.source_statement_hash`](./cash_events.md) (017).
+[`statement_positions.statement_hash`](./statement_positions.md) (016),
+[`cash_events.source_statement_hash`](./cash_events.md) (017),
+[`corporate_actions.source_statement_hash`](./corporate_actions.md) (024)
+and [`statement_cash_balances.statement_hash`](./statement_cash_balances.md) (024).
 A `DELETE FROM statements WHERE statement_hash = ?` therefore removes
 every fact the statement contributed, which is what `ib-cgt ingest
 --replace` and `ib-cgt db reset` rely on.

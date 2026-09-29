@@ -1,11 +1,11 @@
 """CLI tests for `ib-cgt match fx` and `show match` on the shared runner.
 
 Seeds one USD stock purchase (a disposal of dollars) followed within
-30 days by a USD external deposit and a USD bond coupon, so the
-30-day rule matches part of the disposal directly against each —
-which is how the `Cash #N` and `Cpn #N` labels reach the rendered
-table — and leaves the remainder in the yellow unmatched-disposals
-block.
+30 days by a USD external deposit, a USD bond coupon and the USD cash
+of a GBP-listed fund's cash merger, so the 30-day rule matches part
+of the disposal directly against each — which is how the `Cash #N`,
+`Cpn #N` and `CA #N` labels reach the rendered table — and leaves the
+remainder in the yellow unmatched-disposals block.
 
 Author: Emre Tezel
 """
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from ib_cgt.db import (
     AccountRepo,
     BondCouponRepo,
     CashEventRepo,
+    CorporateActionRepo,
     FXRateRepo,
     StatementRepo,
     TradeRepo,
@@ -40,6 +41,8 @@ from ib_cgt.domain import (
     BondInstrument,
     CashEvent,
     CashEventKind,
+    CorporateAction,
+    CorporateActionKind,
     Money,
     StockInstrument,
     Trade,
@@ -109,6 +112,41 @@ def _seed(conn: sqlite3.Connection) -> None:
         ],
         source_statement_hash="hash-fx",
     )
+    # A GBP-listed fund cashed out for 15 USD: the dollars arrive under
+    # the corporate action's own event id (`CA #1`).
+    iemi = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+    TradeRepo(conn).insert_many(
+        [
+            Trade(
+                account_id="U1",
+                instrument=iemi,
+                action=TradeAction.BUY,
+                trade_datetime=datetime(2025, 3, 10, 14, 0, tzinfo=_UK),
+                trade_date=date(2025, 3, 10),
+                settlement_date=date(2025, 3, 10),
+                quantity=Decimal("2"),
+                price=Money.of(Decimal("5"), "GBP"),
+                fees=Money.of(Decimal("0"), "GBP"),
+            )
+        ],
+        source_statement_hash="hash-fx",
+    )
+    CorporateActionRepo(conn).insert_many(
+        [
+            CorporateAction(
+                account_id="U1",
+                kind=CorporateActionKind.CASH_DISPOSAL,
+                instrument=iemi,
+                effective_datetime=datetime(2025, 4, 12, 12, 0, tzinfo=UTC),
+                effective_date=date(2025, 4, 12),
+                report_date=date(2025, 4, 14),
+                quantity=Decimal("-2"),
+                cash=Money.of("15", "USD"),
+                description="IEMI(IE00B2NPL135) Merged(Acquisition) for USD 7.50 per Share",
+            )
+        ],
+        source_statement_hash="hash-fx",
+    )
     rates: list[FXRate] = []
     cur = date(2025, 3, 1)
     while cur <= date(2025, 5, 1):
@@ -136,16 +174,19 @@ def test_match_fx_renders_coupon_label_and_unmatched_block(
 ) -> None:
     result = runner.invoke(app, ["match", "fx"])
     assert result.exit_code == 0, result.stdout
-    # 20 USD (the deposit) + 30 USD (the coupon) of the 100 USD spent on
-    # AAPL matched under the 30-day rule; each is cited by its real row id.
+    # 15 USD (the merger cash) + 20 USD (the deposit) + 30 USD (the
+    # coupon) of the 100 USD spent on AAPL matched under the 30-day
+    # rule; each is cited by its real row id.
     assert "bed_and_breakfast" in result.stdout
+    assert "acq CA #1" in result.stdout
+    assert "corporate action IEMI cash_disposal" in result.stdout
     assert "acq Cash #1" in result.stdout
     assert "transfer: Electronic Fund Transfer" in result.stdout
     assert "acq Cpn #1" in result.stdout
     assert "bond coupon ACME 5 2030" in result.stdout
-    # The other 50 USD could not be covered — reported, not raised.
+    # The other 35 USD could not be covered — reported, not raised.
     assert "Unmatched disposals (1)" in result.stdout
-    assert "50.00" in result.stdout
+    assert "35.00" in result.stdout
     assert "Errors" not in result.stdout
 
 
@@ -160,6 +201,22 @@ def test_show_match_uses_the_same_pass(runner: CliRunner, populated_db: Path) ->
     assert result.exit_code == 0, result.stdout
     assert "Disposal #1" in result.stdout
     assert "USD vs GBP" in result.stdout
+    assert "acq CA #1" in result.stdout
     assert "acq Cash #1" in result.stdout
     assert "acq Cpn #1" in result.stdout
     assert "UNMATCHED" in result.stdout
+
+
+def test_show_match_resolves_a_corporate_action_by_row_id(
+    runner: CliRunner, populated_db: Path
+) -> None:
+    """`--corporate-action N` and `--disposal <event id>` name the same event."""
+    by_row = runner.invoke(app, ["show", "match", "--corporate-action", "1"])
+    assert by_row.exit_code == 0, by_row.stdout
+    assert "Disposal CA #1 (event id 5000000000001)" in by_row.stdout
+    assert "corporate action IEMI cash_disposal on 2025-04-12" in by_row.stdout
+    # The merger cash is an acquisition, so no chunk is matched *against* it.
+    assert "No matched chunks found" in by_row.stdout
+    by_event = runner.invoke(app, ["show", "match", "--disposal", "5000000000001"])
+    assert by_event.exit_code == 0, by_event.stdout
+    assert "Disposal CA #1 (event id 5000000000001)" in by_event.stdout

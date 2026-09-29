@@ -2,10 +2,11 @@
 
 A `matched_disposals` row cites its disposal and (for a direct basis)
 its acquisition by integer id. For stocks, bonds and forex trades that
-is a real `trades.trade_id`. For the non-trade cashflows the FX pools
+is a real `trades.trade_id`. For the non-trade events the engines
 consume — dividends, withholding tax, coupons, cash movements, futures
-P&L — it is a synthetic id the runner allocated, and the run's
-`fx_event_sources` table says which row each one stands for.
+P&L, corporate actions — it is a synthetic id the runner allocated,
+and the run's `event_sources` table says which row each one stands
+for.
 
 `DbEventResolver` turns either kind of id into an `EventRef` (label,
 date, account, description) with one repository lookup per distinct
@@ -19,21 +20,24 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable, Mapping
-from typing import Protocol
+from typing import Protocol, assert_never
 
-from ib_cgt.db import BondCouponRepo, CashEventRepo, DividendRepo, TradeRepo
+from ib_cgt.db import BondCouponRepo, CashEventRepo, CorporateActionRepo, DividendRepo, TradeRepo
 from ib_cgt.domain import (
     BondCouponRef,
     CashEventRef,
+    CorporateActionRef,
     DividendRef,
+    EventSource,
     FutureInstrument,
     FutureRealisationRef,
-    FXEventSource,
     OptionExerciseTransfer,
 )
 from ib_cgt.report.labels import (
     cash_description,
     cash_label,
+    corporate_action_description,
+    corporate_action_label,
     coupon_description,
     coupon_label,
     dividend_description,
@@ -91,7 +95,7 @@ class DbEventResolver:
     def __init__(
         self,
         conn: sqlite3.Connection,
-        fx_event_sources: Mapping[int, FXEventSource],
+        event_sources: Mapping[int, EventSource],
         exercise_transfers: Iterable[OptionExerciseTransfer] = (),
     ) -> None:
         """Bind to an open connection, the run's synthetic-id map and its exercise transfers.
@@ -104,7 +108,8 @@ class DbEventResolver:
         self._dividends = DividendRepo(conn)
         self._coupons = BondCouponRepo(conn)
         self._cash_events = CashEventRepo(conn)
-        self._sources = fx_event_sources
+        self._corporate_actions = CorporateActionRepo(conn)
+        self._sources = event_sources
         self._transfers: dict[int, list[OptionExerciseTransfer]] = {}
         for transfer in exercise_transfers:
             self._transfers.setdefault(transfer.share_trade_id, []).append(transfer)
@@ -131,7 +136,12 @@ class DbEventResolver:
             return self._coupon(event_id, source)
         if isinstance(source, CashEventRef):
             return self._cash_event(event_id, source)
-        return self._realisation(event_id, source)
+        if isinstance(source, CorporateActionRef):
+            return self._corporate_action(event_id, source)
+        if isinstance(source, FutureRealisationRef):
+            return self._realisation(event_id, source)
+        # The union is sealed; a new member needs a branch here.
+        assert_never(source)
 
     def _trade(self, event_id: int) -> EventRef:
         """A real trade: label `#N`, dated and described from the row.
@@ -195,6 +205,20 @@ class DbEventResolver:
             on=event.value_date,
             account_id=event.account_id,
             description=cash_description(event),
+        )
+
+    def _corporate_action(self, event_id: int, source: CorporateActionRef) -> EventRef:
+        """A corporate action, dated on its effective date — the disposal and the pool date."""
+        stored = self._corporate_actions.get(source.corporate_action_id)
+        if stored is None:
+            return unresolved(event_id)
+        action = stored.action
+        return EventRef(
+            event_id=event_id,
+            label=corporate_action_label(source.corporate_action_id),
+            on=action.effective_date,
+            account_id=action.account_id,
+            description=corporate_action_description(action),
         )
 
     def _realisation(self, event_id: int, source: FutureRealisationRef) -> EventRef:

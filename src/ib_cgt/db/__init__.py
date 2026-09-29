@@ -10,7 +10,8 @@ This package is step 3 of the twelve-step implementation order in
 * `codecs` — small, explicit helpers for Decimal / date / datetime / Money
   round-trips so repo code never reaches for sqlite3's adapter magic.
 * `repos/` — one repository class per aggregate (accounts, instruments,
-  trades, fx_rates, statements, tax_runs, option grants and exercises).
+  trades, fx_rates, statements, corporate actions, cash balances,
+  tax_runs, option grants and exercises).
   Each takes a connection and exposes intention-revealing methods; no ORM.
 
 Downstream components (ingest, fx, rules, calculator, report) should
@@ -26,13 +27,15 @@ from ib_cgt.db.migrator import apply_migrations
 from ib_cgt.db.repos.accounts import AccountRepo
 from ib_cgt.db.repos.bond_coupons import BondCouponRepo, StoredBondCoupon
 from ib_cgt.db.repos.cash_events import CashEventRepo, StoredCashEvent
+from ib_cgt.db.repos.corporate_actions import CorporateActionRepo, StoredCorporateAction
 from ib_cgt.db.repos.dividends import DividendRepo, StoredDividend
+from ib_cgt.db.repos.event_sources import EventSourceRepo
 from ib_cgt.db.repos.future_realisations import FutureRealisationRepo
-from ib_cgt.db.repos.fx_event_sources import FXEventSourceRepo
 from ib_cgt.db.repos.fx_rates import FXRate, FXRateRepo
 from ib_cgt.db.repos.instruments import InstrumentRepo
 from ib_cgt.db.repos.option_exercises import OptionExerciseLinkRepo, OptionExerciseTransferRepo
 from ib_cgt.db.repos.option_grants import OptionGrantRepo
+from ib_cgt.db.repos.statement_cash_balances import StatementCashBalanceRepo
 from ib_cgt.db.repos.statement_positions import StatementPositionRepo
 from ib_cgt.db.repos.statements import StatementRepo, StatementRow
 from ib_cgt.db.repos.tax_run_issues import TaxRunIssueRepo
@@ -43,8 +46,9 @@ __all__ = [
     "AccountRepo",
     "BondCouponRepo",
     "CashEventRepo",
+    "CorporateActionRepo",
     "DividendRepo",
-    "FXEventSourceRepo",
+    "EventSourceRepo",
     "FXRate",
     "FXRateRepo",
     "FutureRealisationRepo",
@@ -53,11 +57,13 @@ __all__ = [
     "OptionExerciseLinkRepo",
     "OptionExerciseTransferRepo",
     "OptionGrantRepo",
+    "StatementCashBalanceRepo",
     "StatementPositionRepo",
     "StatementRepo",
     "StatementRow",
     "StoredBondCoupon",
     "StoredCashEvent",
+    "StoredCorporateAction",
     "StoredDividend",
     "StoredTrade",
     "TaxRun",

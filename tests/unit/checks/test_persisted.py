@@ -84,7 +84,7 @@ def persisted_db(db: sqlite3.Connection, fx_service: FXService) -> sqlite3.Conne
                 symbol="AAPL",
                 kind=DividendKind.WITHHOLDING_TAX,
                 pay_date=date(2025, 4, 3),
-                amount=Money.of("7.50", "USD"),
+                amount=Money.of("-7.50", "USD"),
                 description="AAPL(US0378331005) Cash Dividend USD 0.25 per Share - US Tax",
             ),
         ],
@@ -182,7 +182,7 @@ def test_D2_counts_futures_realisations(
     assert _check(_tier_d(persisted_db, fx_service), "D2").status is Status.FAIL
 
 
-def test_D4_resolves_synthetic_ids_through_fx_event_sources(
+def test_D4_resolves_synthetic_ids_through_event_sources(
     persisted_db: sqlite3.Connection, fx_service: FXService
 ) -> None:
     """The WHT-vs-dividend chunk carries two synthetic ids; both resolve via the map."""
@@ -191,7 +191,7 @@ def test_D4_resolves_synthetic_ids_through_fx_event_sources(
     ).fetchone()[0]
     assert synthetic >= 1
     assert _check(_tier_d(persisted_db, fx_service), "D4").status is Status.OK
-    persisted_db.execute("DELETE FROM fx_event_sources")
+    persisted_db.execute("DELETE FROM event_sources")
     persisted_db.commit()
     d4 = _check(_tier_d(persisted_db, fx_service), "D4")
     assert d4.status is Status.FAIL
@@ -215,7 +215,7 @@ def test_tier_d_wakes_on_a_futures_only_run(
 ) -> None:
     """A run with realisations but no chunks still has a `tax_runs` row — the tier runs."""
     persisted_db.execute("DELETE FROM matched_disposals")
-    persisted_db.execute("DELETE FROM fx_event_sources")
+    persisted_db.execute("DELETE FROM event_sources")
     persisted_db.commit()
     results = _tier_d(persisted_db, fx_service)
     assert _check(results, "D2").status is Status.FAIL  # the header no longer adds up

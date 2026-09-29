@@ -10,7 +10,7 @@ in the listing currency).
 This module is the projector layer: pure, stateless functions that
 turn each non-Forex source — non-GBP stock, bond and option trades,
 non-GBP futures trade fees, futures realised P&L, dividends, bond
-coupons, and instrument-less cash events — into the same
+coupons, instrument-less cash events and corporate-action cash — into the same
 `Acquisition` / `Disposal` shapes the FX engine already feeds into the
 shared `MatchingEngine`. The forex-trade projector also lives here so
 every projection rule sits in one file.
@@ -57,10 +57,10 @@ from ib_cgt.domain import (
     BondCoupon,
     BondInstrument,
     CashEvent,
+    CorporateAction,
     CurrencyPair,
     Disposal,
     Dividend,
-    DividendKind,
     FutureInstrument,
     FutureRealisation,
     FXInstrument,
@@ -411,10 +411,14 @@ def from_dividend(
     receipt: cash arrives in the foreign-currency balance on
     `pay_date`, GBP-converted at that date's spot rate.
 
-    Direction is encoded in `Dividend.kind`:
-    * `cash_dividend`, `payment_in_lieu` → **Acquisition** of the
-      pool currency.
-    * `withholding_tax` → **Disposal** (cash debited at source).
+    Direction is the **sign of the amount**, never the kind: a
+    positive row is cash arriving in the balance — an **Acquisition**
+    of the pool currency; a negative row is cash leaving — a
+    **Disposal** of the absolute amount. A cash dividend or payment
+    in lieu is normally positive and withholding normally negative,
+    but a payment in lieu owed on a short (TUR, 2019-06-21, -887.72
+    USD) and a withholding reversal (FF / BBBY, January 2017) carry
+    the opposite sign, and the pool must follow the cash.
 
     The income-tax treatment of the dividend itself (basic / higher
     rate, dividend allowance, foreign-tax-credit relief) is out of
@@ -441,35 +445,33 @@ def from_dividend(
         return None
 
     # Defensive: matches `Dividend.__post_init__`. The validator
-    # already rejects zero or negative amounts, but reasserting
-    # here documents the projector's contract for readers who
-    # haven't read the domain validation.
-    amount = dividend.amount.amount
-    if amount <= 0:
+    # already rejects a zero amount, but reasserting here documents
+    # the projector's contract for readers who haven't read the
+    # domain validation.
+    magnitude = abs(dividend.amount.amount)
+    if magnitude == 0:
         return None
 
-    gbp_value = _money_to_gbp(dividend.amount, fx, dividend.pay_date)
+    # Statement-sourced cents: no `_cash` rounding needed.
+    gbp_value = _to_gbp(magnitude, native_ccy, fx, dividend.pay_date)
 
-    if dividend.kind is DividendKind.WITHHOLDING_TAX:
-        return Disposal(
+    if dividend.is_inflow:
+        return Acquisition(
             trade_id=synth_id,
             account_id=dividend.account_id,
             instrument=pool_instrument,
-            disposal_date=dividend.pay_date,
-            quantity=amount,
-            proceeds_gbp=gbp_value,
+            acquisition_date=dividend.pay_date,
+            quantity=magnitude,
+            cost_gbp=gbp_value,
             fees_gbp=Money.gbp(Decimal(0)),
         )
-    # CASH_DIVIDEND and PAYMENT_IN_LIEU are both inflows — cash
-    # arrives in the foreign-currency balance, the pool gains a
-    # native-currency acquisition.
-    return Acquisition(
+    return Disposal(
         trade_id=synth_id,
         account_id=dividend.account_id,
         instrument=pool_instrument,
-        acquisition_date=dividend.pay_date,
-        quantity=amount,
-        cost_gbp=gbp_value,
+        disposal_date=dividend.pay_date,
+        quantity=magnitude,
+        proceeds_gbp=gbp_value,
         fees_gbp=Money.gbp(Decimal(0)),
     )
 
@@ -788,6 +790,67 @@ def from_option_trade(
         account_id=trade.account_id,
         instrument=pool_instrument,
         disposal_date=trade.trade_date,
+        quantity=magnitude,
+        proceeds_gbp=gbp_value,
+        fees_gbp=Money.gbp(Decimal(0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Corporate actions — the cash leg of a disposal for cash, in its own currency
+# ---------------------------------------------------------------------------
+
+
+def from_corporate_action(
+    synth_id: int,
+    action: CorporateAction,
+    currency: str,
+    fx: FXConverter,
+    pool_instrument: FXInstrument,
+) -> Acquisition | Disposal | None:
+    """Project a corporate action's cash leg into an FX-pool event.
+
+    A cash merger, a fund redemption or a bond maturity puts cash into
+    the balance in whatever currency the issuer paid — not necessarily
+    the listing currency (IEMI, GBP-listed, paid out 14,425.52 USD).
+    That cash is foreign currency arising from a source like any other
+    (HMRC CG78315): positive cash is an **acquisition** of the pool
+    currency on the effective date, GBP-valued at that date's spot —
+    the same date and rate the stock or bond engine uses for the
+    disposal of the units, so the two legs of one event agree to the
+    penny. Negative cash (no supported kind pays cash out today, but
+    the leg is signed) would be a **disposal** of the magnitude.
+
+    Only `cash_disposal` rows project: an unsupported row's cash is
+    stored and reported by check A16, never booked, because its tax
+    treatment is unmodelled. The amount is statement-sourced cents,
+    so no `_cash` rounding is applied. `synth_id` is the row-derived
+    event id shared with the stock or bond engine. Returns `None` for
+    GBP cash and for cash in a currency other than the requested pool.
+    """
+    if not action.is_cash_disposal or action.cash is None:
+        return None
+    native_ccy = action.cash.currency
+    if native_ccy == "GBP" or native_ccy != currency:
+        return None
+
+    magnitude = abs(action.cash.amount)
+    gbp_value = _to_gbp(magnitude, native_ccy, fx, action.effective_date)
+    if action.cash.amount > 0:
+        return Acquisition(
+            trade_id=synth_id,
+            account_id=action.account_id,
+            instrument=pool_instrument,
+            acquisition_date=action.effective_date,
+            quantity=magnitude,
+            cost_gbp=gbp_value,
+            fees_gbp=Money.gbp(Decimal(0)),
+        )
+    return Disposal(
+        trade_id=synth_id,
+        account_id=action.account_id,
+        instrument=pool_instrument,
+        disposal_date=action.effective_date,
         quantity=magnitude,
         proceeds_gbp=gbp_value,
         fees_gbp=Money.gbp(Decimal(0)),

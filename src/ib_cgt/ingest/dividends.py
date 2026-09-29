@@ -18,10 +18,15 @@ Scope (intentionally narrow, mirrors `corporate_actions.py`):
   programme rebates appear in this shape.
 * Withholding-section rows whose description names a stock
   (``"<SYMBOL>(<SECID>) Cash Dividend … - US Tax"``) produce
-  `Dividend(kind=WITHHOLDING_TAX)` with the absolute amount. Rows in
-  that section with no security tag — withholding on broker interest
-  and its cancellation — are left to `ingest/cash_events.py`; the two
-  mappers partition the section through `has_instrument_prefix`.
+  `Dividend(kind=WITHHOLDING_TAX)`. Rows in that section with no
+  security tag — withholding on broker interest and its cancellation
+  — are left to `ingest/cash_events.py`; the two mappers partition
+  the section through `has_instrument_prefix`.
+* **The amount keeps the sign IB printed.** Direction is the sign,
+  never the kind: a payment in lieu on a short is a negative row
+  (cash paid), a withholding reversal is a positive row (cash
+  refunded). Stripping the sign booked both the wrong way round
+  (TUR, June 2019; FF and BBBY, January 2017).
 * The 2013-2014 vintage prints the same rows without the `(SECID)`
   tag and without the word "Cash": ``"AAPL Dividend 3.05 USD per
   Share (Ordinary Dividend)"``, ``"INTC Payment in Lieu of Dividend
@@ -189,7 +194,9 @@ def _synthesize_one(
 
     symbol = match.group("symbol").strip()
     pay_date = _parse_date(raw.date_text, raw.description)
-    amount_native = abs(_parse_decimal(raw.amount_text, raw.description))
+    # Signed as printed: the sign is the direction (see module
+    # docstring). Never take the absolute value here.
+    amount_native = _parse_decimal(raw.amount_text, raw.description)
     if amount_native == 0:
         # An IB row with zero magnitude isn't a real cashflow;
         # treat it like an accrual adjustment and skip rather than

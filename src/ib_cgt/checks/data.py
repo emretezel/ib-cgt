@@ -417,6 +417,7 @@ _PERIOD_SLACK_DAYS: Final = 31
 # One `(table, date column)` per dated child of `statements`.
 _DATED_TABLES: Final[tuple[tuple[str, str], ...]] = (
     ("trades", "trade_date"),
+    ("corporate_actions", "effective_date"),
     ("dividends", "pay_date"),
     ("bond_coupons", "pay_date"),
     ("cash_events", "value_date"),
@@ -544,21 +545,27 @@ def _check_instrument_symbol_currency(ctx: CheckContext) -> Finding:
 
 @register_check(
     name="A13",
-    description="dividends reference a live account and carry a symbol and a plausible pay_date",
+    description=(
+        "dividends reference a live account and carry a symbol, a plausible pay_date "
+        "and a non-zero amount"
+    ),
     tier=Tier.A,
     scopes={Scope.ALL, Scope.DATA},
     severity=Severity.WARN,
 )
 def _check_dividends_referential(ctx: CheckContext) -> Finding:
     # Dividends are instrument-less (migration 021): the only FK is the
-    # account, and the IB security tag travels as `symbol` text.
+    # account, and the IB security tag travels as `symbol` text. The
+    # amount is signed (024) — the sign is the direction — so only a
+    # zero, which the schema CHECK and the domain both refuse, is wrong.
     rows = ctx.conn.execute(
-        "SELECT d.dividend_id, d.account_id, d.symbol, d.pay_date "
+        "SELECT d.dividend_id, d.account_id, d.symbol, d.pay_date, d.amount_native "
         "FROM dividends d "
         "LEFT JOIN accounts a ON a.account_id = d.account_id "
         "WHERE a.account_id IS NULL "
         "OR d.symbol IS NULL OR d.symbol = '' "
-        "OR d.pay_date IS NULL OR d.pay_date = ''"
+        "OR d.pay_date IS NULL OR d.pay_date = '' "
+        "OR CAST(d.amount_native AS REAL) = 0"
     ).fetchall()
     if not rows:
         return Finding(triggered=False)
@@ -566,7 +573,7 @@ def _check_dividends_referential(ctx: CheckContext) -> Finding:
         triggered=True,
         detail=(
             f"{len(rows)} dividend row(s) with a broken account ref, "
-            "empty symbol or missing pay_date"
+            "empty symbol, missing pay_date or zero amount"
         ),
         evidence=_rows_to_evidence(rows),
     )
@@ -608,5 +615,50 @@ def _check_cash_events_referential(ctx: CheckContext) -> Finding:
     return Finding(
         triggered=True,
         detail=f"{len(rows)} cash_events row(s) with broken refs, missing date or zero amount",
+        evidence=_rows_to_evidence(rows),
+    )
+
+
+# ---------------------------------------------------------------------------
+# A16 — corporate actions the engines do not model but which move units or cash
+# ---------------------------------------------------------------------------
+
+
+@register_check(
+    name="A16",
+    description=(
+        "no unsupported corporate action moves units or cash (a split, a spin-off, a return "
+        "of capital, or a disposal whose security could not be resolved)"
+    ),
+    tier=Tier.A,
+    scopes={Scope.ALL, Scope.DATA},
+    severity=Severity.WARN,
+)
+def _check_unsupported_corporate_actions(ctx: CheckContext) -> Finding:
+    """Report every stored corporate action the engines skipped that has an effect.
+
+    Ingest never drops a Corporate Actions row: a shape the engines do
+    not model is stored as `unsupported` (`docs/db/corporate_actions.md`).
+    Such a row that carries a quantity still moves the position (the
+    reconciliation counts it) and one that carries cash moves a
+    currency balance the FX pools never see, so its tax treatment has
+    to be decided by hand. A row with neither — a name change, an
+    informational line — is inert and not reported.
+    """
+    rows = ctx.conn.execute(
+        "SELECT c.corporate_action_id, c.account_id, c.effective_date, c.quantity, "
+        "       c.cash_amount, c.cash_currency, c.description "
+        "FROM corporate_actions c "
+        "WHERE c.kind = 'unsupported' "
+        "AND (CAST(c.quantity AS REAL) <> 0 OR c.cash_amount IS NOT NULL) "
+        "ORDER BY c.effective_date, c.corporate_action_id"
+    ).fetchall()
+    if not rows:
+        return Finding(triggered=False)
+    return Finding(
+        triggered=True,
+        detail=(
+            f"{len(rows)} corporate-action row(s) the engines do not model carry units or cash"
+        ),
         evidence=_rows_to_evidence(rows),
     )

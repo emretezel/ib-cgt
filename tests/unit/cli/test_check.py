@@ -123,7 +123,14 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
         # The statement still lists the 10 AAPL held on 5 April (sold on
         # 20 April, after the period end), so C7 reconciles cleanly.
         StatementPositionRepo(conn).insert_many(
-            [StatementPosition(account_id="U1", instrument=aapl, quantity=Decimal("10"))],
+            [
+                StatementPosition(
+                    account_id="U1",
+                    instrument=aapl,
+                    quantity=Decimal("10"),
+                    close_price=Decimal("1"),
+                )
+            ],
             source_statement_hash="h",
         )
         rates: list[FXRate] = []

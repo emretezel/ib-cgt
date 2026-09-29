@@ -14,21 +14,23 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ib_cgt.calculator import Calculator, load_persisted_run
-from ib_cgt.db import CashEventRepo, StatementRepo, TaxRunIssueRepo, TradeRepo
+from ib_cgt.db import CashEventRepo, CorporateActionRepo, StatementRepo, TaxRunIssueRepo, TradeRepo
 from ib_cgt.domain import (
     CashEvent,
     CashEventKind,
     CashEventRef,
+    CorporateActionRef,
     FutureInstrument,
     Money,
     RunIssue,
     RunIssueKind,
+    StockInstrument,
     TaxYear,
     TradeAction,
 )
 from ib_cgt.fx import FXService
 
-from .conftest import trade
+from .conftest import corporate_action, trade
 from .test_calculator import seed_statements_and_positions
 
 Y2024 = TaxYear(2024)
@@ -80,7 +82,7 @@ def _counts(conn: sqlite3.Connection) -> dict[str, int]:
             "tax_runs",
             "matched_disposals",
             "future_realisations",
-            "fx_event_sources",
+            "event_sources",
             "tax_run_issues",
             "fx_instruments",
         )
@@ -97,10 +99,10 @@ def test_persist_writes_all_five_tables(calc_db: sqlite3.Connection, fx_service:
     assert counts["matched_disposals"] == len(computation.report.matched_disposals) > 0
     assert counts["future_realisations"] == len(computation.report.future_realisations) == 1
     assert counts["tax_run_issues"] == len(computation.issues) > 0
-    assert counts["fx_event_sources"] == len(computation.fx_event_sources) > 0
+    assert counts["event_sources"] == len(computation.event_sources) > 0
     # The USD fee is a persisted chunk's disposal id and resolves to its cash event.
     sources = calc_db.execute(
-        "SELECT event_id, kind, cash_event_id FROM fx_event_sources WHERE run_id = ? "
+        "SELECT event_id, kind, cash_event_id FROM event_sources WHERE run_id = ? "
         "AND kind = 'CASH_EVENT'",
         (run_id,),
     ).fetchall()
@@ -108,9 +110,7 @@ def test_persist_writes_all_five_tables(calc_db: sqlite3.Connection, fx_service:
     assert [(int(r["event_id"]) >= 4 * 10**12, int(r["cash_event_id"])) for r in sources] == [
         (True, 2)
     ]
-    assert computation.fx_event_sources[int(sources[0]["event_id"])] == CashEventRef(
-        cash_event_id=2
-    )
+    assert computation.event_sources[int(sources[0]["event_id"])] == CashEventRef(cash_event_id=2)
     cited = {
         int(r["disposal_trade_id"])
         for r in calc_db.execute(
@@ -130,7 +130,7 @@ def test_load_round_trips_the_computation(
     assert loaded is not None
     assert loaded.report == computed.report
     assert loaded.issues == computed.issues
-    assert dict(loaded.fx_event_sources) == dict(computed.fx_event_sources)
+    assert dict(loaded.event_sources) == dict(computed.event_sources)
     assert calc.load(TaxYear(2030)) is None
 
 
@@ -219,3 +219,43 @@ def test_failed_persist_leaves_nothing_behind(
     assert _counts(calc_db) == before
     assert not calc_db.in_transaction
     assert calc.load(Y2024) is None
+
+
+def test_stock_cited_corporate_action_is_persisted_in_event_sources(
+    calc_db: sqlite3.Connection, fx_service: FXService
+) -> None:
+    """A disposal a cash merger constituted resolves through the provenance map (D4)."""
+    iemi = StockInstrument(conid=59262240, symbol="IEMI", currency="GBP")
+    TradeRepo(calc_db).insert_many(
+        [trade(iemi, TradeAction.BUY, date(2025, 3, 3), "824", "12.52", account_id="U2")],
+        source_statement_hash="hash-fee",
+    )
+    CorporateActionRepo(calc_db).insert_many(
+        [
+            corporate_action(
+                iemi, date(2025, 4, 1), "-824", Money.of("14425.52", "USD"), account_id="U2"
+            )
+        ],
+        source_statement_hash="hash-fee",
+    )
+    event_id = 5 * 10**12 + 1
+    calc = Calculator(calc_db, fx_service)
+    computation = calc.compute(Y2024)
+    run_id = calc.persist(computation)
+
+    assert computation.event_sources[event_id] == CorporateActionRef(corporate_action_id=1)
+    row = calc_db.execute(
+        "SELECT kind, corporate_action_id FROM event_sources WHERE run_id = ? AND event_id = ?",
+        (run_id, event_id),
+    ).fetchone()
+    assert (row["kind"], row["corporate_action_id"]) == ("CORPORATE_ACTION", 1)
+    cited = {
+        int(r["disposal_trade_id"])
+        for r in calc_db.execute(
+            "SELECT disposal_trade_id FROM matched_disposals WHERE run_id = ?", (run_id,)
+        )
+    }
+    assert event_id in cited
+    loaded = calc.load(Y2024)
+    assert loaded is not None
+    assert loaded.event_sources[event_id] == CorporateActionRef(corporate_action_id=1)

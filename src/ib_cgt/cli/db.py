@@ -47,7 +47,9 @@ _RESET_TABLES_DATA: tuple[str, ...] = (
     "dividends",
     "bond_coupons",
     "cash_events",
+    "corporate_actions",
     "statement_positions",
+    "statement_cash_balances",
     "statements",
     "instruments",  # cascades to {stock,bond,future,fx}_instruments
     "accounts",

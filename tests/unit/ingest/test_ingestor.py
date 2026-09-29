@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -17,34 +16,22 @@ import pytest
 
 from ib_cgt.db import (
     CashEventRepo,
+    CorporateActionRepo,
     InstrumentRepo,
+    StatementCashBalanceRepo,
     StatementPositionRepo,
     StatementRepo,
     TradeRepo,
 )
-from ib_cgt.domain import FutureInstrument, Money
+from ib_cgt.domain import (
+    BondInstrument,
+    CorporateActionKind,
+    FutureInstrument,
+    Money,
+    StockInstrument,
+)
 from ib_cgt.ingest.ingestor import ingest_statement, ingest_statements
 from tests.conid import fake_conid
-
-
-@dataclass
-class _FXStub:
-    """Minimal FX stub for the merger ingest test.
-
-    The synthesizer only ever calls `convert`. Returning a fixed rate
-    is enough to exercise the end-to-end persistence path without
-    pulling Frankfurter or seeding the rate cache.
-    """
-
-    rate: Decimal
-    calls: list[tuple[Money, str, date]] = field(default_factory=list)
-
-    def convert(self, amount: Money, *, target: str, on: date) -> Money:
-        self.calls.append((amount, target, on))
-        if amount.currency == target:
-            return amount
-        return Money.of(amount.amount * self.rate, target)
-
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "statements"
 
@@ -161,83 +148,79 @@ def test_replace_on_unseen_statement_behaves_like_normal_ingest(
     assert result.inserted_count == result.trade_count > 0
 
 
-def test_ingest_persists_synthesized_merger_trade(db: sqlite3.Connection) -> None:
-    """End-to-end: cash-merger fixture lands as a SELL trade in the DB.
+def test_ingest_persists_cash_merger_as_a_corporate_action(db: sqlite3.Connection) -> None:
+    """End-to-end: the cash-merger fixture lands as one `cash_disposal` row, not a trade.
 
-    The fixture has 1 regular buy + 1 cross-currency cash merger.
-    With FXService injected, the synthesizer produces a SELL with
-    `fees=0` and a `statement_row_index` strictly after the buy's.
-    Without FXService injected, only the buy lands.
+    The fixture has 1 regular buy + the two rows of a cross-currency
+    cash merger. The trade table gets only the buy; the corporate
+    action keeps the quantity in the listing currency's row and the
+    cash in USD, on the shared conid-keyed instrument.
     """
     fixture = _FIXTURES / "with_cash_merger.htm"
-    fx = _FXStub(rate=Decimal("0.74"))
 
-    result = ingest_statement(fixture, db, fx_service=fx)
+    result = ingest_statement(fixture, db)
 
-    assert result.trade_count == 2
-    assert result.merger_trade_count == 1
-    assert result.inserted_count == 2
+    assert result.trade_count == 1
+    assert result.inserted_count == 1
+    assert result.corporate_action_count == 1
+    assert result.unsupported_corporate_action_count == 0
+    assert result.corporate_actions_inserted == 1
+    assert [r["action"] for r in db.execute("SELECT action FROM trades")] == ["buy"]
 
-    rows = db.execute(
-        "SELECT action, fees_amount, fees_currency, statement_row_index "
-        "FROM trades ORDER BY statement_row_index"
+    stored = CorporateActionRepo(db).get(1)
+    assert stored is not None
+    action = stored.action
+    assert action.kind is CorporateActionKind.CASH_DISPOSAL
+    assert action.quantity == Decimal("-824")
+    assert action.cash == Money.of("14425.52", "USD")
+    assert action.effective_date == date(2025, 8, 16)
+    assert action.report_date == date(2025, 8, 22)
+    assert isinstance(action.instrument, StockInstrument)
+    assert action.instrument.conid == 59262240
+    # The buy and the disposal share one instrument row.
+    (row,) = db.execute(
+        "SELECT t.instrument_id AS trade_iid, c.instrument_id AS action_iid "
+        "FROM trades t, corporate_actions c"
     ).fetchall()
-    assert len(rows) == 2
-    buy, sell = rows
-    assert buy["action"] == "buy"
-    assert sell["action"] == "sell"
-    # The synthesized SELL carries no fees.
-    assert sell["fees_amount"] == "0"
-    assert sell["fees_currency"] == "GBP"
-    # And lives at a row_index strictly past the regular trade.
-    assert sell["statement_row_index"] > buy["statement_row_index"]
+    assert row["trade_iid"] == row["action_iid"]
 
 
-def test_ingest_persists_bond_maturity_as_sell_trade(db: sqlite3.Connection) -> None:
-    """End-to-end: bond-maturity fixture lands as a SELL trade at par.
+def test_ingest_persists_bond_maturity_as_a_corporate_action(db: sqlite3.Connection) -> None:
+    """End-to-end: the bond-maturity fixture lands as a `cash_disposal` on the ISIN-keyed gilt.
 
     The fixture has 1 regular bond buy + 1 Bond Maturity Corporate
-    Actions row. The maturity synthesizer turns the CA row into a
-    SELL with `price=1.00 GBP`, `fees=0`, and a `statement_row_index`
-    strictly after the buy's. No FX service is needed (par price is
-    in the bond's own currency).
+    Actions row. The buy is the only trade; the maturity disposes of
+    the face value for the redemption cash in GBP.
     """
     fixture = _FIXTURES / "with_bond_maturity.htm"
     result = ingest_statement(fixture, db)
 
-    assert result.trade_count == 2
-    assert result.maturity_trade_count == 1
-    assert result.merger_trade_count == 0
-    assert result.inserted_count == 2
+    assert result.trade_count == 1
+    assert result.inserted_count == 1
+    assert result.corporate_action_count == 1
+    assert result.unsupported_corporate_action_count == 0
 
-    rows = db.execute(
-        "SELECT action, price_amount, price_currency, fees_amount, "
-        "       quantity, statement_row_index "
-        "FROM trades ORDER BY statement_row_index"
+    (buy,) = db.execute(
+        "SELECT action, price_amount, price_currency, quantity FROM trades"
     ).fetchall()
-    assert len(rows) == 2
-    buy, sell = rows
-
     # Regular bond buy: price rescaled from "98.500" → "0.985".
     assert buy["action"] == "buy"
     assert Decimal(buy["price_amount"]) == Decimal("0.985")
     assert buy["price_currency"] == "GBP"
     assert Decimal(buy["quantity"]) == Decimal("215000")
 
-    # Synthesised maturity SELL: par price 1.00, no fees, strictly after the buy.
-    assert sell["action"] == "sell"
-    assert Decimal(sell["price_amount"]) == Decimal("1")
-    assert sell["price_currency"] == "GBP"
-    assert sell["fees_amount"] == "0"
-    assert Decimal(sell["quantity"]) == Decimal("215000")
-    assert sell["statement_row_index"] > buy["statement_row_index"]
-
-    # The bond is correctly auto-classified as a UK gilt (CGT-exempt).
-    bond_row = db.execute(
-        "SELECT is_cgt_exempt FROM bond_instruments WHERE symbol = ?",
-        ("UKT 0 1/4 01/31/25",),
-    ).fetchone()
-    assert bool(bond_row["is_cgt_exempt"]) is True
+    stored = CorporateActionRepo(db).get(1)
+    assert stored is not None
+    action = stored.action
+    assert action.kind is CorporateActionKind.CASH_DISPOSAL
+    assert action.quantity == Decimal("-215000")
+    assert action.cash == Money.of("215000.00", "GBP")
+    assert action.effective_date == date(2025, 1, 31)
+    assert isinstance(action.instrument, BondInstrument)
+    assert action.instrument.isin == "GB00BLPK7110"
+    assert action.instrument.is_cgt_exempt is True
+    # One ISIN-keyed bond row serves both the buy and the maturity.
+    assert db.execute("SELECT COUNT(*) FROM bond_instruments").fetchone()[0] == 1
 
 
 def test_ingest_collapses_yield_suffixed_bond_lots_to_one_instrument(
@@ -277,12 +260,12 @@ def test_ingest_collapses_yield_suffixed_bond_lots_to_one_instrument(
 
 
 def test_reingest_bond_maturity_is_idempotent(db: sqlite3.Connection) -> None:
-    """A second ingest of the same statement does not duplicate the maturity SELL."""
+    """A second ingest of the same statement does not duplicate the maturity."""
     fixture = _FIXTURES / "with_bond_maturity.htm"
 
     first = ingest_statement(fixture, db)
-    assert first.maturity_trade_count == 1
-    assert first.inserted_count == 2
+    assert first.corporate_actions_inserted == 1
+    assert first.inserted_count == 1
 
     second = ingest_statement(fixture, db)
     # Hash-level short-circuit returns `already_imported` and does not
@@ -291,7 +274,8 @@ def test_reingest_bond_maturity_is_idempotent(db: sqlite3.Connection) -> None:
     assert second.inserted_count == 0
 
     # No duplicates landed.
-    assert TradeRepo(db).count() == 2
+    assert TradeRepo(db).count() == 1
+    assert CorporateActionRepo(db).count() == 1
 
 
 def test_ingest_persists_dividends(db: sqlite3.Connection) -> None:
@@ -316,8 +300,8 @@ def test_ingest_persists_dividends(db: sqlite3.Connection) -> None:
     currencies = [r["currency"] for r in rows]
     assert kinds == ["cash_dividend", "withholding_tax", "payment_in_lieu", "cash_dividend"]
     assert currencies == ["USD", "USD", "EUR", "USD"]
-    # Withholding rows store the absolute amount; direction lives in `kind`.
-    assert rows[1]["amount_native"] == "4.50"
+    # Withholding rows keep the sign IB printed; the sign is the direction.
+    assert rows[1]["amount_native"] == "-4.50"
 
 
 def test_reingest_dividends_idempotent(db: sqlite3.Connection) -> None:
@@ -345,52 +329,73 @@ def test_replace_cascades_to_dividends(db: sqlite3.Connection) -> None:
     assert n_after == n_before
 
 
-def test_ingest_without_fx_service_skips_merger(db: sqlite3.Connection) -> None:
-    """Without an FXService, Corporate Actions rows are silently skipped.
-
-    Pre-existing tests / call sites that don't pass `fx_service=` keep
-    working — the corporate-action synthesizer is opt-in.
-    """
-    fixture = _FIXTURES / "with_cash_merger.htm"
-
-    result = ingest_statement(fixture, db)
-
-    assert result.trade_count == 1
-    assert result.merger_trade_count == 0
-    assert result.inserted_count == 1
-
-
-def test_reingest_with_replace_replays_merger_trade(db: sqlite3.Connection) -> None:
-    """`--replace` re-runs CA synthesis at the same statement_row_index.
+def test_replace_replays_corporate_actions_at_the_same_row_index(db: sqlite3.Connection) -> None:
+    """`--replace` re-maps the corporate actions under the same statement_row_index.
 
     Identity stability matters: the audit trail
     `(source_statement_hash, statement_row_index)` must continue to
     point at the same logical event after a replace.
     """
     fixture = _FIXTURES / "with_cash_merger.htm"
-    fx = _FXStub(rate=Decimal("0.74"))
 
-    first = ingest_statement(fixture, db, fx_service=fx)
-    first_indices = sorted(
-        int(r["statement_row_index"])
-        for r in db.execute(
-            "SELECT statement_row_index FROM trades WHERE source_statement_hash = ?",
-            (first.statement_hash,),
+    first = ingest_statement(fixture, db)
+
+    def indices() -> list[int]:
+        return sorted(
+            int(r["statement_row_index"])
+            for r in db.execute(
+                "SELECT statement_row_index FROM corporate_actions WHERE source_statement_hash = ?",
+                (first.statement_hash,),
+            )
         )
-    )
 
-    second = ingest_statement(fixture, db, replace=True, fx_service=fx)
+    first_indices = indices()
+    second = ingest_statement(fixture, db, replace=True)
 
     assert second.replaced is True
-    assert second.merger_trade_count == first.merger_trade_count == 1
-    second_indices = sorted(
-        int(r["statement_row_index"])
-        for r in db.execute(
-            "SELECT statement_row_index FROM trades WHERE source_statement_hash = ?",
-            (first.statement_hash,),
-        )
-    )
-    assert second_indices == first_indices
+    assert second.corporate_action_count == first.corporate_action_count == 1
+    assert indices() == first_indices == [0]
+
+
+def test_unsupported_corporate_action_row_is_stored_and_counted(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A shape the engines do not model is kept as data and reported, never dropped.
+
+    The cash-merger fixture with its quantity flipped positive is
+    shares *arriving* beside cash — not a disposal for cash — so both
+    rows of the event are stored as `unsupported`.
+    """
+    source = (_FIXTURES / "with_cash_merger.htm").read_text()
+    assert source.count('<td align="right">-824</td>') == 1
+    variant = tmp_path / "with_shares_arriving.htm"
+    variant.write_text(source.replace('<td align="right">-824</td>', '<td align="right">824</td>'))
+
+    result = ingest_statement(variant, db)
+
+    assert result.corporate_action_count == 2
+    assert result.unsupported_corporate_action_count == 2
+    assert result.corporate_actions_inserted == 2
+    kinds = [r["kind"] for r in db.execute("SELECT kind FROM corporate_actions ORDER BY 1")]
+    assert kinds == ["unsupported", "unsupported"]
+
+
+def test_covered_corporate_actions_are_skipped_by_effective_date(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A second statement over the same period contributes no corporate action."""
+    source = (_FIXTURES / "with_cash_merger.htm").read_text()
+    variant = tmp_path / "with_cash_merger_again.htm"
+    variant.write_text(source.replace("<body>", "<body><!-- re-downloaded -->"))
+
+    first = ingest_statement(_FIXTURES / "with_cash_merger.htm", db)
+    second = ingest_statement(variant, db)
+
+    assert first.corporate_actions_inserted == 1
+    assert second.fully_covered is True
+    assert second.covered_corporate_action_count == 1
+    assert second.corporate_actions_inserted == 0
+    assert CorporateActionRepo(db).count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +451,26 @@ def test_ingest_persists_open_positions_and_cash_events(db: sqlite3.Connection) 
         ("6LK6", "6"),
     ]
     assert all(p.account_id == "U9999996" for _iid, p in positions)
+    # The statement's close prices ride along, as printed.
+    assert [str(p.close_price) for _iid, p in positions] == [
+        "5.3350",
+        "26.0000",
+        "240.0000",
+        "0.6000",
+        "98.1240",
+        "0.1923",
+    ]
+
+    # The Cash Report's balances, one per currency, GBP included.
+    assert result.cash_balance_count == 4
+    assert result.cash_balances_inserted == 4
+    balances = StatementCashBalanceRepo(db).for_statement(result.statement_hash)
+    assert [(b.currency, str(b.starting_cash), str(b.ending_cash)) for b in balances] == [
+        ("EUR", "0.00", "1000.00"),
+        ("GBP", "10.00", "26.81"),
+        ("JPY", "0", "-15"),
+        ("USD", "212.10", "1127.55"),
+    ]
 
     events = CashEventRepo(db)
     assert events.count() == 8

@@ -243,10 +243,10 @@ def test_banner_and_footer_never_become_rows() -> None:
 
 
 def test_unread_title_closes_the_column() -> None:
-    """Rows under `Cash Report` belong to no section we read."""
+    """Rows under `Interest Accruals` belong to no section we read."""
     page = _first_page()
-    page.title(80, "Cash Report")
-    page.row(98, _DATED_COLUMNS, ("Starting Cash", "", "12,933.53"))
+    page.title(80, "Interest Accruals")
+    page.row(98, _DATED_COLUMNS, ("Starting Accrual Balance", "", "-0.90"))
     page.title(120, "Trades")
     page.row(138, _TRADE_COLUMNS, _TRADE_HEADER)
     document = build_document([page.build()])
@@ -329,6 +329,61 @@ def test_wrapped_rows_of_unequal_height_across_columns_keep_their_words() -> Non
     assert div == [("2017-07-18", "BBBY(US0758961009) Cash Dividend\nUSD 0.15 (Ordinary)", "30.00")]
 
 
+# Column edges of the Cash Report: an unnamed label column and four amounts.
+_CASH_REPORT_COLUMNS = (
+    (36.0, 300.0),
+    (300.0, 414.0),
+    (414.0, 528.0),
+    (528.0, 642.0),
+    (642.0, 756.0),
+)
+
+
+def test_cash_report_header_with_a_blank_lead_is_a_header() -> None:
+    """The Cash Report's label column has no header: a blank cell then `Total` is the header."""
+    page = _first_page()
+    page.title(80, "Cash Report")
+    page.row(98, _CASH_REPORT_COLUMNS, ("", "Total", "Securities", "Futures", "IB-UKL"))
+    page.band(109, "Base Currency Summary")
+    page.row(120, _CASH_REPORT_COLUMNS, ("Starting Cash", "0.00", "0.00", "0.00", "0.00"))
+    page.band(131, "USD")
+    page.row(142, _CASH_REPORT_COLUMNS, ("Starting Cash", "26,565.50", "26,565.50", "0", "0"))
+    page.row(153, _CASH_REPORT_COLUMNS, ("Ending Cash", "2,463.81", "0.00", "2,463.81", "0"))
+    document = build_document([page.build()])
+    (table,) = document.tables
+    assert table.section is SectionKind.CASH_REPORT
+    assert [r.kind for r in table.rows] == [
+        RowKind.HEADER,
+        RowKind.ASSET_HEADER,
+        RowKind.DATA,
+        RowKind.CURRENCY_HEADER,
+        RowKind.DATA,
+        RowKind.DATA,
+    ]
+    assert table.rows[0].cells == ("", "Total", "Securities", "Futures", "IB-UKL")
+    assert table.rows[5].cells == ("Ending Cash", "2,463.81", "0.00", "2,463.81", "0")
+
+
+def test_cash_report_continues_over_a_page_break() -> None:
+    """A currency block split by a page break keeps its rows in one table."""
+    first = _first_page()
+    first.title(80, "Cash Report")
+    first.row(98, _CASH_REPORT_COLUMNS, ("", "Total", "Securities", "Futures", "IB-UKL"))
+    first.band(109, "EUR")
+    first.row(120, _CASH_REPORT_COLUMNS, ("Starting Cash", "0.00", "0.00", "0.00", "0.00"))
+    second = _Page(2)
+    second.title(36, "Cash Report")
+    second.row(54, _CASH_REPORT_COLUMNS, ("", "Total", "Securities", "Futures", "IB-UKL"))
+    second.row(65, _CASH_REPORT_COLUMNS, ("Ending Cash", "-5,000.00", "-5,000.00", "0.00", "0.00"))
+    document = build_document([first.build(), second.build()])
+    (table,) = document.tables
+    assert table.section is SectionKind.CASH_REPORT
+    assert [r.cells[0] for r in table.rows if r.kind is RowKind.DATA] == [
+        "Starting Cash",
+        "Ending Cash",
+    ]
+
+
 def test_asset_and_currency_bands_are_told_apart_by_shape() -> None:
     page = _first_page()
     page.title(80, "Open Positions")
@@ -384,6 +439,14 @@ def _fixture_pdf() -> bytes:
     )
     page.row(280, 291, [(410, 670), (670, 756)], ["Interest Accrued", "-487.53"])
     page.row(291, 302, list(_DATED_COLUMNS), ["Total", "", "3.59"])
+    page.band(320, 338, 36, 756, "Cash Report")
+    cash = [(36, 300), (300, 414), (414, 528), (528, 642), (642, 756)]
+    page.row(338, 349, cash, ["", "Total", "Securities", "Futures", "IB-UKL"])
+    page.band(349, 360, 36, 756, "Base Currency Summary")
+    page.row(360, 371, cash, ["Starting Cash", "0.00", "0.00", "0.00", "0.00"])
+    page.band(371, 382, 36, 756, "USD")
+    page.row(382, 393, cash, ["Starting Cash", "26,565.50", "26,565.50", "0.00", "0.00"])
+    page.row(393, 404, cash, ["Ending Cash", "2,463.81", "0.00", "2,463.81", "0.00"])
     page.text(40, 580, "Trade execution times are displayed in Eastern Time.", size=6)
     page.text(40, 595, "Activity Statement - January 1, 2012 - December 31, 2012", size=6)
     return build_pdf([page])
@@ -410,6 +473,11 @@ def test_pdf_strategy_parses_a_hand_written_statement_end_to_end() -> None:
     assert cash.currency == "AUD"
     assert cash.amount_text == "3.59"
     assert parsed.open_positions == ()
+    assert [(r.currency, r.label, r.total_text) for r in parsed.cash_report] == [
+        ("", "Starting Cash", "0.00"),
+        ("USD", "Starting Cash", "26,565.50"),
+        ("USD", "Ending Cash", "2,463.81"),
+    ]
 
 
 def test_pdf_suffix_selects_the_pdf_strategy() -> None:
