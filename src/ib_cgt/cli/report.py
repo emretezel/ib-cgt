@@ -2,7 +2,8 @@
 
 Reads the year's run back from the run tables (no engine pass, no FX
 service), builds the SA108 report and renders it: to the console by
-default, or as Markdown, JSON or CSV to stdout or to `--out`. Exits 1
+default, as a PDF to `--out`, or as Markdown, JSON or CSV to stdout or
+to `--out`. Exits 1
 when the year has never been computed or when the run it reads has
 error-severity issues, so a script cannot silently consume figures
 the calculator itself called incomplete.
@@ -30,6 +31,7 @@ from ib_cgt.report import (
     render_csv,
     render_json,
     render_markdown,
+    render_pdf,
 )
 
 
@@ -37,13 +39,15 @@ class ReportFormat(StrEnum):
     """The output formats `--format` accepts."""
 
     CONSOLE = "console"
+    PDF = "pdf"
     MARKDOWN = "markdown"
     JSON = "json"
     CSV = "csv"
 
 
-# `--out report.md` alone is enough to pick the format.
+# `--out report.pdf` alone is enough to pick the format.
 _FORMAT_BY_SUFFIX: dict[str, ReportFormat] = {
+    ".pdf": ReportFormat.PDF,
     ".md": ReportFormat.MARKDOWN,
     ".markdown": ReportFormat.MARKDOWN,
     ".json": ReportFormat.JSON,
@@ -69,7 +73,7 @@ def report(
             case_sensitive=False,
             help=(
                 "Output format. Defaults to console, or to the format implied by the "
-                "--out file's extension (.md, .json, .csv)."
+                "--out file's extension (.pdf, .md, .json, .csv)."
             ),
         ),
     ] = None,
@@ -78,7 +82,10 @@ def report(
         typer.Option(
             "--out",
             "-o",
-            help="Write the report to this file instead of stdout (not for console output).",
+            help=(
+                "Write the report to this file instead of stdout (required for pdf, not for "
+                "console output)."
+            ),
         ),
     ] = None,
     summary_only: Annotated[
@@ -108,7 +115,12 @@ def report(
     chosen = _resolve_format(fmt, out)
     if chosen is ReportFormat.CONSOLE and out is not None:
         raise typer.BadParameter(
-            "console output cannot be written to a file; pick --format markdown, json or csv",
+            "console output cannot be written to a file; pick --format pdf, markdown, json or csv",
+            param_hint="--out",
+        )
+    if chosen is ReportFormat.PDF and out is None:
+        raise typer.BadParameter(
+            "a PDF is a binary file, not terminal output; pass --out report.pdf",
             param_hint="--out",
         )
     if chosen is ReportFormat.CSV and summary_only:
@@ -133,15 +145,20 @@ def report(
 
     include_disposals = not summary_only
     if chosen is ReportFormat.CONSOLE:
-        doc = layout(sa108, include_disposals=include_disposals, source=str(db_path))
+        doc = layout(sa108, include_disposals=include_disposals)
         render_console(doc, console)
     else:
-        text = _render_text(sa108, chosen, include_disposals=include_disposals, source=str(db_path))
+        rendered = _render_file(sa108, chosen, include_disposals=include_disposals)
         if out is None:
             # Plain stdout, no Rich styling, so the output can be piped.
-            typer.echo(text.rstrip("\n"))
+            # (A PDF never gets here: it is refused without --out above.)
+            typer.echo(rendered.rstrip("\n") if isinstance(rendered, str) else rendered)
         else:
-            out.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+            if isinstance(rendered, bytes):
+                out.write_bytes(rendered)
+            else:
+                text = rendered if rendered.endswith("\n") else rendered + "\n"
+                out.write_text(text, encoding="utf-8")
             console.print(f"Wrote the {chosen.value} report for {tax_year.label} to {out}")
 
     if not sa108.is_complete:
@@ -166,18 +183,18 @@ def _resolve_format(fmt: ReportFormat | None, out: Path | None) -> ReportFormat:
     chosen = _FORMAT_BY_SUFFIX.get(out.suffix.lower())
     if chosen is None:
         raise typer.BadParameter(
-            f"cannot infer a format from {out.name!r}; pass --format markdown, json or csv",
+            f"cannot infer a format from {out.name!r}; pass --format pdf, markdown, json or csv",
             param_hint="--out",
         )
     return chosen
 
 
-def _render_text(
-    sa108: Sa108Report, fmt: ReportFormat, *, include_disposals: bool, source: str
-) -> str:
-    """The report as text in one of the file formats."""
+def _render_file(sa108: Sa108Report, fmt: ReportFormat, *, include_disposals: bool) -> str | bytes:
+    """The report in one of the file formats: PDF as bytes, the rest as text."""
+    if fmt is ReportFormat.PDF:
+        return render_pdf(layout(sa108, include_disposals=include_disposals))
     if fmt is ReportFormat.MARKDOWN:
-        return render_markdown(layout(sa108, include_disposals=include_disposals, source=source))
+        return render_markdown(layout(sa108, include_disposals=include_disposals))
     if fmt is ReportFormat.JSON:
         return render_json(sa108, include_disposals=include_disposals)
     return render_csv(sa108)

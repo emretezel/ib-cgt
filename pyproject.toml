@@ -46,6 +46,11 @@ dependencies = [
     # request/response model is clean enough that we can keep the client
     # surface tiny. No retries/backoff in v1 — fail fast and surface errors.
     "httpx>=0.28",
+    # Reporting (component 7) — the PDF output of `ib-cgt report`. reportlab
+    # is pure Python (no pango/cairo system libraries, unlike weasyprint), its
+    # platypus tables split across pages with repeated header rows, and
+    # typeshed ships `types-reportlab`, so the renderer type-checks strictly.
+    "reportlab>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +62,7 @@ dev = [
     # Type stubs for ingestion deps (rule 14: no blanket ignores).
     "types-beautifulsoup4>=4.12",
     "lxml-stubs>=0.5",
+    "types-reportlab>=5.0",
     # FX client tests — respx intercepts httpx at the transport layer so
     # tests assert against real URL/query shapes without real network.
     "respx>=0.22",

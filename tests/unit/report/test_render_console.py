@@ -22,7 +22,7 @@ def _render(doc: Document) -> str:
 
 
 def test_sample_report_prints_boxes_computations_and_issues() -> None:
-    text = _render(layout(sample_report(), source="/tmp/ibcgt.sqlite"))
+    text = _render(layout(sample_report()))
     assert "Capital Gains Tax computations 2025/26" in text
     assert "Listed shares and securities (boxes 23-27)" in text
     assert "│ 24  │ Disposal proceeds" in text

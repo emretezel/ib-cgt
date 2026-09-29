@@ -23,14 +23,15 @@ from .conftest import sample_report
 
 
 def test_sample_report_renders_headings_tables_and_computations() -> None:
-    text = render_markdown(layout(sample_report(), source="/tmp/ibcgt.sqlite"))
+    text = render_markdown(layout(sample_report()))
     assert text.startswith("# Capital Gains Tax computations 2025/26\n\n")
     assert "\n## SA108 summary\n" in text
     assert "\n### Listed shares and securities (boxes 23-27)\n" in text
     assert "| 24 | Disposal proceeds | 3,000.00 |" in text
     assert "| 25 | Allowable costs (including purchase price) | 2,505.00 |" in text
     assert "| **Section total** | **1** | **3,000.00** |" in text
-    assert "| **Source** | /tmp/ibcgt.sqlite |" in text
+    assert "| **Tax year** | 2025/26 (2025-04-06 to 2026-04-05) |" in text
+    assert "Run #" not in text and "Status" not in text
     assert "> **Warning:** Disposals the run could not compute" in text
     assert "\n#### 1. AAPL — 2025-06-20 — Stock\n" in text
     assert "| 1 | #5 | same-day (s.105(1)(b)) | 10.00 | 2025-06-20 |" in text

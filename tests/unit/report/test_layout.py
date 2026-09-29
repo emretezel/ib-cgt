@@ -17,7 +17,7 @@ def _headings(blocks: tuple[object, ...]) -> list[str]:
 
 
 def test_full_layout_reads_summary_then_computations() -> None:
-    doc = layout(sample_report(), source="/tmp/ibcgt.sqlite")
+    doc = layout(sample_report())
     assert doc.title == "Capital Gains Tax computations 2025/26"
     assert _headings(doc.blocks) == [
         "SA108 summary",
@@ -32,18 +32,19 @@ def test_full_layout_reads_summary_then_computations() -> None:
         "2. ES — 2025-05-08 — Future",
         "3. USD held vs GBP — 2025-06-02 — Foreign currency",
     ]
-    provenance = doc.blocks[0]
-    assert isinstance(provenance, KeyValues)
-    assert [item.key for item in provenance.items] == ["Tax year", "Run", "Source", "Status"]
-    assert provenance.items[3].value == "complete"
+    opening = doc.blocks[0]
+    assert isinstance(opening, KeyValues)
+    assert [(item.key, item.value) for item in opening.items] == [
+        ("Tax year", "2025/26 (2025-04-06 to 2026-04-05)")
+    ]
 
 
 def test_summary_only_stops_before_the_computations() -> None:
     doc = layout(sample_report(), include_disposals=False)
     assert "Computations" not in _headings(doc.blocks)
-    provenance = doc.blocks[0]
-    assert isinstance(provenance, KeyValues)
-    assert [item.key for item in provenance.items] == ["Tax year", "Run", "Status"]
+    opening = doc.blocks[0]
+    assert isinstance(opening, KeyValues)
+    assert [item.key for item in opening.items] == ["Tax year"]
 
 
 def test_box_table_carries_the_box_numbers_and_the_class_split() -> None:
@@ -91,9 +92,6 @@ def test_issues_block_lists_warnings_and_incomplete_runs_get_an_error_paragraph(
 
     broken = build(persisted(issues=[issue(RunIssueKind.RATE_NOT_FOUND)]))
     doc = layout(broken, include_disposals=False)
-    provenance = doc.blocks[0]
-    assert isinstance(provenance, KeyValues)
-    assert provenance.items[-1].value == "INCOMPLETE — 1 error(s)"
     banner = doc.blocks[1]
     assert isinstance(banner, Paragraph)
     assert banner.tone == "error"
@@ -104,7 +102,8 @@ def test_empty_sections_say_so() -> None:
     doc = layout(build(persisted()))
     paragraphs = [b.text for b in doc.blocks if isinstance(b, Paragraph)]
     assert paragraphs.count("No disposals in this section.") == 4  # summary and computations
-    assert "The run recorded no warnings and no errors." in paragraphs
+    # A clean run has nothing to list, so the block is not printed at all.
+    assert "Not included in the figures above" not in _headings(doc.blocks)
 
 
 def test_disposal_header_spells_out_each_disposal_event() -> None:

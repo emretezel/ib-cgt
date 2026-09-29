@@ -1,10 +1,10 @@
-"""A format-neutral document — the one shape the console and Markdown renderers draw.
+"""A format-neutral document — the one shape the console, Markdown and PDF renderers draw.
 
 `layout.py` decides *what* the report shows (which tables, which
 columns, which headings); the renderers decide *how* each block looks
 in their medium. Putting a tiny document AST between them means the
-column choice is made once and the two human-readable outputs cannot
-drift apart. The JSON and CSV renderers work from the model directly
+column choice is made once and the three human-readable outputs
+cannot drift apart. The JSON and CSV renderers work from the model directly
 — they want raw values, not a page.
 
 Cells stay typed (`Decimal`, `Money`, `date`, …) until a renderer
@@ -72,7 +72,7 @@ class Heading:
     level: int = 1
 
     def __post_init__(self) -> None:
-        """Four levels is what Markdown readers and terminals can tell apart."""
+        """Four levels is what Markdown readers, terminals and a PDF outline can tell apart."""
         if not 1 <= self.level <= 4:
             raise ValueError(f"Heading.level must be 1..4, got {self.level}")
 

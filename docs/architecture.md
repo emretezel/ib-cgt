@@ -255,8 +255,9 @@ where noted.
    `sources` / `labels` resolve engine ids to the citeable labels of
    `docs/audit.md` and append the s.144 note to share trades an option
    modified, `document` / `layout`
-   form the page, and `render` emits console (rich), Markdown, JSON and
-   CSV. Pure formatting on top of persisted results — no engine pass,
+   form the page, and `render` emits console (rich), Markdown, PDF
+   (reportlab, A4 landscape, the document to attach to the return), JSON
+   and CSV. Pure formatting on top of persisted results — no engine pass,
    no FX lookups. See [`reporting.md`](./reporting.md).
 
 8. **CLI** — `ib_cgt.cli` — Typer app, laid out as a package with one
@@ -385,7 +386,7 @@ ib-cgt/
 │           ├── labels.py        ← citeable label vocabulary (docs/audit.md)
 │           ├── document.py      ← format-neutral page AST
 │           ├── layout.py        ← `Sa108Report` → `Document`
-│           └── render/          ← to_console / to_markdown / to_json / to_csv
+│           └── render/          ← to_console / to_markdown / to_pdf / to_json / to_csv
 └── tests/
     ├── __init__.py
     ├── conftest.py

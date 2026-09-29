@@ -1,11 +1,11 @@
 """Rendering a report document as Markdown.
 
-Markdown is the report you keep: it reads in any editor, diffs in
-version control, and prints to PDF from a browser for the
-"computations" HMRC asks to see with the return. Headings nest under
-the document title, key/value blocks and tables become pipe tables
-with numeric columns right-aligned, and warnings and errors are
-block quotes so they stand out on the page.
+Markdown is the plain-text copy of the page: it reads in any editor
+and diffs in version control (the PDF is the document to keep and to
+attach to the return). Headings nest under the document title,
+key/value blocks and tables become pipe tables with numeric columns
+right-aligned, and warnings and errors are block quotes so they stand
+out on the page.
 
 Author: Emre Tezel
 """

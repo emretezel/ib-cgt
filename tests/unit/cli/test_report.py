@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pdfplumber
 import pytest
 from typer.testing import CliRunner
 
@@ -67,7 +68,7 @@ def test_console_report_shows_both_sections_and_the_computations(
     assert "Computations" in out
     assert "AAPL — 2025-04-20 — Stock" in out
     assert "USD held vs GBP" in out
-    assert str(computed_db) in out
+    assert str(computed_db) not in out
 
 
 def test_summary_only_leaves_out_the_computations(runner: CliRunner, computed_db: Path) -> None:
@@ -88,6 +89,39 @@ def test_markdown_is_written_to_the_out_file(
     assert text.startswith("# Capital Gains Tax computations 2025/26\n")
     assert "| 23 | Number of disposals | 1 |" in text
     assert "#### 1. AAPL — 2025-04-20 — Stock" in text
+
+
+def test_pdf_is_written_to_the_out_file_and_inferred_from_the_suffix(
+    runner: CliRunner, computed_db: Path, tmp_path: Path
+) -> None:
+    target = tmp_path / "2025-26.pdf"
+    result = runner.invoke(app, ["report", "--year", "2025/26", "--out", str(target)])
+    assert result.exit_code == 0, result.stdout
+    assert f"Wrote the pdf report for 2025/26 to {target}" in result.stdout
+    data = target.read_bytes()
+    assert data.startswith(b"%PDF-")
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        pages = len(pdf.pages)
+    assert text.startswith("Capital Gains Tax computations 2025/26\n")
+    assert "23 Number of disposals 1" in text
+    assert "1. AAPL — 2025-04-20 — Stock" in text
+    assert f"Page {pages} of {pages}" in text
+
+
+def test_pdf_summary_only_leaves_out_the_computations(
+    runner: CliRunner, computed_db: Path, tmp_path: Path
+) -> None:
+    target = tmp_path / "summary.pdf"
+    result = runner.invoke(
+        app,
+        ["report", "--year", "2025/26", "--format", "pdf", "--summary-only", "--out", str(target)],
+    )
+    assert result.exit_code == 0, result.stdout
+    with pdfplumber.open(target) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "Listed shares and securities (boxes 23-27)" in text
+    assert "Computations" not in text
 
 
 def test_json_goes_to_stdout_and_parses(runner: CliRunner, computed_db: Path) -> None:
@@ -128,6 +162,9 @@ def test_option_conflicts_are_usage_errors(
     )
     assert console_to_file.exit_code == 2
     assert "console output cannot be written to a file" in console_to_file.output
+    pdf_to_stdout = runner.invoke(app, ["report", "--year", "2025/26", "--format", "pdf"])
+    assert pdf_to_stdout.exit_code == 2
+    assert "pass --out report.pdf" in pdf_to_stdout.output
     csv_summary = runner.invoke(
         app, ["report", "--year", "2025/26", "--format", "csv", "--summary-only"]
     )
@@ -173,6 +210,7 @@ def test_incomplete_run_renders_then_exits_one(runner: CliRunner, populated_db: 
 
     result = runner.invoke(app, ["report", "--year", "2024/25", "--summary-only"])
     assert result.exit_code == 1, result.stdout
-    assert "INCOMPLETE" in result.stdout
+    # No status line any more; the red note is what says the figures are not to be filed.
+    assert "The run recorded 2 error(s)" in result.stdout
     assert "inconsistent_trades" in result.stdout
     assert "Results are incomplete" in result.stdout

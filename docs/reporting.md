@@ -11,7 +11,8 @@ FX lookups — so it needs nothing but the database.
 ib-cgt compute --year 2025/26                       # once, after ingesting
 ib-cgt report  --year 2025/26                       # console, summary + computations
 ib-cgt report  --year 2025/26 --summary-only        # just the boxes
-ib-cgt report  --year 2025/26 --out 2025-26.md      # Markdown, inferred from the suffix
+ib-cgt report  --year 2025/26 --out 2025-26.pdf     # PDF, the document to keep; inferred from the suffix
+ib-cgt report  --year 2025/26 --out 2025-26.md      # Markdown, the plain-text copy
 ib-cgt report  --year 2025/26 --format json         # to stdout
 ib-cgt report  --year 2025/26 --format csv -o lines.csv
 ```
@@ -19,7 +20,7 @@ ib-cgt report  --year 2025/26 --format csv -o lines.csv
 The package is `ib_cgt.report` (component 7 of
 [`architecture.md`](./architecture.md)): `model` is the report shape,
 `builder` the only arithmetic, `sources` / `labels` the id resolution
-and vocabulary, `document` / `layout` the page, `render` the four
+and vocabulary, `document` / `layout` the page, `render` the five
 outputs.
 
 ## Which section of the form
@@ -44,8 +45,12 @@ listed-shares section, carrying the option's amount
 
 Both sections always print, with zeros when empty, so every box the
 form has can be copied. The report also prints the year totals across
-both sections and a "Not included in the figures above" block — the
-run's warnings and errors — so the return can be completed knowingly.
+both sections and, when the run recorded any, a "Not included in the
+figures above" block — its warnings and errors — so the return can be
+completed knowingly; a clean run prints no such block. The page opens
+with the tax year alone: the run id, the database path and the run's
+status are not printed, except that an incomplete run gets a red note
+saying its figures are not to be filed.
 
 ## What one disposal is
 
@@ -121,8 +126,8 @@ Three consequences worth knowing:
   `label: description` per disposal event) and in the acquisition
   column when the share trade is the acquisition side.
 
-Money is carried unrounded through the model; the console and
-Markdown renderers show pennies, JSON and CSV carry full precision. A
+Money is carried unrounded through the model; the console, Markdown
+and PDF renderers show pennies, JSON and CSV carry full precision. A
 rendered line may therefore differ from a rendered box total by a
 penny of rounding; the underlying figures reconcile exactly.
 
@@ -187,14 +192,32 @@ refresh the run.
 | `--format` | Goes to | Contents | Use |
 |---|---|---|---|
 | `console` (default) | the terminal | summary + computations (rich tables) | looking up box values |
-| `markdown` | stdout or `--out` | the same page as Markdown | the document to keep and to print to PDF as the "computations" attached to the return |
+| `pdf` | `--out` only | the same page as an A4 landscape PDF: numeric columns never wrap, a table continued on the next page repeats its header, no page ends with a heading, every page is numbered `Page N of M`, and the outline (the viewer's sidebar) lists every section and every disposal | the document to keep and to attach to the return as the "computations" |
+| `markdown` | stdout or `--out` | the same page as Markdown | the plain-text copy: reads in any editor, diffs in version control |
 | `json` | stdout or `--out` | the full model: sections, boxes, totals, issues, every line and basis (`kind`: `direct`, `pool`, `close_out` or `grant` — the grant basis carries `premium_native`, `grant_fee_native`, `grant_fx_rate`, `granted_quantity`, `chargeable_quantity` and `closes[]`; an option instrument carries `underlying`, `strike`, `right`, `expiry_date`, `contract_multiplier`) | scripts, golden tests, a future form-filler |
 | `csv` | stdout or `--out` | one row per computation line with the disposal's identity repeated (a grant line has `acquisition_ref` = `grant` and the grant's terms and later events in `acquisition_description`) | spreadsheet reconciliation |
 
-`--out` alone picks the format from the suffix (`.md`, `.json`,
-`.csv`); `--summary-only` drops the computations (not available for
-CSV, which is the computations). Console output cannot be written to
-a file.
+`--out` alone picks the format from the suffix (`.pdf`, `.md`,
+`.json`, `.csv`); `--summary-only` drops the computations (not
+available for CSV, which is the computations). Console output cannot
+be written to a file, and a PDF — a binary file — can only be written
+to one.
+
+### The PDF page
+
+The PDF draws the same `Document` as the console and Markdown, so it
+says exactly what they say; `render/to_pdf.py` decides only how it
+looks. A4 landscape, because the futures table has fifteen columns
+and at a readable size its numeric columns alone outgrow a portrait
+page. Helvetica throughout, built into every viewer, so the file
+carries no fonts; the arrow in `P&L #A→#B` comes from the built-in
+Symbol font. Each table is sized to its own content: numeric and date
+columns take their widest value and never wrap, text columns share
+what is left and wrap when squeezed, and only a table whose numbers
+alone do not fit steps its font down. A disposal's heading and
+working sheet are kept with its lines table, so a disposal starts on
+a fresh page rather than being split at the top; a long lines table
+then continues across pages with its header row repeated.
 
 Exit codes: `0` when the run was clean; `1` when the year has never
 been computed (`No computed run for 2025/26 — run ib-cgt compute

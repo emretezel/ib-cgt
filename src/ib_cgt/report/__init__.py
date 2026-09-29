@@ -13,9 +13,9 @@ HMRC expects to see attached to them:
   the only place the report does arithmetic.
 * `sources` / `labels` — resolving engine ids to citeable event
   references and the vocabulary they are printed in.
-* `document` / `layout` — the format-neutral page the console and
-  Markdown renderers draw.
-* `render` — console, Markdown, JSON and CSV outputs.
+* `document` / `layout` — the format-neutral page the console,
+  Markdown and PDF renderers draw.
+* `render` — console, Markdown, PDF, JSON and CSV outputs.
 
 Pure formatting on top of persisted results: nothing here runs an
 engine or consults an FX rate. Dependency direction is strictly
@@ -53,6 +53,7 @@ from ib_cgt.report.render import (
     render_csv,
     render_json,
     render_markdown,
+    render_pdf,
     report_to_dict,
 )
 from ib_cgt.report.sources import (
@@ -91,6 +92,7 @@ __all__ = [
     "render_csv",
     "render_json",
     "render_markdown",
+    "render_pdf",
     "report_to_dict",
     "unresolved",
 ]

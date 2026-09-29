@@ -1,10 +1,11 @@
 """Laying the SA108 report out as a document — the one place that chooses tables and columns.
 
-The console and Markdown renderers both draw the `Document` this
+The console, Markdown and PDF renderers all draw the `Document` this
 module produces, so the page reads the same in a terminal and in the
-file attached to the return: provenance first, then the box figures
+file attached to the return: the tax year first, then the box figures
 per section with a per-class breakdown, the year totals, what the
-run left out, and finally one computation per disposal in HMRC's
+run left out (only when it left anything out), and finally one
+computation per disposal in HMRC's
 working-sheet layout (A proceeds, B incidental costs of disposal,
 C = A - B, D cost, E incidental costs of acquisition, G = D + E,
 H = C - G).
@@ -62,17 +63,14 @@ _RELIEFS_NOTE = (
 )
 
 
-def layout(
-    report: Sa108Report, *, include_disposals: bool = True, source: str | None = None
-) -> Document:
+def layout(report: Sa108Report, *, include_disposals: bool = True) -> Document:
     """The report as a document: summary first, computations after.
 
     `include_disposals=False` stops after the summary — the shape of a
-    quick look-up of the box figures. `source` names where the run
-    was read from (the database path) for the provenance block.
+    quick look-up of the box figures.
     """
     blocks: list[Block] = []
-    blocks.extend(_provenance_blocks(report, source))
+    blocks.extend(_opening_blocks(report))
     blocks.append(Heading(text="SA108 summary", level=1))
     for section in report.sections:
         blocks.extend(_section_blocks(section))
@@ -91,29 +89,29 @@ def layout(
 # ---------------------------------------------------------------------------
 
 
-def _provenance_blocks(report: Sa108Report, source: str | None) -> list[Block]:
-    """Which year, which run, where from, and whether the run was clean."""
+def _opening_blocks(report: Sa108Report) -> list[Block]:
+    """The tax year, and a red note when the run was not clean.
+
+    The run id, the database path and a "complete" status are the
+    tool's business, not the return's, so they are not printed; an
+    incomplete run is the exception, because its figures are not to
+    be filed.
+    """
     year = report.tax_year
-    items = [
-        KeyValue(
-            key="Tax year",
-            value=f"{year.label} ({year.start_date.isoformat()} to {year.end_date.isoformat()})",
-        ),
-        KeyValue(
-            key="Run",
-            value=f"#{report.run.run_id}, computed {report.run.computed_at:%Y-%m-%d %H:%M} UTC",
-        ),
-    ]
-    if source is not None:
-        items.append(KeyValue(key="Source", value=source))
-    errors = len(report.errors)
-    items.append(
-        KeyValue(
-            key="Status",
-            value="complete" if report.is_complete else f"INCOMPLETE — {errors} error(s)",
+    blocks: list[Block] = [
+        KeyValues(
+            items=(
+                KeyValue(
+                    key="Tax year",
+                    value=(
+                        f"{year.label} ({year.start_date.isoformat()} to "
+                        f"{year.end_date.isoformat()})"
+                    ),
+                ),
+            )
         )
-    )
-    blocks: list[Block] = [KeyValues(items=tuple(items))]
+    ]
+    errors = len(report.errors)
     if not report.is_complete:
         blocks.append(
             Paragraph(
@@ -220,11 +218,10 @@ def _totals_blocks(report: Sa108Report) -> list[Block]:
 
 
 def _issue_blocks(report: Sa108Report) -> list[Block]:
-    """Everything the run could not include, errors first."""
-    blocks: list[Block] = [Heading(text="Not included in the figures above", level=2)]
+    """Everything the run could not include, errors first; nothing for a clean run."""
     if not report.issues:
-        blocks.append(Paragraph(text="The run recorded no warnings and no errors."))
-        return blocks
+        return []
+    blocks: list[Block] = [Heading(text="Not included in the figures above", level=2)]
     blocks.append(
         Paragraph(
             text=(
